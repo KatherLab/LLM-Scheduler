@@ -8,7 +8,6 @@ class Settings(BaseSettings):
     router_port: int = Field(default=9000, alias="ROUTER_PORT")
 
     public_hostname: str = Field(default="127.0.0.1", alias="PUBLIC_HOSTNAME")
-
     database_url: str = Field(default="sqlite:////var/lib/vllm-router/router.db", alias="DATABASE_URL")
 
     slurm_partition: str | None = Field(default=None, alias="SLURM_PARTITION")
@@ -17,11 +16,14 @@ class Settings(BaseSettings):
     slurm_nodelist: str | None = Field(default=None, alias="SLURM_NODELIST")
     slurm_cpus_per_task: int = Field(default=32, alias="SLURM_CPUS_PER_TASK")
 
-    port_min: int = Field(default=8010, alias="PORT_MIN")
-    port_max: int = Field(default=8099, alias="PORT_MAX")
-
     vllm_log_dir: str = Field(default="/var/log/vllm", alias="VLLM_LOG_DIR")
     sbatch_template_path: str = Field(default="/opt/vllm-swapper-router/templates/vllm_job.sh", alias="SBATCH_TEMPLATE_PATH")
+
+    # NEW: single-node total GPU count (for planning & timeline)
+    total_gpus: int = Field(default=8, alias="TOTAL_GPUS")
+
+    # NEW: planned jobs are submitted shortly before begin_at
+    scheduler_submit_lead_seconds: int = Field(default=120, alias="SCHEDULER_SUBMIT_LEAD_SECONDS")
 
     default_model: str | None = Field(default=None, alias="DEFAULT_MODEL")
     default_model_gpus: int | None = Field(default=None, alias="DEFAULT_MODEL_GPUS")

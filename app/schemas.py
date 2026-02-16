@@ -6,17 +6,22 @@ from typing import Optional, Any
 class LeaseCreate(BaseModel):
     model: str
     owner: Optional[str] = None
-    # schedule:
     begin_at: Optional[datetime] = None
     duration_seconds: int = Field(default=6*3600, ge=60)
 
-    # optional overrides; if omitted use catalog defaults
     gpus: Optional[int] = Field(default=None, ge=1)
     tensor_parallel_size: Optional[int] = Field(default=None, ge=1)
     gpu_memory_utilization: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     extra_args: Optional[str] = None
     tool_args: Optional[str] = None
     reasoning_parser: Optional[str] = None
+
+class LeaseUpdate(BaseModel):
+    # Only allowed for PLANNED leases (not yet submitted), unless you're extending end_at for running ones via extend endpoint.
+    begin_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    requested_gpus: Optional[int] = Field(default=None, ge=1)
+    requested_tp: Optional[int] = Field(default=None, ge=1)
 
 class LeaseOut(BaseModel):
     id: int
@@ -31,6 +36,11 @@ class LeaseOut(BaseModel):
     begin_at: Optional[datetime]
     end_at: Optional[datetime]
     created_at: datetime
+
+    # NEW for timeline rendering (visual placement)
+    lane_start: Optional[int] = None
+    lane_count: Optional[int] = None
+    conflict: bool = False
 
 class LeaseExtend(BaseModel):
     duration_seconds: int = Field(..., ge=60)
@@ -55,3 +65,14 @@ class EndpointOut(BaseModel):
 class OpenAIModelsResponse(BaseModel):
     object: str = "list"
     data: list[dict[str, Any]]
+
+class DashboardModel(BaseModel):
+    id: str
+    ready: bool
+    meta: dict[str, Any]
+
+class DashboardResponse(BaseModel):
+    now: datetime
+    total_gpus: int
+    models: list[DashboardModel]
+    leases: list[LeaseOut]

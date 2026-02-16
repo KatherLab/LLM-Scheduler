@@ -3,13 +3,17 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-import os
+from typing import Optional
 
 from .settings import settings
 from .db import make_engine, make_session_factory
 from .models import Lease, Endpoint
-from .schemas import LeaseCreate, LeaseOut, LeaseExtend, EndpointRegister, EndpointOut
+from .schemas import (
+    LeaseCreate, LeaseOut, LeaseExtend, LeaseUpdate,
+    EndpointRegister, EndpointOut, DashboardResponse, DashboardModel
+)
 from .catalog import load_catalog
+from .planner import compute_placements
 from . import slurm
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -19,14 +23,21 @@ SessionLocal = make_session_factory(engine)
 
 CATALOG = load_catalog("config/models.yaml")
 
+# ---------- helpers -------------------------------------------------------------
+
 def _time_limit_from_duration(seconds: int) -> str:
-    # Slurm time limit as HH:MM:SS
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def _lease_to_out(l: Lease) -> LeaseOut:
+def _lease_begin(l: Lease) -> datetime:
+    return l.begin_at or l.created_at
+
+def _lease_end(l: Lease) -> datetime:
+    return l.end_at or (_lease_begin(l) + timedelta(hours=1))
+
+def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Optional[int] = None, conflict: bool = False) -> LeaseOut:
     return LeaseOut(
         id=l.id,
         model=l.model,
@@ -34,16 +45,171 @@ def _lease_to_out(l: Lease) -> LeaseOut:
         state=l.state,
         slurm_job_id=l.slurm_job_id,
         host=settings.public_hostname,
-        port=l.requested_port or 0, # 0 means "assigned dynamically"
+        port=l.requested_port or 0,
         requested_gpus=l.requested_gpus,
         requested_tp=l.requested_tp,
         begin_at=l.begin_at,
         end_at=l.end_at,
         created_at=l.created_at,
+        lane_start=lane_start,
+        lane_count=lane_count,
+        conflict=conflict,
     )
+
+def _build_job_env(lease: Lease) -> dict[str, str]:
+    return {
+        "MODEL_PATH": lease.model_path,
+        "SERVED_MODEL_NAME": lease.model,
+        "TP_SIZE": str(lease.requested_tp),
+        "API_KEY": "secret",
+        "GPU_MEM_UTIL": lease.gpu_memory_utilization or "0.95",
+        "EXTRA_ARGS": lease.extra_args or "",
+        "TOOL_ARGS": lease.tool_args or "",
+        "REASONING_PARSER": lease.reasoning_parser or "",
+        "ROUTER_REGISTER_URL": f"http://{settings.public_hostname}:{settings.router_port}/admin/endpoints/register",
+    }
+
+def _submit_to_slurm(lease: Lease) -> str:
+    # submit and return job id
+    seconds = int((_lease_end(lease) - (_lease_begin(lease))).total_seconds())
+    seconds = max(60, seconds)
+    time_limit = _time_limit_from_duration(seconds)
+
+    env = _build_job_env(lease)
+
+    res = slurm.submit_vllm_job(
+        template_path=settings.sbatch_template_path,
+        job_name=f"vllm-{lease.model}",
+        gpus=lease.requested_gpus,
+        time_limit=time_limit,
+        begin=None,  # already planned in DB; we submit "now" when time comes
+        env=env,
+        partition=settings.slurm_partition,
+        account=settings.slurm_account,
+        qos=settings.slurm_qos,
+        nodelist=settings.slurm_nodelist,
+        cpus_per_task=settings.slurm_cpus_per_task,
+    )
+    return res.job_id
+
+def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
+    """
+    Strict planner: disallow creating/updating a lease if it would overbook GPUs.
+    We only consider PLANNED + SUBMITTED + RUNNING leases for the horizon.
+    """
+    now = datetime.utcnow()
+    horizon_start = now - timedelta(hours=1)
+    horizon_end = now + timedelta(hours=48)
+
+    leases = db.execute(
+        select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"]))
+    ).scalars().all()
+
+    # include candidate (may not be in DB yet)
+    leases = [l for l in leases if l.id != candidate.id] + [candidate]
+
+    placements = compute_placements(
+        leases=leases,
+        total_gpus=settings.total_gpus,
+        horizon_start=horizon_start,
+        horizon_end=horizon_end,
+    )
+    p = placements.get(candidate.id)
+    if p and p.conflict:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Not enough GPUs available for that time window (needs {candidate.requested_gpus}).",
+        )
+
+def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: datetime, end: datetime, gpus: int, tp: int) -> Optional[Lease]:
+    """
+    If the same model is already PLANNED/SUBMITTED/RUNNING and the new request is
+    contiguous or overlapping, then extend instead of creating a new lease.
+    This prevents "same model twice in a row" which is wasteful for vLLM.
+    """
+    existing = db.execute(
+        select(Lease).where(
+            Lease.model == req.model,
+            Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"])
+        ).order_by(Lease.id.desc())
+    ).scalars().first()
+
+    if not existing:
+        return None
+
+    ex_begin = _lease_begin(existing)
+    ex_end = _lease_end(existing)
+
+    # If overlaps or touches within 5 minutes, treat as extension
+    touch = timedelta(minutes=5)
+    overlaps_or_touches = not (end < ex_begin - touch or begin > ex_end + touch)
+
+    if overlaps_or_touches:
+        # If the request changes GPU count, we keep existing GPUs for now to avoid surprises.
+        # You could optionally allow increasing GPUs if it's feasible.
+        existing.end_at = max(ex_end, end)
+        # keep begin as earliest
+        existing.begin_at = min(ex_begin, begin) if existing.begin_at else None
+        return existing
+
+    return None
+
+# ---------- endpoints ------------------------------------------------------------
+
+@router.get("/dashboard", response_model=DashboardResponse)
+def dashboard():
+    now = datetime.utcnow()
+    horizon_start = now - timedelta(hours=1)
+    horizon_end = now + timedelta(hours=48)
+
+    with SessionLocal() as db:
+        ready = set(
+            db.execute(select(Endpoint.model).where(Endpoint.state == "READY")).scalars().all()
+        )
+
+        leases = db.execute(select(Lease).order_by(Lease.id.desc())).scalars().all()
+
+        # placements for horizon
+        active_like = [l for l in leases if l.state in ("PLANNED", "SUBMITTED", "RUNNING")]
+        placements = compute_placements(
+            leases=active_like,
+            total_gpus=settings.total_gpus,
+            horizon_start=horizon_start,
+            horizon_end=horizon_end,
+        )
+
+        out_leases: list[LeaseOut] = []
+        for l in leases:
+            p = placements.get(l.id)
+            out_leases.append(_lease_to_out(
+                l,
+                lane_start=p.lane_start if p else None,
+                lane_count=p.lane_count if p else None,
+                conflict=p.conflict if p else False,
+            ))
+
+        models: list[DashboardModel] = []
+        for name, m in CATALOG.items():
+            models.append(DashboardModel(
+                id=name,
+                ready=(name in ready),
+                meta={
+                    "gpus": m.gpus,
+                    "tensor_parallel_size": m.tensor_parallel_size,
+                    "notes": m.notes,
+                }
+            ))
+
+        return DashboardResponse(
+            now=now,
+            total_gpus=settings.total_gpus,
+            models=models,
+            leases=out_leases,
+        )
 
 @router.get("/leases", response_model=list[LeaseOut])
 def list_leases():
+    # kept for backwards compatibility; UI uses /dashboard
     with SessionLocal() as db:
         leases = db.execute(select(Lease).order_by(Lease.id.desc())).scalars().all()
         return [_lease_to_out(l) for l in leases]
@@ -65,117 +231,159 @@ def create_lease(req: LeaseCreate):
     cat = CATALOG[req.model]
     gpus = req.gpus or cat.gpus
     tp = req.tensor_parallel_size or cat.tensor_parallel_size
-    
-    # We do NOT allocate a port here anymore. Slurm job does it.
-    
-    begin_at = req.begin_at
-    end_at = (begin_at or datetime.utcnow()) + timedelta(seconds=req.duration_seconds)
 
-    lease = Lease(
-        model=req.model,
-        requested_gpus=gpus,
-        requested_tp=tp,
-        requested_port=0, # Placeholder
-        owner=req.owner,
-        begin_at=begin_at,
-        end_at=end_at,
-        model_path=cat.model_path,
-        tool_args=req.tool_args if req.tool_args is not None else cat.tool_args,
-        extra_args=req.extra_args if req.extra_args is not None else cat.extra_args,
-        reasoning_parser=req.reasoning_parser if req.reasoning_parser is not None else cat.reasoning_parser,
-        gpu_memory_utilization=str(req.gpu_memory_utilization if req.gpu_memory_utilization is not None else cat.gpu_memory_utilization),
-        state="REQUESTED",
-    )
-
-    time_limit = _time_limit_from_duration(req.duration_seconds)
-    env = {
-        "MODEL_PATH": lease.model_path,
-        "SERVED_MODEL_NAME": lease.model,
-        "TP_SIZE": str(lease.requested_tp),
-        "API_KEY": "secret", 
-        "GPU_MEM_UTIL": lease.gpu_memory_utilization or "0.95",
-        "EXTRA_ARGS": lease.extra_args or "",
-        "TOOL_ARGS": lease.tool_args or "",
-        "REASONING_PARSER": lease.reasoning_parser or "",
-        "ROUTER_REGISTER_URL": f"http://{settings.public_hostname}:{settings.router_port}/admin/endpoints/register",
-    }
-
-    try:
-        res = slurm.submit_vllm_job(
-            template_path=settings.sbatch_template_path,
-            job_name=f"vllm-{lease.model}",
-            gpus=lease.requested_gpus,
-            time_limit=time_limit,
-            begin=lease.begin_at,
-            env=env,
-            partition=settings.slurm_partition,
-            account=settings.slurm_account,
-            qos=settings.slurm_qos,
-            nodelist=settings.slurm_nodelist,
-            cpus_per_task=settings.slurm_cpus_per_task,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
-
-    lease.slurm_job_id = res.job_id
-    lease.state = "SUBMITTED"
+    begin = req.begin_at or datetime.utcnow()
+    end = begin + timedelta(seconds=req.duration_seconds)
 
     with SessionLocal() as db:
+        # MERGE RULE: same model twice => extend instead
+        merged = _merge_same_model_if_applicable(db, req, begin, end, gpus, tp)
+        if merged:
+            _validate_no_conflicts(db, merged)
+            db.add(merged)
+            db.commit()
+            db.refresh(merged)
+            return _lease_to_out(merged)
+
+        lease = Lease(
+            model=req.model,
+            requested_gpus=gpus,
+            requested_tp=tp,
+            requested_port=0,
+            owner=req.owner,
+            begin_at=req.begin_at,  # keep None if "now"
+            end_at=end,
+            model_path=cat.model_path,
+            tool_args=req.tool_args if req.tool_args is not None else cat.tool_args,
+            extra_args=req.extra_args if req.extra_args is not None else cat.extra_args,
+            reasoning_parser=req.reasoning_parser if req.reasoning_parser is not None else cat.reasoning_parser,
+            gpu_memory_utilization=str(req.gpu_memory_utilization if req.gpu_memory_utilization is not None else cat.gpu_memory_utilization),
+            state="PLANNED" if req.begin_at and req.begin_at > datetime.utcnow() else "SUBMITTED",
+        )
+
+        # validate feasibility of plan
+        _validate_no_conflicts(db, lease)
+
+        # if immediate, submit to slurm now
+        if lease.state == "SUBMITTED":
+            try:
+                job_id = _submit_to_slurm(lease)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
+            lease.slurm_job_id = job_id
+
         db.add(lease)
         db.commit()
         db.refresh(lease)
+        return _lease_to_out(lease)
 
-    return _lease_to_out(lease)
+@router.patch("/leases/{lease_id}", response_model=LeaseOut)
+def update_lease(lease_id: int, req: LeaseUpdate):
+    with SessionLocal() as db:
+        lease = db.get(Lease, lease_id)
+        if not lease:
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        if lease.state != "PLANNED":
+            raise HTTPException(status_code=409, detail="Only planned bookings can be edited (move/resize).")
+
+        if req.begin_at is not None:
+            lease.begin_at = req.begin_at
+        if req.end_at is not None:
+            lease.end_at = req.end_at
+        if req.requested_gpus is not None:
+            lease.requested_gpus = req.requested_gpus
+        if req.requested_tp is not None:
+            lease.requested_tp = req.requested_tp
+
+        # basic sanity
+        b = _lease_begin(lease)
+        e = _lease_end(lease)
+        if e <= b:
+            raise HTTPException(status_code=400, detail="End time must be after start time.")
+        if lease.requested_gpus > settings.total_gpus:
+            raise HTTPException(status_code=400, detail=f"Cannot request more than {settings.total_gpus} GPUs.")
+
+        # Prevent “same model twice in a row” by auto-merge if it now touches/overlaps
+        fake_req = LeaseCreate(model=lease.model, begin_at=lease.begin_at, duration_seconds=int((e-b).total_seconds()))
+        merged = _merge_same_model_if_applicable(db, fake_req, b, e, lease.requested_gpus, lease.requested_tp)
+        if merged and merged.id != lease.id:
+            # merge target is different lease => extend it, delete this one
+            merged.end_at = max(_lease_end(merged), e)
+            db.delete(lease)
+            _validate_no_conflicts(db, merged)
+            db.commit()
+            db.refresh(merged)
+            return _lease_to_out(merged)
+
+        _validate_no_conflicts(db, lease)
+        db.commit()
+        db.refresh(lease)
+        return _lease_to_out(lease)
 
 @router.delete("/leases/{lease_id}")
 def cancel_lease(lease_id: int):
     with SessionLocal() as db:
         lease = db.get(Lease, lease_id)
         if not lease:
-            raise HTTPException(status_code=404, detail="Lease not found")
-        
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        # cancel slurm job if already submitted
         if lease.slurm_job_id:
             try:
                 slurm.cancel(lease.slurm_job_id)
             except Exception as e:
-                # We log but continue, hoping to clean up DB state
                 print(f"Warning: Slurm cancel failed: {e}")
-        
+
         lease.state = "CANCELED"
-        
-        # Also mark endpoint as STOPPED if it exists
+
         if lease.slurm_job_id:
             ep = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == lease.slurm_job_id)).scalars().first()
             if ep:
                 ep.state = "STOPPED"
-        
+
         db.commit()
     return {"ok": True}
 
 @router.post("/leases/{lease_id}/extend")
 def extend_lease(lease_id: int, req: LeaseExtend):
+    """
+    Extend a booking.
+    - If PLANNED: extend end_at in DB (easy)
+    - If SUBMITTED/RUNNING: extend end_at in DB and best-effort bump Slurm TimeLimit (total)
+    """
     with SessionLocal() as db:
         lease = db.get(Lease, lease_id)
         if not lease:
-            raise HTTPException(status_code=404, detail="Lease not found")
-        if not lease.slurm_job_id:
-            raise HTTPException(status_code=409, detail="Lease has no Slurm job")
-        
-        new_time = _time_limit_from_duration(req.duration_seconds)
-        try:
-            slurm.extend_time(lease.slurm_job_id, new_time)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to extend job time: {e}")
-            
-        # Update end time based on NOW + duration (simplification for extension)
-        lease.end_at = datetime.utcnow() + timedelta(seconds=req.duration_seconds)
+            raise HTTPException(status_code=404, detail="Booking not found")
+
+        now = datetime.utcnow()
+        b = _lease_begin(lease)
+        e = _lease_end(lease)
+
+        # Extend from current end, not from now
+        new_end = e + timedelta(seconds=req.duration_seconds)
+        lease.end_at = new_end
+
+        # Validate plan feasibility
+        _validate_no_conflicts(db, lease)
+
+        # If submitted, best effort update Slurm total time limit
+        if lease.slurm_job_id and lease.state in ("SUBMITTED", "RUNNING"):
+            total_seconds = int((new_end - b).total_seconds())
+            total_seconds = max(60, total_seconds)
+            new_time_limit = _time_limit_from_duration(total_seconds)
+            try:
+                slurm.extend_time(lease.slurm_job_id, new_time_limit)
+            except Exception as e:
+                # don’t fail user; DB still reflects desired booking
+                print(f"Warning: failed to extend Slurm time: {e}")
+
         db.commit()
-    return {"ok": True, "new_time_limit": new_time}
+        return {"ok": True, "new_end_at": lease.end_at}
 
 @router.post("/endpoints/register", response_model=EndpointOut)
 def register_endpoint(req: EndpointRegister):
-    # This is called by the SLURM job itself.
-    # It tells us which port it actually bound to.
     with SessionLocal() as db:
         existing = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == req.slurm_job_id)).scalars().first()
         if existing:
@@ -191,22 +399,20 @@ def register_endpoint(req: EndpointRegister):
             db.add(e)
             db.commit()
             db.refresh(e)
-            
-            # Also update the lease with the actual port for visibility
-            lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
-            if lease:
-                lease.requested_port = req.port
-                lease.state = "RUNNING"
-                db.commit()
+
+        # Update lease state
+        lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
+        if lease:
+            lease.requested_port = req.port
+            lease.state = "RUNNING"
+            db.commit()
 
     return EndpointOut(
         id=e.id, model=e.model, host=e.host, port=e.port, slurm_job_id=e.slurm_job_id, state=e.state,
         last_health_at=e.last_health_at, last_error=e.last_error, created_at=e.created_at
     )
 
-# --- Default model (idle fallback) -------------------------------------------------
-# This is a simple controller that ensures DEFAULT_MODEL is running whenever there are
-# no other READY endpoints. It does NOT affect request routing/fallback chains.
+# ---------- default model --------------------------------------------------------
 
 async def ensure_default_model_running():
     if not settings.default_model:
@@ -214,22 +420,31 @@ async def ensure_default_model_running():
     default_name = settings.default_model
 
     with SessionLocal() as db:
-        # If any READY endpoint exists for a non-default model, do nothing
+        # If a planned non-default booking starts soon, avoid thrashing default
+        soon = datetime.utcnow() + timedelta(minutes=30)
+        planned_soon = db.execute(
+            select(Lease).where(
+                Lease.state == "PLANNED",
+                Lease.model != default_name,
+                Lease.begin_at != None,  # noqa
+                Lease.begin_at <= soon
+            )
+        ).scalars().first()
+        if planned_soon:
+            return
+
         non_default_ready = db.execute(
             select(Endpoint).where(Endpoint.state == "READY", Endpoint.model != default_name)
         ).scalars().first()
         if non_default_ready:
             return
 
-        # Is default already present and not stopped?
         existing = db.execute(
             select(Endpoint).where(Endpoint.model == default_name, Endpoint.state.in_(["STARTING", "READY"]))
         ).scalars().first()
         if existing:
             return
 
-    # Submit default lease "now" with a long duration if configured
-    # Use catalog defaults if overrides not provided.
     if default_name not in CATALOG:
         return
 
@@ -237,10 +452,8 @@ async def ensure_default_model_running():
     gpus = settings.default_model_gpus or cat.gpus
     tp = settings.default_model_tp or cat.tensor_parallel_size
 
-    # 12h default runtime; can be restarted by this worker.
     req = LeaseCreate(model=default_name, owner="default", begin_at=None, duration_seconds=12*3600, gpus=gpus, tensor_parallel_size=tp)
     try:
         create_lease(req)
     except Exception:
-        # ignore; next loop will retry
         return

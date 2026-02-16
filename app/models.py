@@ -1,6 +1,6 @@
 from __future__ import annotations
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import String, Integer, DateTime, Text, Boolean, Index
+from sqlalchemy import String, Integer, DateTime, Text, Index
 from datetime import datetime
 from .db import Base
 
@@ -18,9 +18,10 @@ class Lease(Base):
     begin_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     end_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    state: Mapped[str] = mapped_column(String(32), default="REQUESTED")  # REQUESTED, SUBMITTED, RUNNING, CANCELED, ENDED, FAILED
+    # NEW: PLANNED state for “reservation not yet submitted to Slurm”
+    # PLANNED, SUBMITTED, RUNNING, CANCELED, ENDED, FAILED
+    state: Mapped[str] = mapped_column(String(32), default="PLANNED")
 
-    # job args snapshot
     model_path: Mapped[str] = mapped_column(Text)
     tool_args: Mapped[str | None] = mapped_column(Text, nullable=True)
     extra_args: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -10,7 +10,6 @@ from .db import make_engine, make_session_factory
 from .models import Lease, Endpoint
 from .schemas import LeaseCreate, LeaseOut, LeaseExtend, EndpointRegister, EndpointOut
 from .catalog import load_catalog
-from .ports import PortAllocator
 from . import slurm
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -19,7 +18,6 @@ engine = make_engine(settings.database_url)
 SessionLocal = make_session_factory(engine)
 
 CATALOG = load_catalog("config/models.yaml")
-PORTS = PortAllocator(settings.port_min, settings.port_max)
 
 def _time_limit_from_duration(seconds: int) -> str:
     # Slurm time limit as HH:MM:SS
@@ -36,7 +34,7 @@ def _lease_to_out(l: Lease) -> LeaseOut:
         state=l.state,
         slurm_job_id=l.slurm_job_id,
         host=settings.public_hostname,
-        port=l.requested_port,
+        port=l.requested_port or 0, # 0 means "assigned dynamically"
         requested_gpus=l.requested_gpus,
         requested_tp=l.requested_tp,
         begin_at=l.begin_at,
@@ -67,8 +65,9 @@ def create_lease(req: LeaseCreate):
     cat = CATALOG[req.model]
     gpus = req.gpus or cat.gpus
     tp = req.tensor_parallel_size or cat.tensor_parallel_size
-    port = PORTS.allocate(key=f"lease-{req.model}-{datetime.utcnow().timestamp()}")
-
+    
+    # We do NOT allocate a port here anymore. Slurm job does it.
+    
     begin_at = req.begin_at
     end_at = (begin_at or datetime.utcnow()) + timedelta(seconds=req.duration_seconds)
 
@@ -76,7 +75,7 @@ def create_lease(req: LeaseCreate):
         model=req.model,
         requested_gpus=gpus,
         requested_tp=tp,
-        requested_port=port,
+        requested_port=0, # Placeholder
         owner=req.owner,
         begin_at=begin_at,
         end_at=end_at,
@@ -93,8 +92,7 @@ def create_lease(req: LeaseCreate):
         "MODEL_PATH": lease.model_path,
         "SERVED_MODEL_NAME": lease.model,
         "TP_SIZE": str(lease.requested_tp),
-        "PORT": str(lease.requested_port),
-        "API_KEY": "test",  # keep private; LiteLLM should sit in front anyway
+        "API_KEY": "secret", 
         "GPU_MEM_UTIL": lease.gpu_memory_utilization or "0.95",
         "EXTRA_ARGS": lease.extra_args or "",
         "TOOL_ARGS": lease.tool_args or "",
@@ -117,7 +115,6 @@ def create_lease(req: LeaseCreate):
             cpus_per_task=settings.slurm_cpus_per_task,
         )
     except Exception as e:
-        PORTS.release(key=str(port))
         raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
 
     lease.slurm_job_id = res.job_id
@@ -136,12 +133,22 @@ def cancel_lease(lease_id: int):
         lease = db.get(Lease, lease_id)
         if not lease:
             raise HTTPException(status_code=404, detail="Lease not found")
+        
         if lease.slurm_job_id:
             try:
                 slurm.cancel(lease.slurm_job_id)
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to cancel Slurm job: {e}")
+                # We log but continue, hoping to clean up DB state
+                print(f"Warning: Slurm cancel failed: {e}")
+        
         lease.state = "CANCELED"
+        
+        # Also mark endpoint as STOPPED if it exists
+        if lease.slurm_job_id:
+            ep = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == lease.slurm_job_id)).scalars().first()
+            if ep:
+                ep.state = "STOPPED"
+        
         db.commit()
     return {"ok": True}
 
@@ -153,21 +160,23 @@ def extend_lease(lease_id: int, req: LeaseExtend):
             raise HTTPException(status_code=404, detail="Lease not found")
         if not lease.slurm_job_id:
             raise HTTPException(status_code=409, detail="Lease has no Slurm job")
-        # extend to new duration from now (simple); you can make this smarter.
+        
         new_time = _time_limit_from_duration(req.duration_seconds)
         try:
             slurm.extend_time(lease.slurm_job_id, new_time)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to extend job time: {e}")
-        lease.end_at = (lease.begin_at or lease.created_at) + timedelta(seconds=req.duration_seconds)
+            
+        # Update end time based on NOW + duration (simplification for extension)
+        lease.end_at = datetime.utcnow() + timedelta(seconds=req.duration_seconds)
         db.commit()
     return {"ok": True, "new_time_limit": new_time}
 
 @router.post("/endpoints/register", response_model=EndpointOut)
 def register_endpoint(req: EndpointRegister):
-    # Called by the Slurm job script once vLLM is up (or once it decides to register).
+    # This is called by the SLURM job itself.
+    # It tells us which port it actually bound to.
     with SessionLocal() as db:
-        # Upsert by slurm_job_id
         existing = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == req.slurm_job_id)).scalars().first()
         if existing:
             existing.model = req.model
@@ -182,6 +191,14 @@ def register_endpoint(req: EndpointRegister):
             db.add(e)
             db.commit()
             db.refresh(e)
+            
+            # Also update the lease with the actual port for visibility
+            lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
+            if lease:
+                lease.requested_port = req.port
+                lease.state = "RUNNING"
+                db.commit()
+
     return EndpointOut(
         id=e.id, model=e.model, host=e.host, port=e.port, slurm_job_id=e.slurm_job_id, state=e.state,
         last_health_at=e.last_health_at, last_error=e.last_error, created_at=e.created_at

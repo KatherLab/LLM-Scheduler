@@ -58,8 +58,14 @@ def v1_models():
 def _resolve_upstream(db: Session, model: str) -> str:
     ep = choose_ready_endpoint(db, model)
     if not ep:
-        raise HTTPException(status_code=503, detail=f"No READY endpoint for model '{model}'. Start/schedule it via /admin/leases.")
+        # CUSTOM ERROR FOR MANUAL SCHEDULING
+        msg = (
+            f"Model '{model}' is not currently running. "
+            f"Please visit the Scheduler UI to launch it: http://{settings.public_hostname}:{settings.router_port}/"
+        )
+        raise HTTPException(status_code=503, detail=msg)
     return f"http://{ep.host}:{ep.port}"
+
 
 async def _get_model_from_body(request: Request) -> str:
     try:

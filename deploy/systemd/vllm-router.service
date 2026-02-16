@@ -1,0 +1,14 @@
+[Unit]
+Description=vLLM Swapper Router
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vllm-swapper-router
+EnvironmentFile=/opt/vllm-swapper-router/.env
+ExecStart=/opt/vllm-swapper-router/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 9000
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

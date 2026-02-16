@@ -1,0 +1,10 @@
+models:
+  - name: Qwen3.5-397B-A17B
+    model_path: /mnt/models/Qwen_Qwen3.5-397B-A17B
+    gpus: 8
+    tensor_parallel_size: 8
+    gpu_memory_utilization: 0.95
+    extra_args: ""
+    reasoning_parser: qwen3
+    tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
+    notes: "Example from Fabian"

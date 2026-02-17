@@ -213,7 +213,6 @@ $('#drawerSave').addEventListener('click', async () => {
     $('#drawerError').classList.add('hidden');
 
     const model = $('#drawerModel').value;
-    const gpus = parseInt($('#drawerGpus').value || '1', 10);
     const durationHours = parseInt($('#drawerDuration').value || '1', 10);
 
     if (!model) return drawerError("Please choose a model.");
@@ -233,7 +232,6 @@ $('#drawerSave').addEventListener('click', async () => {
         method: "POST",
         body: JSON.stringify({
           model,
-          gpus,
           duration_seconds: durationHours * 3600,
           begin_at
         })
@@ -250,7 +248,6 @@ $('#drawerSave').addEventListener('click', async () => {
         body: JSON.stringify({
           begin_at: begin.toISOString(),
           end_at: end.toISOString(),
-          requested_gpus: gpus
         })
       });
     }

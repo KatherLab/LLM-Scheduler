@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,7 +34,7 @@ def root_ui():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "time": datetime.utcnow().isoformat()}
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/v1/models", response_model=OpenAIModelsResponse)
 def v1_models():
@@ -108,7 +108,7 @@ async def health_worker():
                         if e.state == "READY":
                             e.state = "FAILED"
                         e.last_error = err
-                    e.last_health_at = datetime.utcnow()
+                    e.last_health_at = datetime.now(timezone.utc)
                 db.commit()
         except Exception:
             pass
@@ -121,7 +121,7 @@ async def planned_submit_worker():
     """
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             lead = timedelta(seconds=settings.scheduler_submit_lead_seconds)
 
             with SessionLocal() as db:

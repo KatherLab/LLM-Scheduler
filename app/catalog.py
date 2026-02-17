@@ -13,6 +13,7 @@ class CatalogModel:
     extra_args: str = ""
     tool_args: str = ""
     reasoning_parser: str | None = None
+    venv_activate: str | None = None
     notes: str = ""
 
 def load_catalog(path: str) -> dict[str, CatalogModel]:
@@ -29,6 +30,7 @@ def load_catalog(path: str) -> dict[str, CatalogModel]:
             extra_args=str(item.get("extra_args", "") or ""),
             tool_args=str(item.get("tool_args", "") or ""),
             reasoning_parser=item.get("reasoning_parser"),
+            venv_activate=item.get("venv_activate"),
             notes=str(item.get("notes", "") or ""),
         )
         out[m.name] = m

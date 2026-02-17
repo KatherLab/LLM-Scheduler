@@ -7,4 +7,5 @@ models:
     extra_args: ""
     reasoning_parser: qwen3
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
+    venv_activate: /root/vllm-nightly-16022026/.venv/bin/activate
     notes: "Example from Fabian"

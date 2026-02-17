@@ -2,11 +2,34 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import String, Integer, DateTime, Text, Index
+from sqlalchemy import String, Integer, DateTime, Text, Index, TypeDecorator
+
 from .db import Base
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class TZDateTime(TypeDecorator):
+    """A DateTime type that ensures UTC timezone on read, even with SQLite."""
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+        return value
+
 
 class Lease(Base):
     __tablename__ = "leases"
@@ -20,10 +43,10 @@ class Lease(Base):
 
     owner: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
-    # UTC-aware timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    begin_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # UTC-aware timestamps — TZDateTime ensures awareness on read
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utc_now)
+    begin_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    end_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
     # PLANNED, SUBMITTED, RUNNING, CANCELED, ENDED, FAILED
     state: Mapped[str] = mapped_column(String(32), default="PLANNED")
@@ -34,8 +57,8 @@ class Lease(Base):
     reasoning_parser: Mapped[str | None] = mapped_column(String(128), nullable=True)
     gpu_memory_utilization: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
-    # NEW: optional venv activation script path
     venv_activate: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class Endpoint(Base):
     __tablename__ = "endpoints"
@@ -46,11 +69,12 @@ class Endpoint(Base):
     port: Mapped[int] = mapped_column(Integer)
     slurm_job_id: Mapped[str] = mapped_column(String(64), index=True)
 
-    state: Mapped[str] = mapped_column(String(32), default="STARTING")  # STARTING, READY, FAILED, STOPPED
+    state: Mapped[str] = mapped_column(String(32), default="STARTING")
 
-    last_health_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_health_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utc_now)
+
 
 Index("ix_endpoints_model_state", Endpoint.model, Endpoint.state)

@@ -35,19 +35,21 @@ def _time_limit_from_duration(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-# Add this helper near the top of the file, after imports:
-def _ensure_aware(dt: datetime) -> datetime:
-    """Ensure datetime is timezone-aware (UTC)."""
+def _ensure_aware(dt: Optional[datetime]) -> datetime:
+    """Ensure datetime is timezone-aware (UTC). If None, return now_utc()."""
+    if dt is None:
+        return now_utc()
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
-# Update the existing helper functions:
 def _lease_begin(l: Lease) -> datetime:
-    return _ensure_aware(l.begin_at or l.created_at)
+    return _ensure_aware(l.begin_at) if l.begin_at is not None else _ensure_aware(l.created_at)
 
 def _lease_end(l: Lease) -> datetime:
-    return _ensure_aware(l.end_at) if l.end_at else (_lease_begin(l) + timedelta(hours=1))
+    if l.end_at is not None:
+        return _ensure_aware(l.end_at)
+    return _lease_begin(l) + timedelta(hours=1)
 
 def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Optional[int] = None, conflict: bool = False) -> LeaseOut:
     return LeaseOut(
@@ -130,12 +132,6 @@ def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
             detail=f"Not enough GPUs available for that time window (needs {candidate.requested_gpus}).",
         )
 
-def _ensure_aware(dt: datetime) -> datetime:
-    """Ensure datetime is timezone-aware (UTC)."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
 def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: datetime, end: datetime) -> Optional[Lease]:
     existing = db.execute(
         select(Lease).where(
@@ -145,8 +141,8 @@ def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: dateti
     ).scalars().first()
     if not existing:
         return None
-    ex_begin = _ensure_aware(_lease_begin(existing))
-    ex_end = _ensure_aware(_lease_end(existing))
+    ex_begin = _lease_begin(existing)
+    ex_end = _lease_end(existing)
     begin = _ensure_aware(begin)
     end = _ensure_aware(end)
     touch = timedelta(minutes=5)
@@ -156,6 +152,7 @@ def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: dateti
         existing.begin_at = min(ex_begin, begin) if existing.begin_at else None
         return existing
     return None
+
 
 # ---------- endpoints ------------------------------------------------------------
 
@@ -256,8 +253,9 @@ def create_lease(req: LeaseCreate):
             requested_tp=tp,
             requested_port=0,
             owner=req.owner,
-            begin_at=req.begin_at,  # keep None if "now"
+            begin_at=req.begin_at,
             end_at=end,
+            created_at=now_utc(),
             model_path=cat.model_path,
             tool_args=req.tool_args if req.tool_args is not None else cat.tool_args,
             extra_args=req.extra_args if req.extra_args is not None else cat.extra_args,
@@ -268,6 +266,7 @@ def create_lease(req: LeaseCreate):
             venv_activate=cat.venv_activate,
             state="PLANNED" if planned else "SUBMITTED",
         )
+
 
         _validate_no_conflicts(db, lease)
 
@@ -417,18 +416,28 @@ async def ensure_default_model_running():
         if non_default_ready:
             return
 
-        existing = db.execute(
+        # Check if there's already an active lease for the default model
+        existing_lease = db.execute(
+            select(Lease).where(
+                Lease.model == default_name,
+                Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"])
+            )
+        ).scalars().first()
+        if existing_lease:
+            return
+
+        existing_ep = db.execute(
             select(Endpoint).where(Endpoint.model == default_name, Endpoint.state.in_(["STARTING", "READY"]))
         ).scalars().first()
-        if existing:
+        if existing_ep:
             return
 
     if default_name not in CATALOG:
         return
 
-    # GPU/TP fixed by catalog (create_lease enforces anyway)
     req = LeaseCreate(model=default_name, owner="default", begin_at=None, duration_seconds=12 * 3600)
     try:
         create_lease(req)
-    except Exception:
-        return
+    except Exception as e:
+        print(f"Failed to create default model lease: {e}")
+

@@ -973,7 +973,8 @@ function renderTimeline() {
     });
 
     const t = new Date(TL.start.getTime() + h * 3600000);
-    const label = `${String(t.getHours()).padStart(2, '0')}:00`;
+    // Use local time display consistently
+    const label = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
     drawText(svg, x + 4, 22, label, {
       fill: dark ? '#94a3b8' : '#64748b',
       'font-size': 12,

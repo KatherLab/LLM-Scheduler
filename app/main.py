@@ -94,11 +94,20 @@ async def default_model_worker():
             pass
         await asyncio.sleep(10)
 
+def _ensure_aware_dt(dt: datetime) -> datetime:
+    if dt is None:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 async def health_worker():
     while True:
         try:
             with SessionLocal() as db:
                 eps = db.execute(select(Endpoint)).scalars().all()
+                now = datetime.now(timezone.utc)
                 for e in eps:
                     ok, err = await health_check_endpoint(e.host, e.port)
                     if ok:
@@ -107,17 +116,21 @@ async def health_worker():
                     else:
                         if e.state == "READY":
                             e.state = "FAILED"
+                        elif e.state == "STARTING":
+                            # If stuck in STARTING for >10 min, mark FAILED
+                            if e.created_at and (now - _ensure_aware_dt(e.created_at)).total_seconds() > 600:
+                                e.state = "FAILED"
                         e.last_error = err
-                    e.last_health_at = datetime.now(timezone.utc)
+                    e.last_health_at = now
                 db.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"health_worker error: {e}")
         await asyncio.sleep(3)
+
 
 async def planned_submit_worker():
     """
     Submits PLANNED bookings shortly before begin_at.
-    This makes rescheduling easy (no Slurm begin juggling).
     """
     while True:
         try:
@@ -136,21 +149,49 @@ async def planned_submit_worker():
                     if not l.begin_at:
                         continue
                     if l.begin_at <= now + lead:
-                        # submit now
                         try:
                             job_id = _submit_to_slurm(l)
                             l.slurm_job_id = job_id
                             l.state = "SUBMITTED"
                         except Exception as e:
                             l.state = "FAILED"
-                        db.commit()
-        except Exception:
-            pass
+                            print(f"Failed to submit planned lease {l.id}: {e}")
+                db.commit()
+        except Exception as e:
+            print(f"planned_submit_worker error: {e}")
 
         await asyncio.sleep(5)
+
+
+async def endpoint_cleanup_worker():
+    """Remove endpoints whose lease has ended or whose Slurm job is gone."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            with SessionLocal() as db:
+                eps = db.execute(
+                    select(Endpoint).where(Endpoint.state.in_(["READY", "STARTING", "FAILED"]))
+                ).scalars().all()
+                for e in eps:
+                    # Check if corresponding lease has ended
+                    lease = db.execute(
+                        select(Lease).where(Lease.slurm_job_id == e.slurm_job_id)
+                    ).scalars().first()
+                    if lease and lease.end_at and _ensure_aware_dt(lease.end_at) < now:
+                        e.state = "STOPPED"
+                        if lease.state == "RUNNING":
+                            lease.state = "ENDED"
+                    elif lease and lease.state in ("CANCELED", "FAILED"):
+                        e.state = "STOPPED"
+                db.commit()
+        except Exception as e:
+            print(f"endpoint_cleanup_worker error: {e}")
+        await asyncio.sleep(15)
+
 
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(health_worker())
     asyncio.create_task(default_model_worker())
     asyncio.create_task(planned_submit_worker())
+    asyncio.create_task(endpoint_cleanup_worker())

@@ -213,6 +213,7 @@ $('#drawerSave').addEventListener('click', async () => {
     $('#drawerError').classList.add('hidden');
 
     const model = $('#drawerModel').value;
+    const gpus = parseInt($('#drawerGpus').value || '1', 10);
     const durationHours = parseInt($('#drawerDuration').value || '1', 10);
 
     if (!model) return drawerError("Please choose a model.");

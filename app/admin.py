@@ -122,6 +122,12 @@ def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
             detail=f"Not enough GPUs available for that time window (needs {candidate.requested_gpus}).",
         )
 
+def _ensure_aware(dt: datetime) -> datetime:
+    """Ensure datetime is timezone-aware (UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
 def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: datetime, end: datetime) -> Optional[Lease]:
     existing = db.execute(
         select(Lease).where(
@@ -129,21 +135,18 @@ def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: dateti
             Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"])
         ).order_by(Lease.id.desc())
     ).scalars().first()
-
     if not existing:
         return None
-
-    ex_begin = _lease_begin(existing)
-    ex_end = _lease_end(existing)
-
+    ex_begin = _ensure_aware(_lease_begin(existing))
+    ex_end = _ensure_aware(_lease_end(existing))
+    begin = _ensure_aware(begin)
+    end = _ensure_aware(end)
     touch = timedelta(minutes=5)
     overlaps_or_touches = not (end < ex_begin - touch or begin > ex_end + touch)
-
     if overlaps_or_touches:
         existing.end_at = max(ex_end, end)
         existing.begin_at = min(ex_begin, begin) if existing.begin_at else None
         return existing
-
     return None
 
 # ---------- endpoints ------------------------------------------------------------

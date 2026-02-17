@@ -12,12 +12,16 @@ class Placement:
 
 def _ensure_aware(dt: datetime) -> datetime:
     """Ensure datetime is timezone-aware (UTC)."""
+    if dt is None:
+        # Fallback to now if somehow None slips through
+        return datetime.now(timezone.utc)
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
 def _t(dt: Optional[datetime], fallback: datetime) -> datetime:
-    return _ensure_aware(dt if dt is not None else fallback)
+    dt = _ensure_aware(dt) if dt is not None else _ensure_aware(fallback)
+    return dt
 
 def compute_placements(
     *,

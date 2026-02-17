@@ -35,11 +35,19 @@ def _time_limit_from_duration(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+# Add this helper near the top of the file, after imports:
+def _ensure_aware(dt: datetime) -> datetime:
+    """Ensure datetime is timezone-aware (UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+# Update the existing helper functions:
 def _lease_begin(l: Lease) -> datetime:
-    return l.begin_at or l.created_at
+    return _ensure_aware(l.begin_at or l.created_at)
 
 def _lease_end(l: Lease) -> datetime:
-    return l.end_at or (_lease_begin(l) + timedelta(hours=1))
+    return _ensure_aware(l.end_at) if l.end_at else (_lease_begin(l) + timedelta(hours=1))
 
 def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Optional[int] = None, conflict: bool = False) -> LeaseOut:
     return LeaseOut(

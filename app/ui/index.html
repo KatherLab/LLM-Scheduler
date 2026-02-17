@@ -16,14 +16,103 @@
     }
   </script>
   <style>
-    .no-select { user-select: none; }
+    .no-select { user-select: none; -webkit-user-select: none; }
     .timeline-scroll::-webkit-scrollbar { height: 10px; width: 10px; }
     .timeline-scroll::-webkit-scrollbar-thumb { background: #475569; border-radius: 6px; }
     .timeline-scroll::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    .timeline-scroll::-webkit-scrollbar-track { background: transparent; }
+
+    /* Popover animations */
+    .popover-enter { animation: popIn 0.15s ease-out; }
+    @keyframes popIn {
+      from { opacity: 0; transform: scale(0.95) translateY(-4px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+
+    /* Now line pulse */
+    .now-line-pulse {
+      animation: nowPulse 2s ease-in-out infinite;
+    }
+    @keyframes nowPulse {
+      0%, 100% { stroke-opacity: 0.9; }
+      50% { stroke-opacity: 0.4; }
+    }
+
+    /* Ghost block during drag */
+    .ghost-block {
+      pointer-events: none;
+      animation: ghostPulse 0.8s ease-in-out infinite alternate;
+    }
+    @keyframes ghostPulse {
+      from { opacity: 0.5; }
+      to { opacity: 0.8; }
+    }
+
+    /* Duration preset buttons */
+    .dur-btn { transition: all 0.1s; }
+    .dur-btn.active {
+      background-color: rgba(14, 165, 233, 0.3) !important;
+      border-color: rgba(14, 165, 233, 0.7) !important;
+      color: #38bdf8 !important;
+    }
+
+    /* Quick-time buttons */
+    .qt-btn { transition: all 0.1s; }
+    .qt-btn.active {
+      background-color: rgba(14, 165, 233, 0.3) !important;
+      border-color: rgba(14, 165, 233, 0.7) !important;
+      color: #38bdf8 !important;
+    }
+
+    /* Resize handles */
+    .resize-handle {
+      cursor: ew-resize;
+    }
+    .resize-handle:hover {
+      fill-opacity: 0.5;
+    }
+
+    /* Toast notifications */
+    .toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .toast {
+      padding: 12px 20px;
+      border-radius: 10px;
+      font-size: 14px;
+      animation: toastIn 0.25s ease-out, toastOut 0.3s ease-in 2.7s forwards;
+      max-width: 360px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    }
+    .toast-success { background: #065f46; color: #a7f3d0; border: 1px solid #059669; }
+    .toast-error { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
+    .toast-info { background: #1e3a5f; color: #93c5fd; border: 1px solid #3b82f6; }
+    @keyframes toastIn { from { opacity:0; transform: translateY(16px); } to { opacity:1; transform: translateY(0); } }
+    @keyframes toastOut { from { opacity:1; } to { opacity:0; transform: translateY(-8px); } }
+
+    /* Snap indicator */
+    .snap-indicator {
+      pointer-events: none;
+      stroke-dasharray: 4 4;
+    }
+
+    /* Conflict highlight during drag */
+    .lane-conflict {
+      fill: rgba(239, 68, 68, 0.08);
+    }
   </style>
 </head>
 
 <body class="bg-gray-50 text-gray-900 dark:bg-slate-900 dark:text-gray-100 min-h-screen flex flex-col">
+
+  <!-- Toast container -->
+  <div id="toastContainer" class="toast-container"></div>
 
   <!-- Header -->
   <header class="sticky top-0 z-40 w-full border-b border-gray-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md">
@@ -39,7 +128,7 @@
       <div class="flex items-center gap-3">
         <button id="themeToggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-slate-800 transition" title="Toggle theme">
           <svg id="iconSun" class="hidden w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-          <svg id="iconMoon" class="block w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 24.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+          <svg id="iconMoon" class="block w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
         </button>
 
         <div class="hidden md:flex items-center gap-2 text-sm">
@@ -57,7 +146,8 @@
           </select>
         </div>
 
-        <button id="refreshBtn" class="px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-md hover:bg-brand-500 transition">
+        <button id="refreshBtn" class="px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-md hover:bg-brand-500 transition flex items-center gap-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
           Refresh
         </button>
       </div>
@@ -100,25 +190,31 @@
             <div>
               <h2 class="text-lg font-semibold">GPU Schedule</h2>
               <p class="text-sm text-slate-500 dark:text-slate-400">
-                Click empty space to schedule. Click a block to extend, move, or stop.
+                <strong>Drag</strong> empty lanes to create · <strong>Drag edges</strong> to resize · <strong>Drag center</strong> to move · <strong>Click</strong> block for actions
               </p>
             </div>
 
             <div class="flex items-center gap-2">
-              <button id="newBookingBtn" class="px-3 py-2 text-sm rounded-md bg-brand-600 text-white hover:bg-brand-500 transition">
+              <button id="newBookingBtn" class="px-3 py-2 text-sm rounded-md bg-brand-600 text-white hover:bg-brand-500 transition flex items-center gap-1">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                 New Booking
               </button>
             </div>
           </div>
 
-          <div class="timeline-scroll overflow-x-auto overflow-y-hidden border-t border-gray-200 dark:border-slate-700">
+          <div id="timelineContainer" class="timeline-scroll overflow-x-auto overflow-y-hidden border-t border-gray-200 dark:border-slate-700 relative">
             <svg id="timelineSvg" class="block no-select"></svg>
+            <!-- Tooltip overlay -->
+            <div id="timelineTooltip" class="hidden absolute pointer-events-none z-30 px-3 py-2 rounded-lg text-xs font-mono bg-slate-800 text-slate-100 border border-slate-600 shadow-lg whitespace-nowrap"></div>
           </div>
 
-          <div id="timelineLegend" class="px-4 py-3 border-t border-gray-200 dark:border-slate-700 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+          <div id="timelineLegend" class="px-4 py-3 border-t border-gray-200 dark:border-slate-700 flex flex-wrap items-center gap-4 text-xs text-slate-500 dark:text-slate-400">
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-emerald-500/30 border border-emerald-400"></span>Running</span>
+            <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-amber-500/30 border border-amber-400"></span>Submitted</span>
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-sky-500/25 border border-sky-400 border-dashed"></span>Planned</span>
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-red-500/25 border border-red-400"></span>Conflict</span>
+            <span class="text-slate-600 dark:text-slate-500">|</span>
+            <span>Drag to create · Resize edges · Move center</span>
           </div>
         </div>
 
@@ -148,53 +244,90 @@
     </div>
   </main>
 
-  <!-- Booking drawer (simple modal) -->
-  <div id="drawerBackdrop" class="fixed inset-0 z-50 hidden bg-black/40" aria-hidden="true"></div>
+  <!-- Booking Modal (replaces drawer) -->
+  <div id="modalBackdrop" class="fixed inset-0 z-50 hidden bg-black/50 backdrop-blur-sm flex items-center justify-center" aria-hidden="true">
+    <div id="bookingModal" class="bg-white dark:bg-slate-900 rounded-2xl border border-gray-200 dark:border-slate-700 shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto popover-enter">
 
-  <div id="bookingDrawer" class="fixed top-0 right-0 z-50 h-full w-full sm:w-[460px] translate-x-full transition-transform duration-200 bg-white dark:bg-slate-900 border-l border-gray-200 dark:border-slate-800 shadow-xl">
-    <div class="p-4 border-b border-gray-200 dark:border-slate-800 flex items-start justify-between">
-      <div>
-        <div id="drawerTitle" class="text-lg font-semibold">New Booking</div>
-        <div id="drawerSubtitle" class="text-xs text-slate-500 dark:text-slate-400">Schedule a model on the GPUs</div>
+      <div class="p-5 border-b border-gray-200 dark:border-slate-800 flex items-start justify-between">
+        <div>
+          <div id="modalTitle" class="text-lg font-semibold">New Booking</div>
+          <div id="modalSubtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-1">Schedule a model on the GPUs</div>
+        </div>
+        <button id="modalClose" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800 transition">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
       </div>
-      <button id="drawerClose" class="p-2 rounded-md hover:bg-gray-100 dark:hover:bg-slate-800">✕</button>
+
+      <div class="p-5 space-y-5">
+        <!-- Model selector -->
+        <div>
+          <label class="block text-sm font-medium mb-1">Model</label>
+          <select id="modalModel" class="w-full px-3 py-2.5 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"></select>
+          <div id="modalModelMeta" class="mt-1.5 text-xs text-slate-500"></div>
+        </div>
+
+        <!-- GPU display (read-only from catalog) -->
+        <div class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">
+          <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+          <span id="modalGpuInfo" class="text-sm text-slate-600 dark:text-slate-300">—</span>
+        </div>
+
+        <!-- Start time -->
+        <div>
+          <label class="block text-sm font-medium mb-2">Start Time</label>
+          <div id="quickTimeButtons" class="flex flex-wrap gap-2 mb-3">
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="0">Now</button>
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="30">+30m</button>
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="60">+1h</button>
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="120">+2h</button>
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="tomorrow9">Tomorrow 9:00</button>
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="custom">Custom…</button>
+          </div>
+          <input id="modalBeginAt" type="datetime-local" class="hidden w-full px-3 py-2.5 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+          <div id="modalStartPreview" class="mt-1 text-xs text-slate-500"></div>
+        </div>
+
+        <!-- Duration -->
+        <div>
+          <label class="block text-sm font-medium mb-2">Duration</label>
+          <div id="durationButtons" class="flex flex-wrap gap-2 mb-3">
+            <button class="dur-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-hours="1">1h</button>
+            <button class="dur-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-hours="2">2h</button>
+            <button class="dur-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-hours="4">4h</button>
+            <button class="dur-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-hours="8">8h</button>
+            <button class="dur-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-hours="12">12h</button>
+            <button class="dur-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-hours="24">24h</button>
+          </div>
+          <div class="flex items-center gap-3">
+            <input id="modalDurationRange" type="range" min="1" max="48" step="1" value="4" class="flex-1 accent-brand-500" />
+            <span id="modalDurationLabel" class="text-sm font-mono text-slate-300 w-12 text-right">4h</span>
+          </div>
+        </div>
+
+        <!-- Error -->
+        <div id="modalError" class="hidden text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3"></div>
+
+        <!-- Actions -->
+        <div class="pt-1 flex gap-3">
+          <button id="modalSave" class="flex-1 px-4 py-2.5 rounded-lg bg-brand-600 text-white font-medium hover:bg-brand-500 transition flex items-center justify-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+            <span id="modalSaveText">Create Booking</span>
+          </button>
+          <button id="modalCancel" class="px-4 py-2.5 rounded-lg border border-gray-300 dark:border-slate-700 hover:bg-gray-50 dark:hover:bg-slate-800 transition">Cancel</button>
+        </div>
+      </div>
     </div>
+  </div>
 
-    <div class="p-4 space-y-4">
-      <div>
-        <label class="block text-sm font-medium">Model</label>
-        <select id="drawerModel" class="mt-1 w-full px-3 py-2 rounded-md bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm"></select>
-        <div id="drawerModelMeta" class="mt-1 text-xs text-slate-500"></div>
+  <!-- Block Popover (context menu for clicking blocks) -->
+  <div id="blockPopover" class="hidden fixed z-50 popover-enter">
+    <div class="bg-white dark:bg-slate-900 rounded-xl border border-gray-200 dark:border-slate-700 shadow-2xl w-72 overflow-hidden">
+      <div id="popoverHeader" class="p-4 border-b border-gray-200 dark:border-slate-800">
+        <div id="popoverModel" class="font-semibold text-sm"></div>
+        <div id="popoverTime" class="text-xs text-slate-500 mt-1"></div>
+        <div id="popoverStatus" class="mt-2"></div>
       </div>
-
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-sm font-medium">GPUs needed</label>
-          <input id="drawerGpus" type="number" min="1" disabled
-  class="mt-1 w-full px-3 py-2 rounded-md bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm opacity-70 cursor-not-allowed" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium">Duration (hours)</label>
-          <input id="drawerDuration" type="number" min="1" step="1" class="mt-1 w-full px-3 py-2 rounded-md bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm" />
-        </div>
-      </div>
-
-      <div>
-        <label class="block text-sm font-medium">Start</label>
-        <select id="drawerStartMode" class="mt-1 w-full px-3 py-2 rounded-md bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm">
-          <option value="now">Start now</option>
-          <option value="time">Schedule time</option>
-        </select>
-        <input id="drawerBeginAt" type="datetime-local" class="mt-2 hidden w-full px-3 py-2 rounded-md bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm" />
-        <p class="mt-2 text-xs text-slate-500">Tip: clicking the timeline pre-fills a start time.</p>
-      </div>
-
-      <div id="drawerError" class="hidden text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-md p-3"></div>
-
-      <div class="pt-2 flex gap-2">
-        <button id="drawerSave" class="flex-1 px-4 py-2 rounded-md bg-brand-600 text-white hover:bg-brand-500 transition">Save</button>
-        <button id="drawerCancel" class="px-4 py-2 rounded-md border border-gray-300 dark:border-slate-700 hover:bg-gray-50 dark:hover:bg-slate-800 transition">Cancel</button>
-      </div>
+      <div id="popoverActions" class="p-3 space-y-2"></div>
     </div>
   </div>
 

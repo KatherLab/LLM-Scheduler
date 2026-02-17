@@ -84,6 +84,13 @@ def _build_job_env(lease: Lease) -> dict[str, str]:
         "REASONING_PARSER": lease.reasoning_parser or "",
         "ROUTER_REGISTER_URL": f"http://{settings.public_hostname}:{settings.router_port}/admin/endpoints/register",
     }
+
+    env.update({
+        "VLLM_HEALTH_TIMEOUT_SECONDS": str(settings.vllm_health_timeout_seconds),
+        "VLLM_MAX_RETRIES": str(settings.vllm_max_retries),
+        "VLLM_RETRY_DELAY_SECONDS": str(settings.vllm_retry_delay_seconds),
+    })
+
     if lease.venv_activate:
         env["VENV_ACTIVATE"] = lease.venv_activate
     return env
@@ -107,7 +114,9 @@ def _submit_to_slurm(lease: Lease) -> str:
         qos=settings.slurm_qos,
         nodelist=settings.slurm_nodelist,
         cpus_per_task=settings.slurm_cpus_per_task,
+        log_dir=settings.vllm_log_dir,  # NEW
     )
+
     return res.job_id
 
 def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
@@ -171,7 +180,8 @@ def _read_log_file(path: str, max_bytes: int = 200_000) -> tuple[str, bool]:
 
 def _find_log_files(slurm_job_id: str) -> tuple[str, str]:
     """Find stdout/stderr log files for a Slurm job."""
-    log_dir = settings.vllm_log_dir
+    log_dir = os.path.abspath(settings.vllm_log_dir)
+
     stdout_pattern = os.path.join(log_dir, f"*-{slurm_job_id}.out")
     stderr_pattern = os.path.join(log_dir, f"*-{slurm_job_id}.err")
 
@@ -181,6 +191,7 @@ def _find_log_files(slurm_job_id: str) -> tuple[str, str]:
     stdout_path = stdout_files[0] if stdout_files else ""
     stderr_path = stderr_files[0] if stderr_files else ""
     return stdout_path, stderr_path
+
 
 
 # ---------- endpoints ------------------------------------------------------------
@@ -540,8 +551,11 @@ def register_endpoint(req: EndpointRegister):
         lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
         if lease:
             lease.requested_port = req.port
-            lease.state = "RUNNING"
+            # Only mark STARTING here; RUNNING will be set when endpoint is READY
+            if lease.state in ("SUBMITTED", "PLANNED"):
+                lease.state = "STARTING"
             db.commit()
+
 
     return EndpointOut(
         id=e.id, model=e.model, host=e.host, port=e.port, slurm_job_id=e.slurm_job_id, state=e.state,

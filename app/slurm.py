@@ -4,17 +4,27 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+
 @dataclass
 class SlurmSubmitResult:
     job_id: str
     raw: str
 
+
 def _run(cmd: list[str], extra_env: dict[str, str] | None = None) -> str:
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    p = subprocess.run(
+        cmd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
     return p.stdout.strip()
+
 
 def submit_vllm_job(
     *,
@@ -29,14 +39,27 @@ def submit_vllm_job(
     qos: str | None = None,
     nodelist: str | None = None,
     cpus_per_task: int = 32,
+    log_dir: str = "./logs",
 ) -> SlurmSubmitResult:
+    # Make logs deterministic and independent of router working directory:
+    # Slurm expands %x=%jobname, %j=%jobid
+    log_dir_abs = os.path.abspath(log_dir)
+    os.makedirs(log_dir_abs, exist_ok=True)
+
+    stdout_path = os.path.join(log_dir_abs, "%x-%j.out")
+    stderr_path = os.path.join(log_dir_abs, "%x-%j.err")
+
     cmd = [
-        "sbatch", "--parsable",
+        "sbatch",
+        "--parsable",
         f"--job-name={job_name}",
         f"--gres=gpu:{gpus}",
         f"--cpus-per-task={cpus_per_task}",
         f"--time={time_limit}",
+        f"--output={stdout_path}",
+        f"--error={stderr_path}",
     ]
+
     if begin is not None:
         cmd.append(f"--begin={begin.strftime('%Y-%m-%dT%H:%M:%S')}")
     if partition:
@@ -48,7 +71,7 @@ def submit_vllm_job(
     if nodelist:
         cmd.append(f"--nodelist={nodelist}")
 
-    # Use --export=ALL to inherit environment, then set vars in the process env
+    # Inherit environment then set vars in the process env
     cmd.append("--export=ALL")
     cmd.append(template_path)
 
@@ -56,11 +79,14 @@ def submit_vllm_job(
     job_id = out.split(";")[0]
     return SlurmSubmitResult(job_id=job_id, raw=out)
 
+
 def cancel(job_id: str) -> None:
     _run(["scancel", job_id])
 
+
 def extend_time(job_id: str, new_time_limit: str) -> None:
     _run(["scontrol", "update", f"JobId={job_id}", f"TimeLimit={new_time_limit}"])
+
 
 def squeue_job_state(job_id: str) -> str | None:
     try:

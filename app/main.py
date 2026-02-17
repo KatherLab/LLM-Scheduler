@@ -16,6 +16,7 @@ from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
 from .proxy import proxy_json_or_stream
 from .admin import _submit_to_slurm  # internal helper
+from . import slurm
 
 app = FastAPI(title="vLLM Swapper Router", version="0.3.0")
 app.include_router(admin_router)
@@ -28,13 +29,16 @@ CATALOG = load_catalog("config/models.yaml")
 
 app.mount("/ui", StaticFiles(directory="app/ui", html=True), name="ui")
 
+
 @app.get("/")
 def root_ui():
     return FileResponse("app/ui/index.html")
 
+
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+
 
 @app.get("/v1/models", response_model=OpenAIModelsResponse)
 def v1_models():
@@ -51,6 +55,7 @@ def v1_models():
         })
     return OpenAIModelsResponse(data=data)
 
+
 def _resolve_upstream(db: Session, model: str) -> str:
     ep = choose_ready_endpoint(db, model)
     if not ep:
@@ -60,6 +65,7 @@ def _resolve_upstream(db: Session, model: str) -> str:
         )
         raise HTTPException(status_code=503, detail=msg)
     return f"http://{ep.host}:{ep.port}"
+
 
 async def _get_model_from_body(request: Request) -> str:
     try:
@@ -71,6 +77,7 @@ async def _get_model_from_body(request: Request) -> str:
         raise HTTPException(status_code=400, detail="Missing 'model' in request body")
     return model
 
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     model = await _get_model_from_body(request)
@@ -78,12 +85,14 @@ async def chat_completions(request: Request):
         upstream = _resolve_upstream(db, model)
     return await proxy_json_or_stream(request, upstream_url=f"{upstream}/v1/chat/completions")
 
+
 @app.post("/v1/messages")
 async def messages(request: Request):
     model = await _get_model_from_body(request)
     with SessionLocal() as db:
         upstream = _resolve_upstream(db, model)
     return await proxy_json_or_stream(request, upstream_url=f"{upstream}/v1/messages")
+
 
 def _ensure_aware_dt(dt: datetime) -> datetime:
     if dt is None:
@@ -99,8 +108,11 @@ async def health_worker():
             with SessionLocal() as db:
                 eps = db.execute(select(Endpoint)).scalars().all()
                 now = datetime.now(timezone.utc)
+
                 for e in eps:
+                    prev_state = e.state
                     ok, err = await health_check_endpoint(e.host, e.port)
+
                     if ok:
                         e.state = "READY"
                         e.last_error = None
@@ -111,7 +123,17 @@ async def health_worker():
                             if e.created_at and (now - _ensure_aware_dt(e.created_at)).total_seconds() > 600:
                                 e.state = "FAILED"
                         e.last_error = err
+
                     e.last_health_at = now
+
+                    # If endpoint just became READY, mark corresponding lease RUNNING
+                    if prev_state != "READY" and e.state == "READY":
+                        lease = db.execute(
+                            select(Lease).where(Lease.slurm_job_id == e.slurm_job_id)
+                        ).scalars().first()
+                        if lease and lease.state in ("SUBMITTED", "STARTING"):
+                            lease.state = "RUNNING"
+
                 db.commit()
         except Exception as e:
             print(f"health_worker error: {e}")
@@ -166,7 +188,7 @@ async def endpoint_cleanup_worker():
                         e.state = "STOPPED"
                         if lease.state == "RUNNING":
                             lease.state = "ENDED"
-                    elif lease and lease.state in ("CANCELED", "FAILED"):
+                    elif lease and lease.state in ("CANCELED", "FAILED", "ENDED"):
                         e.state = "STOPPED"
                 db.commit()
         except Exception as e:
@@ -174,8 +196,50 @@ async def endpoint_cleanup_worker():
         await asyncio.sleep(15)
 
 
+async def slurm_reconcile_worker():
+    """
+    Reconcile leases/endpoints with Slurm reality.
+    - If Slurm job is no longer in squeue, mark lease ENDED/FAILED (depending on endpoint readiness).
+    """
+    while True:
+        try:
+            with SessionLocal() as db:
+                active = db.execute(
+                    select(Lease).where(Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING"]))
+                ).scalars().all()
+
+                for l in active:
+                    if not l.slurm_job_id:
+                        continue
+                    state = slurm.squeue_job_state(l.slurm_job_id)
+
+                    # Not in squeue anymore => finished/failed/canceled (or very fast fail)
+                    if state is None:
+                        ep = db.execute(
+                            select(Endpoint).where(Endpoint.slurm_job_id == l.slurm_job_id)
+                        ).scalars().first()
+
+                        # If it never became READY (or is FAILED), treat as FAILED.
+                        if ep is None or ep.state in ("FAILED", "STARTING"):
+                            l.state = "FAILED"
+                            if ep:
+                                ep.state = "FAILED"
+                        else:
+                            # It was READY at some point, so treat disappearance as ENDED unless user canceled.
+                            if l.state not in ("CANCELED",):
+                                l.state = "ENDED"
+                            if ep:
+                                ep.state = "STOPPED"
+
+                db.commit()
+        except Exception as e:
+            print(f"slurm_reconcile_worker error: {e}")
+        await asyncio.sleep(5)
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(health_worker())
     asyncio.create_task(planned_submit_worker())
     asyncio.create_task(endpoint_cleanup_worker())
+    asyncio.create_task(slurm_reconcile_worker())

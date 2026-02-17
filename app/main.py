@@ -17,7 +17,7 @@ from .router_core import choose_ready_endpoint, health_check_endpoint
 from .proxy import proxy_json_or_stream
 from .admin import _submit_to_slurm  # internal helper
 
-app = FastAPI(title="vLLM Swapper Router", version="0.2.0")
+app = FastAPI(title="vLLM Swapper Router", version="0.3.0")
 app.include_router(admin_router)
 
 engine = make_engine(settings.database_url)
@@ -85,15 +85,6 @@ async def messages(request: Request):
         upstream = _resolve_upstream(db, model)
     return await proxy_json_or_stream(request, upstream_url=f"{upstream}/v1/messages")
 
-async def default_model_worker():
-    from .admin import ensure_default_model_running
-    while True:
-        try:
-            await ensure_default_model_running()
-        except Exception:
-            pass
-        await asyncio.sleep(10)
-
 def _ensure_aware_dt(dt: datetime) -> datetime:
     if dt is None:
         return datetime.now(timezone.utc)
@@ -117,7 +108,6 @@ async def health_worker():
                         if e.state == "READY":
                             e.state = "FAILED"
                         elif e.state == "STARTING":
-                            # If stuck in STARTING for >10 min, mark FAILED
                             if e.created_at and (now - _ensure_aware_dt(e.created_at)).total_seconds() > 600:
                                 e.state = "FAILED"
                         e.last_error = err
@@ -129,9 +119,6 @@ async def health_worker():
 
 
 async def planned_submit_worker():
-    """
-    Submits PLANNED bookings shortly before begin_at.
-    """
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -164,7 +151,6 @@ async def planned_submit_worker():
 
 
 async def endpoint_cleanup_worker():
-    """Remove endpoints whose lease has ended or whose Slurm job is gone."""
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -173,7 +159,6 @@ async def endpoint_cleanup_worker():
                     select(Endpoint).where(Endpoint.state.in_(["READY", "STARTING", "FAILED"]))
                 ).scalars().all()
                 for e in eps:
-                    # Check if corresponding lease has ended
                     lease = db.execute(
                         select(Lease).where(Lease.slurm_job_id == e.slurm_job_id)
                     ).scalars().first()
@@ -192,6 +177,5 @@ async def endpoint_cleanup_worker():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(health_worker())
-    asyncio.create_task(default_model_worker())
     asyncio.create_task(planned_submit_worker())
     asyncio.create_task(endpoint_cleanup_worker())

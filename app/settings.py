@@ -19,15 +19,8 @@ class Settings(BaseSettings):
     vllm_log_dir: str = Field(default="/var/log/vllm", alias="VLLM_LOG_DIR")
     sbatch_template_path: str = Field(default="/opt/vllm-swapper-router/templates/vllm_job.sh", alias="SBATCH_TEMPLATE_PATH")
 
-    # NEW: single-node total GPU count (for planning & timeline)
     total_gpus: int = Field(default=8, alias="TOTAL_GPUS")
-
-    # NEW: planned jobs are submitted shortly before begin_at
     scheduler_submit_lead_seconds: int = Field(default=120, alias="SCHEDULER_SUBMIT_LEAD_SECONDS")
-
-    default_model: str | None = Field(default=None, alias="DEFAULT_MODEL")
-    default_model_gpus: int | None = Field(default=None, alias="DEFAULT_MODEL_GPUS")
-    default_model_tp: int | None = Field(default=None, alias="DEFAULT_MODEL_TP")
 
     allow_on_demand_start: bool = Field(default=False, alias="ALLOW_ON_DEMAND_START")
     on_demand_max_wait_seconds: int = Field(default=30, alias="ON_DEMAND_MAX_WAIT_SECONDS")

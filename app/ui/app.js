@@ -1,5 +1,6 @@
 // ============================================================================
-// Model Hub UI — Full overhaul with drag interactions, popovers, better UX
+// Model Hub UI — Full overhaul with drag-from-catalog, log viewer, stats,
+// stop/shorten, ASAP booking
 // ============================================================================
 
 const $ = (s) => document.querySelector(s);
@@ -48,7 +49,7 @@ let MODEL_MAP = new Map();
 let EDITING_LEASE_ID = null;
 let REFRESH_INTERVAL = null;
 
-// Timeline geometry (recomputed on render)
+// Timeline geometry
 let TL = {
   leftPad: 70,
   headerH: 34,
@@ -79,8 +80,14 @@ function toLocalDTInput(date) {
   const pad = (n) => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
+function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
 
-// Convert SVG client coords to SVG user coords
 function svgPoint(svg, clientX, clientY) {
   const pt = svg.createSVGPoint();
   pt.x = clientX; pt.y = clientY;
@@ -88,13 +95,11 @@ function svgPoint(svg, clientX, clientY) {
   return ctm ? pt.matrixTransform(ctm.inverse()) : pt;
 }
 
-// Convert x position to Date
 function xToDate(x) {
   const hoursFromStart = (x - TL.leftPad) / TL.pxPerHour;
   return new Date(TL.start.getTime() + hoursFromStart * 3600000);
 }
 
-// Convert Date to x position
 function dateToX(d) {
   return TL.leftPad + ((d.getTime() - TL.start.getTime()) / 3600000) * TL.pxPerHour;
 }
@@ -142,23 +147,44 @@ async function refresh() {
     renderCatalog();
     renderTimeline();
     renderTable();
+    renderStatusIndicators();
     populateModalModels();
   } catch (e) {
     toast(e.message, 'error');
   }
 }
 
-// Auto-refresh
 function startAutoRefresh() {
   if (REFRESH_INTERVAL) clearInterval(REFRESH_INTERVAL);
   REFRESH_INTERVAL = setInterval(() => {
-    // Don't refresh during active drag
-    if (dragState.active) return;
+    if (dragState.active || catalogDragState.active) return;
     refresh();
   }, 8000);
 }
 
-// ─── Catalog Rendering ──────────────────────────────────────────────────────
+// ─── Status Indicators (header) ─────────────────────────────────────────────
+function renderStatusIndicators() {
+  const container = $('#statusIndicators');
+  if (!DASH || !DASH.endpoint_stats) { container.innerHTML = ''; return; }
+
+  const stats = DASH.endpoint_stats || [];
+  const readyCount = stats.filter(s => s.state === 'READY').length;
+  const startingCount = stats.filter(s => s.state === 'STARTING').length;
+
+  let html = '';
+  if (readyCount > 0) {
+    html += `<span class="flex items-center gap-1.5"><span class="status-dot-ready"></span>${readyCount} running</span>`;
+  }
+  if (startingCount > 0) {
+    html += `<span class="flex items-center gap-1.5"><span class="status-dot-starting"></span>${startingCount} starting</span>`;
+  }
+  if (readyCount === 0 && startingCount === 0) {
+    html = `<span class="text-slate-500">No models active</span>`;
+  }
+  container.innerHTML = html;
+}
+
+// ─── Catalog Rendering (with drag support) ──────────────────────────────────
 function renderCatalog() {
   const q = $('#searchInput').value.trim().toLowerCase();
   const filter = $('#filterSelect').value;
@@ -182,6 +208,18 @@ function renderCatalog() {
     const notes = meta.notes || '';
     const isRunning = m.ready;
 
+    // Find endpoint stats for this model
+    const epStats = (DASH.endpoint_stats || []).filter(s => s.model === m.id && s.state === 'READY');
+    let statsHtml = '';
+    if (epStats.length > 0) {
+      const ep = epStats[0];
+      const uptime = ep.uptime_seconds ? formatDuration(Math.floor(ep.uptime_seconds)) : '—';
+      statsHtml = `<div class="mt-1.5 text-xs text-slate-500 flex items-center gap-3">
+        <span>⏱ Uptime: ${uptime}</span>
+        <span>📡 ${ep.host}:${ep.port}</span>
+      </div>`;
+    }
+
     const badge = isRunning
       ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>Running
@@ -189,29 +227,37 @@ function renderCatalog() {
       : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-400 border border-slate-500/30">Idle</span>`;
 
     return `
-      <div class="rounded-xl border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 hover:shadow-md hover:border-brand-500/30 transition-all duration-150">
+      <div class="catalog-card rounded-xl border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 hover:shadow-md hover:border-brand-500/30 transition-all duration-150"
+           draggable="true" data-model-id="${escapeHtml(m.id)}">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
             <div class="font-semibold text-sm break-all">${escapeHtml(m.id)}</div>
             <div class="mt-1 text-xs text-slate-500 font-mono">${g} GPUs · TP ${tp}</div>
             ${notes ? `<div class="mt-1 text-xs text-slate-500 italic">${escapeHtml(notes)}</div>` : ''}
+            ${statsHtml}
           </div>
           <div class="shrink-0">${badge}</div>
         </div>
         <div class="mt-3 flex gap-2">
           <button class="flex-1 px-3 py-2 text-xs rounded-lg bg-brand-600 text-white hover:bg-brand-500 transition font-medium"
-            onclick="openNewBookingForModel('${escapeHtml(m.id)}')">
+            onclick="event.stopPropagation(); openNewBookingForModel('${escapeHtml(m.id)}')">
             <svg class="w-3.5 h-3.5 inline mr-1 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
             Schedule
           </button>
           ${isRunning ? `
-            <button class="px-3 py-2 text-xs rounded-lg border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/10 transition"
-              onclick="openChat('${escapeHtml(m.id)}')">Chat</button>
+            <button class="px-3 py-2 text-xs rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 transition"
+              onclick="event.stopPropagation(); viewLogs('${escapeHtml(m.id)}')">Logs</button>
           ` : ''}
         </div>
       </div>
     `;
   }).join('');
+
+  // Attach drag events to catalog cards
+  list.querySelectorAll('.catalog-card[draggable="true"]').forEach(card => {
+    card.addEventListener('dragstart', onCatalogDragStart);
+    card.addEventListener('dragend', onCatalogDragEnd);
+  });
 }
 
 window.openChat = (modelId) => {
@@ -222,6 +268,252 @@ window.openNewBookingForModel = (modelId) => {
   openModal({ model: modelId });
 };
 
+// ─── Catalog Drag-and-Drop onto Timeline ────────────────────────────────────
+const catalogDragState = {
+  active: false,
+  modelId: null,
+  ghostEl: null,
+};
+
+function onCatalogDragStart(e) {
+  const modelId = e.currentTarget.dataset.modelId;
+  catalogDragState.active = true;
+  catalogDragState.modelId = modelId;
+
+  // Set drag data
+  e.dataTransfer.setData('text/plain', modelId);
+  e.dataTransfer.effectAllowed = 'copy';
+
+  // Create a small custom drag image
+  const ghost = document.createElement('div');
+  ghost.className = 'catalog-drag-ghost';
+  ghost.textContent = `📦 ${modelId}`;
+  document.body.appendChild(ghost);
+  catalogDragState.ghostEl = ghost;
+  e.dataTransfer.setDragImage(ghost, 0, 0);
+
+  // Show drop zone overlay
+  setTimeout(() => {
+    $('#dropZoneOverlay').classList.remove('hidden');
+  }, 0);
+}
+
+function onCatalogDragEnd(e) {
+  catalogDragState.active = false;
+  if (catalogDragState.ghostEl) {
+    catalogDragState.ghostEl.remove();
+    catalogDragState.ghostEl = null;
+  }
+  $('#dropZoneOverlay').classList.add('hidden');
+  // Remove any SVG ghost
+  const existing = document.querySelector('.catalog-drop-ghost');
+  if (existing) existing.remove();
+}
+
+// Timeline drop zone handlers
+(function setupTimelineDrop() {
+  const container = $('#timelineContainer');
+
+  container.addEventListener('dragover', (e) => {
+    if (!catalogDragState.active) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+
+    // Show a ghost block on the SVG at the hovered time
+    const svg = $('#timelineSvg');
+    const pt = svgPoint(svg, e.clientX, e.clientY);
+
+    // Remove old ghost
+    const old = svg.querySelector('.catalog-drop-ghost');
+    if (old) old.remove();
+
+    if (pt.x < TL.leftPad || pt.y < TL.headerH || pt.y > TL.height) return;
+
+    const modelId = catalogDragState.modelId;
+    const m = MODEL_MAP.get(modelId);
+    if (!m) return;
+    const gpus = m.meta?.gpus || 1;
+
+    const hoverDate = snapDate(xToDate(pt.x));
+    // Default 4h duration for preview
+    const endDate = new Date(hoverDate.getTime() + 4 * 3600000);
+
+    const x = dateToX(hoverDate);
+    const w = dateToX(endDate) - x;
+    const clickedLane = Math.floor((pt.y - TL.headerH) / TL.laneH);
+    const laneStart = clamp(clickedLane, 0, TL.gpuTotal - gpus);
+    const y = TL.headerH + laneStart * TL.laneH + 4;
+    const h = gpus * TL.laneH - 8;
+
+    const hasConflict = checkVisualConflict(hoverDate, endDate, gpus, null);
+
+    const g = drawGroup(svg, { class: 'catalog-drop-ghost ghost-block' });
+    drawRect(g, x, y, Math.max(8, w), h, {
+      fill: hasConflict ? 'rgba(239, 68, 68, 0.25)' : 'rgba(14, 165, 233, 0.25)',
+      stroke: hasConflict ? 'rgba(239, 68, 68, 0.8)' : 'rgba(14, 165, 233, 0.8)',
+      'stroke-width': 2,
+      'stroke-dasharray': '6 3',
+      rx: 10,
+    });
+    drawText(g, x + 10, y + 18, modelId, {
+      fill: hasConflict ? '#fca5a5' : '#7dd3fc',
+      'font-size': 11,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    });
+    drawText(g, x + 10, y + 34, `${fmtHour(hoverDate)} → ${fmtHour(endDate)} · ${gpus} GPUs`, {
+      fill: hasConflict ? '#fca5a5' : '#7dd3fc',
+      'font-size': 10,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    });
+  });
+
+  container.addEventListener('dragleave', (e) => {
+    // Only if actually leaving the container
+    if (!container.contains(e.relatedTarget)) {
+      const old = document.querySelector('.catalog-drop-ghost');
+      if (old) old.remove();
+    }
+  });
+
+  container.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const old = document.querySelector('.catalog-drop-ghost');
+    if (old) old.remove();
+    $('#dropZoneOverlay').classList.add('hidden');
+
+    if (!catalogDragState.active) return;
+
+    const modelId = catalogDragState.modelId;
+    const svg = $('#timelineSvg');
+    const pt = svgPoint(svg, e.clientX, e.clientY);
+
+    if (pt.x < TL.leftPad) return;
+
+    const dropDate = snapDate(xToDate(pt.x));
+
+    // Open booking modal pre-filled with the model and time
+    openModal({ model: modelId, beginAt: dropDate, durationHours: 4 });
+
+    catalogDragState.active = false;
+    catalogDragState.modelId = null;
+  });
+})();
+
+// ─── Log Viewer ─────────────────────────────────────────────────────────────
+const logModalBackdrop = $('#logModalBackdrop');
+let logState = {
+  leaseId: null,
+  activeTab: 'stdout',
+  data: null,
+};
+
+function openLogModal(leaseId) {
+  logState.leaseId = leaseId;
+  logState.activeTab = 'stdout';
+
+  const lease = DASH?.leases?.find(l => l.id === leaseId);
+  const jobId = lease?.slurm_job_id || '?';
+  $('#logModalTitle').textContent = `Slurm Logs — ${lease?.model || '?'}`;
+  $('#logModalSubtitle').textContent = `Job ID: ${jobId}`;
+  $('#logContent').textContent = 'Loading…';
+  $('#logTruncatedBanner').classList.add('hidden');
+
+  updateLogTabs();
+  logModalBackdrop.classList.remove('hidden');
+  logModalBackdrop.setAttribute('aria-hidden', 'false');
+
+  fetchLogs(leaseId);
+}
+
+function closeLogModal() {
+  logModalBackdrop.classList.add('hidden');
+  logModalBackdrop.setAttribute('aria-hidden', 'true');
+  logState.leaseId = null;
+  logState.data = null;
+}
+
+$('#logModalClose').addEventListener('click', closeLogModal);
+logModalBackdrop.addEventListener('click', (e) => {
+  if (e.target === logModalBackdrop) closeLogModal();
+});
+
+$('#logRefreshBtn').addEventListener('click', () => {
+  if (logState.leaseId) fetchLogs(logState.leaseId);
+});
+
+$('#logTabStdout').addEventListener('click', () => {
+  logState.activeTab = 'stdout';
+  updateLogTabs();
+  renderLogContent();
+});
+
+$('#logTabStderr').addEventListener('click', () => {
+  logState.activeTab = 'stderr';
+  updateLogTabs();
+  renderLogContent();
+});
+
+function updateLogTabs() {
+  const stdoutTab = $('#logTabStdout');
+  const stderrTab = $('#logTabStderr');
+  if (logState.activeTab === 'stdout') {
+    stdoutTab.classList.add('border-brand-500', 'text-brand-400');
+    stdoutTab.classList.remove('border-transparent', 'text-slate-400');
+    stderrTab.classList.remove('border-brand-500', 'text-brand-400');
+    stderrTab.classList.add('border-transparent', 'text-slate-400');
+  } else {
+    stderrTab.classList.add('border-brand-500', 'text-brand-400');
+    stderrTab.classList.remove('border-transparent', 'text-slate-400');
+    stdoutTab.classList.remove('border-brand-500', 'text-brand-400');
+    stdoutTab.classList.add('border-transparent', 'text-slate-400');
+  }
+}
+
+async function fetchLogs(leaseId) {
+  try {
+    const data = await api(`/admin/leases/${leaseId}/logs`);
+    logState.data = data;
+    renderLogContent();
+  } catch (e) {
+    $('#logContent').textContent = `Error loading logs: ${e.message}`;
+  }
+}
+
+function renderLogContent() {
+  if (!logState.data) return;
+  const content = logState.activeTab === 'stdout'
+    ? logState.data.log_stdout
+    : logState.data.log_stderr;
+
+  $('#logContent').textContent = content || '(empty)';
+
+  if (logState.data.truncated) {
+    $('#logTruncatedBanner').classList.remove('hidden');
+  } else {
+    $('#logTruncatedBanner').classList.add('hidden');
+  }
+
+  // Auto-scroll to bottom
+  const scrollContainer = $('#logContent').parentElement;
+  scrollContainer.scrollTop = scrollContainer.scrollHeight;
+}
+
+// Global helper to open logs for a model (finds the active lease)
+window.viewLogs = (modelId) => {
+  const lease = DASH?.leases?.find(l =>
+    l.model === modelId && ['RUNNING', 'SUBMITTED'].includes(l.state) && l.slurm_job_id
+  );
+  if (lease) {
+    openLogModal(lease.id);
+  } else {
+    toast('No active Slurm job found for this model', 'info');
+  }
+};
+
+window.openLogModalForLease = (leaseId) => {
+  openLogModal(leaseId);
+};
+
 // ─── Booking Modal ──────────────────────────────────────────────────────────
 const modalBackdrop = $('#modalBackdrop');
 const modalBeginAt = $('#modalBeginAt');
@@ -229,17 +521,19 @@ const modalDurationRange = $('#modalDurationRange');
 const modalDurationLabel = $('#modalDurationLabel');
 
 let modalState = {
-  mode: 'create', // 'create' or 'edit'
+  mode: 'create',
   leaseId: null,
-  selectedStartOffset: 0, // minutes from now, or 'custom' or 'tomorrow9'
+  selectedStartOffset: 0,
   startDate: null,
   durationHours: 4,
+  asap: false,
 };
 
 function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = null } = {}) {
   modalState.mode = leaseId ? 'edit' : 'create';
   modalState.leaseId = leaseId;
   modalState.durationHours = durationHours;
+  modalState.asap = false;
 
   $('#modalTitle').textContent = leaseId ? 'Edit Booking' : 'New Booking';
   $('#modalSubtitle').textContent = leaseId ? 'Modify a planned booking' : 'Schedule a model on the GPUs';
@@ -285,10 +579,10 @@ modalBackdrop.addEventListener('click', (e) => {
   if (e.target === modalBackdrop) closeModal();
 });
 
-// Escape key
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeModal();
+    closeLogModal();
     hideBlockPopover();
   }
 });
@@ -311,14 +605,19 @@ $('#modalModel').addEventListener('change', () => {
   $('#modalGpuInfo').textContent = `Requires ${meta.gpus} GPUs · TP ${meta.tensor_parallel_size}`;
 });
 
-// Quick time buttons
+// Quick time buttons (including ASAP)
 $$('#quickTimeButtons .qt-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     const offset = btn.dataset.offset;
     modalState.selectedStartOffset = offset;
+    modalState.asap = (offset === 'asap');
     updateQuickTimeButtons(offset);
 
-    if (offset === 'custom') {
+    if (offset === 'asap') {
+      modalBeginAt.classList.add('hidden');
+      modalState.startDate = null;
+      $('#modalStartPreview').textContent = 'Starting: As soon as possible (auto-find earliest slot)';
+    } else if (offset === 'custom') {
       modalBeginAt.classList.remove('hidden');
       const now = new Date();
       now.setMinutes(Math.ceil(now.getMinutes() / 15) * 15, 0, 0);
@@ -397,14 +696,21 @@ $('#modalSave').addEventListener('click', async () => {
     if (durationHours < 1) { showModalError("Duration must be at least 1 hour."); return; }
 
     if (modalState.mode === 'create') {
-      const beginAt = modalState.startDate ? modalState.startDate.toISOString() : null;
+      const payload = {
+        model,
+        duration_seconds: durationHours * 3600,
+      };
+
+      if (modalState.asap) {
+        payload.asap = true;
+        // begin_at is null — server finds earliest slot
+      } else {
+        payload.begin_at = modalState.startDate ? modalState.startDate.toISOString() : null;
+      }
+
       await api("/admin/leases", {
         method: "POST",
-        body: JSON.stringify({
-          model,
-          duration_seconds: durationHours * 3600,
-          begin_at: beginAt,
-        })
+        body: JSON.stringify(payload)
       });
       toast(`Booking created for ${model}`, 'success');
     } else {
@@ -433,7 +739,7 @@ function showModalError(msg) {
   el.classList.remove('hidden');
 }
 
-// ─── Block Popover ──────────────────────────────────────────────────────────
+// ─── Block Popover (with stop, shorten, logs) ───────────────────────────────
 const blockPopover = $('#blockPopover');
 let popoverLeaseId = null;
 
@@ -442,9 +748,24 @@ function showBlockPopover(lease, anchorX, anchorY) {
 
   const b = new Date(lease.begin_at || lease.created_at);
   const e = new Date(lease.end_at);
+  const durationSec = (e - b) / 1000;
 
   $('#popoverModel').textContent = lease.model;
-  $('#popoverTime').textContent = `${fmtTime(b)} → ${fmtTime(e)} (${lease.requested_gpus} GPUs)`;
+  $('#popoverTime').textContent = `${fmtTime(b)} → ${fmtTime(e)} (${formatDuration(durationSec)})`;
+
+  // Stats from endpoint_stats
+  const epStats = (DASH?.endpoint_stats || []).find(s => s.model === lease.model && s.state === 'READY');
+  if (epStats) {
+    const uptime = epStats.uptime_seconds ? formatDuration(Math.floor(epStats.uptime_seconds)) : '—';
+    $('#popoverStats').innerHTML = `
+      <div class="flex items-center gap-3 text-xs text-slate-400">
+        <span>⏱ ${uptime}</span>
+        <span>📡 ${epStats.host}:${epStats.port}</span>
+      </div>
+    `;
+  } else {
+    $('#popoverStats').innerHTML = '';
+  }
 
   const stateColors = {
     RUNNING: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
@@ -462,7 +783,7 @@ function showBlockPopover(lease, anchorX, anchorY) {
   const actionsEl = $('#popoverActions');
   actionsEl.innerHTML = '';
 
-  // Extend buttons (for RUNNING/SUBMITTED)
+  // Extend buttons
   if (['RUNNING', 'SUBMITTED', 'PLANNED'].includes(lease.state)) {
     const extendRow = document.createElement('div');
     extendRow.className = 'flex gap-2';
@@ -492,6 +813,56 @@ function showBlockPopover(lease, anchorX, anchorY) {
     actionsEl.appendChild(extendRow);
   }
 
+  // Shorten (for RUNNING/SUBMITTED)
+  if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
+    const shortenRow = document.createElement('div');
+    shortenRow.className = 'flex gap-2';
+
+    // Shorten by 1h, 2h, or to "in 30 min"
+    const now = new Date();
+    const currentEnd = new Date(lease.end_at);
+    const remainingSec = (currentEnd - now) / 1000;
+
+    const shortenOptions = [];
+    if (remainingSec > 1800 + 300) {
+      shortenOptions.push({ label: 'End in 30m', newEnd: new Date(now.getTime() + 30 * 60000) });
+    }
+    if (remainingSec > 3600 + 300) {
+      shortenOptions.push({ label: 'End in 1h', newEnd: new Date(now.getTime() + 3600000) });
+    }
+    if (remainingSec > 7200 + 300) {
+      shortenOptions.push({ label: '-2h', newEnd: new Date(currentEnd.getTime() - 7200000) });
+    }
+
+    shortenOptions.forEach(({ label, newEnd }) => {
+      const btn = document.createElement('button');
+      btn.className = 'flex-1 px-2 py-1.5 text-xs rounded-lg bg-amber-600/20 text-amber-300 border border-amber-500/30 hover:bg-amber-600/30 transition font-medium';
+      btn.textContent = label;
+      btn.addEventListener('click', async () => {
+        try {
+          await api(`/admin/leases/${lease.id}/shorten`, {
+            method: "POST",
+            body: JSON.stringify({ new_end_at: newEnd.toISOString() })
+          });
+          toast(`Shortened: new end ${fmtTime(newEnd)}`, 'success');
+          hideBlockPopover();
+          await refresh();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      });
+      shortenRow.appendChild(btn);
+    });
+
+    if (shortenOptions.length > 0) {
+      const label = document.createElement('div');
+      label.className = 'text-xs text-slate-500 mb-1';
+      label.textContent = 'Shorten:';
+      actionsEl.appendChild(label);
+      actionsEl.appendChild(shortenRow);
+    }
+  }
+
   // Edit (PLANNED only)
   if (lease.state === 'PLANNED') {
     const editBtn = document.createElement('button');
@@ -499,37 +870,67 @@ function showBlockPopover(lease, anchorX, anchorY) {
     editBtn.textContent = 'Edit Booking';
     editBtn.addEventListener('click', () => {
       hideBlockPopover();
-      const b = new Date(lease.begin_at || lease.created_at);
-      const e = new Date(lease.end_at);
       const hours = Math.max(1, Math.round((e - b) / 3600000));
       openModal({ model: lease.model, beginAt: b, durationHours: hours, leaseId: lease.id });
     });
     actionsEl.appendChild(editBtn);
   }
 
-  // Stop/Cancel
-  const stopBtn = document.createElement('button');
-  stopBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition font-medium';
-  stopBtn.textContent = lease.state === 'PLANNED' ? 'Remove Booking' : 'Stop / Cancel';
-  stopBtn.addEventListener('click', async () => {
-    try {
-      await api(`/admin/leases/${lease.id}`, { method: "DELETE" });
-      toast('Booking removed', 'success');
+  // Logs (if has slurm job)
+  if (lease.slurm_job_id) {
+    const logBtn = document.createElement('button');
+    logBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-slate-600/20 text-slate-300 border border-slate-500/30 hover:bg-slate-600/30 transition font-medium flex items-center justify-center gap-1.5';
+    logBtn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg> View Logs`;
+    logBtn.addEventListener('click', () => {
       hideBlockPopover();
-      await refresh();
-    } catch (err) {
-      toast(err.message, 'error');
-    }
-  });
-  actionsEl.appendChild(stopBtn);
+      openLogModal(lease.id);
+    });
+    actionsEl.appendChild(logBtn);
+  }
+
+  // Stop Now (for RUNNING/SUBMITTED)
+  if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
+    const stopNowBtn = document.createElement('button');
+    stopNowBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition font-medium';
+    stopNowBtn.textContent = '⏹ Stop Now';
+    stopNowBtn.addEventListener('click', async () => {
+      if (!confirm(`Stop ${lease.model} immediately? This will cancel the Slurm job.`)) return;
+      try {
+        await api(`/admin/leases/${lease.id}/stop`, { method: "POST" });
+        toast('Model stopped', 'success');
+        hideBlockPopover();
+        await refresh();
+      } catch (err) {
+        toast(err.message, 'error');
+      }
+    });
+    actionsEl.appendChild(stopNowBtn);
+  }
+
+  // Cancel/Remove (for PLANNED)
+  if (lease.state === 'PLANNED') {
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition font-medium';
+    removeBtn.textContent = 'Remove Booking';
+    removeBtn.addEventListener('click', async () => {
+      try {
+        await api(`/admin/leases/${lease.id}`, { method: "DELETE" });
+        toast('Booking removed', 'success');
+        hideBlockPopover();
+        await refresh();
+      } catch (err) {
+        toast(err.message, 'error');
+      }
+    });
+    actionsEl.appendChild(removeBtn);
+  }
 
   // Position
-  const popW = 288;
-  const popH = actionsEl.childElementCount * 40 + 120; // rough estimate
+  const popW = 320;
+  const popH = actionsEl.childElementCount * 44 + 160;
   let left = anchorX + 8;
   let top = anchorY - 20;
 
-  // Keep on screen
   if (left + popW > window.innerWidth - 16) left = anchorX - popW - 8;
   if (top + popH > window.innerHeight - 16) top = window.innerHeight - popH - 16;
   if (top < 8) top = 8;
@@ -544,7 +945,6 @@ function hideBlockPopover() {
   popoverLeaseId = null;
 }
 
-// Close popover on outside click
 document.addEventListener('mousedown', (e) => {
   if (!blockPopover.classList.contains('hidden') && !blockPopover.contains(e.target)) {
     hideBlockPopover();
@@ -554,7 +954,7 @@ document.addEventListener('mousedown', (e) => {
 // ─── Drag State Machine ─────────────────────────────────────────────────────
 const dragState = {
   active: false,
-  type: null, // 'create' | 'resize-left' | 'resize-right' | 'move'
+  type: null,
   leaseId: null,
   lease: null,
   startX: 0,
@@ -564,10 +964,10 @@ const dragState = {
   origEnd: null,
   ghostEl: null,
   snapLines: [],
-  committed: false, // has drag moved enough to be intentional
+  committed: false,
 };
 
-const DRAG_THRESHOLD = 5; // px before drag activates
+const DRAG_THRESHOLD = 5;
 const SNAP_MINUTES = 15;
 
 function snapDate(d) {
@@ -578,8 +978,6 @@ function snapDate(d) {
 
 function initDragHandlers() {
   const svg = $('#timelineSvg');
-  const container = $('#timelineContainer');
-
   svg.addEventListener('pointerdown', onPointerDown);
   document.addEventListener('pointermove', onPointerMove);
   document.addEventListener('pointerup', onPointerUp);
@@ -611,7 +1009,7 @@ function onPointerDown(e) {
     } else if (lease.state === 'PLANNED' && !handleType) {
       startDrag(e, 'move', lease, pt);
     }
-    // For non-PLANNED, clicking body opens popover (handled separately)
+    // For non-PLANNED, clicking body opens popover (handled in pointerUp)
     return;
   }
 
@@ -714,13 +1112,10 @@ function updateDragGhost(pt) {
     const d2 = snapDate(xToDate(pt.x));
     ghostBegin = new Date(Math.min(d1, d2));
     ghostEnd = new Date(Math.max(d1, d2));
-    // Minimum 15 min
     if (ghostEnd - ghostBegin < 15 * 60000) {
       ghostEnd = new Date(ghostBegin.getTime() + 15 * 60000);
     }
-    // Determine lane from Y position
     const clickedLane = Math.floor((pt.y - TL.headerH) / TL.laneH);
-    // Default to first model's GPU count or 1
     const defaultGpus = DASH?.models?.[0]?.meta?.gpus || 1;
     laneStart = clamp(clickedLane, 0, TL.gpuTotal - defaultGpus);
     laneCount = defaultGpus;
@@ -753,7 +1148,6 @@ function updateDragGhost(pt) {
   const y = TL.headerH + laneStart * TL.laneH + 4;
   const h = laneCount * TL.laneH - 8;
 
-  // Check for conflicts visually
   const hasConflict = checkVisualConflict(ghostBegin, ghostEnd, laneCount, dragState.leaseId);
 
   const ghost = drawGroup(svg, { class: 'ghost-block' });
@@ -765,7 +1159,6 @@ function updateDragGhost(pt) {
     rx: 10,
   });
 
-  // Label
   const model = dragState.lease?.model || (DASH?.models?.[0]?.id || 'New');
   drawText(ghost, x + 10, y + 20, `${model}`, {
     fill: hasConflict ? '#fca5a5' : '#7dd3fc',
@@ -791,8 +1184,6 @@ function checkVisualConflict(begin, end, gpusNeeded, excludeLeaseId = null) {
     ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) && l.id !== excludeLeaseId
   );
 
-  // Simple check: at each moment in [begin, end], sum GPUs in use + gpusNeeded <= total
-  // We check at discrete points (every 15 min) for performance
   const step = 15 * 60000;
   for (let t = begin.getTime(); t < end.getTime(); t += step) {
     const moment = new Date(t);
@@ -855,7 +1246,6 @@ async function commitDrag() {
 
   try {
     if (dragState.type === 'create') {
-      // Open modal pre-filled with the dragged time range
       const durationHours = Math.max(1, Math.round((end - begin) / 3600000));
       openModal({ beginAt: begin, durationHours });
       resetDrag();
@@ -879,7 +1269,7 @@ async function commitDrag() {
         });
         toast('Booking resized', 'success');
       } else {
-        // RUNNING/SUBMITTED — use extend
+        // RUNNING/SUBMITTED — use extend or shorten
         if (diffSeconds > 0) {
           await api(`/admin/leases/${lease.id}/extend`, {
             method: "POST",
@@ -887,7 +1277,12 @@ async function commitDrag() {
           });
           toast(`Extended by ${Math.round(diffSeconds / 60)}m`, 'success');
         } else {
-          toast('Cannot shorten a running booking from the timeline', 'info');
+          // Shorten via new endpoint
+          await api(`/admin/leases/${lease.id}/shorten`, {
+            method: "POST",
+            body: JSON.stringify({ new_end_at: end.toISOString() })
+          });
+          toast(`Shortened to ${fmtTime(end)}`, 'success');
         }
       }
     }
@@ -938,6 +1333,14 @@ function resetDrag() {
   hideTimelineTooltip();
 }
 
+// Helper for catalog drag ghost conflict detection
+function snapDate(d) {
+  // Already defined above but needed for catalog drag context
+  const snapped = new Date(d);
+  snapped.setMinutes(Math.round(snapped.getMinutes() / SNAP_MINUTES) * SNAP_MINUTES, 0, 0);
+  return snapped;
+}
+
 // ─── Timeline Rendering ─────────────────────────────────────────────────────
 function renderTimeline() {
   const svg = $('#timelineSvg');
@@ -964,6 +1367,20 @@ function renderTimeline() {
   // Background
   drawRect(svg, 0, 0, TL.width, TL.height, { fill: dark ? '#0b1220' : '#ffffff' });
 
+  // SVG defs for glow filter
+  const defs = svgEl('defs');
+  const filter = svgEl('filter', { id: 'glow', x: '-50%', y: '-50%', width: '200%', height: '200%' });
+  const blur = svgEl('feGaussianBlur', { stdDeviation: '3', result: 'coloredBlur' });
+  filter.appendChild(blur);
+  const merge = svgEl('feMerge');
+  const mn1 = svgEl('feMergeNode', { in: 'coloredBlur' });
+  const mn2 = svgEl('feMergeNode', { in: 'SourceGraphic' });
+  merge.appendChild(mn1);
+  merge.appendChild(mn2);
+  filter.appendChild(merge);
+  defs.appendChild(filter);
+  svg.appendChild(defs);
+
   // Time grid
   for (let h = 0; h <= hours; h++) {
     const x = TL.leftPad + h * pxPerHour;
@@ -973,7 +1390,6 @@ function renderTimeline() {
     });
 
     const t = new Date(TL.start.getTime() + h * 3600000);
-    // Use local time display consistently
     const label = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
     drawText(svg, x + 4, 22, label, {
       fill: dark ? '#94a3b8' : '#64748b',
@@ -1027,7 +1443,6 @@ function renderTimeline() {
     class: 'now-line-pulse',
   });
 
-  // Small "now" label
   drawText(svg, nowX + 4, 12, 'now', {
     fill: '#0ea5e9',
     'font-size': 10,
@@ -1038,7 +1453,7 @@ function renderTimeline() {
   // Auto-scroll to now on first render
   const container = $('#timelineContainer');
   const scrollTarget = nowX - 200;
-  if (scrollTarget > 0 && !dragState.active) {
+  if (scrollTarget > 0 && !dragState.active && !catalogDragState.active) {
     container.scrollLeft = scrollTarget;
   }
 }
@@ -1085,7 +1500,7 @@ function drawLeaseBlock(svg, l) {
   const g = drawGroup(svg, { 'data-lease-id': l.id, cursor: 'pointer' });
 
   // Main rect
-  const blockRect = drawRect(g, x, y, Math.max(8, w), h, {
+  drawRect(g, x, y, Math.max(8, w), h, {
     fill, stroke, 'stroke-width': 2,
     ...(dash ? { 'stroke-dasharray': dash } : {}),
     rx: 10,
@@ -1102,7 +1517,6 @@ function drawLeaseBlock(svg, l) {
       'pointer-events': 'none',
     });
 
-    // Time range
     const timeLabel = `${fmtHour(b)} → ${fmtHour(e)} · ${l.state}${isConflict ? ' ⚠' : ''}`;
     drawText(g, x + 10, y + 34, timeLabel, {
       fill: dark ? '#94a3b8' : '#64748b',
@@ -1112,10 +1526,10 @@ function drawLeaseBlock(svg, l) {
     });
   }
 
-  // Resize handles (visual indicators at left/right edges)
+  // Resize handles
   const handleW = 8;
 
-  // Right handle (always for resizable states)
+  // Right handle (for all active states — can extend or shorten)
   if (['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) && w > 20) {
     drawRect(g, x + Math.max(8, w) - handleW, y, handleW, h, {
       fill: 'transparent',
@@ -1124,15 +1538,13 @@ function drawLeaseBlock(svg, l) {
       'data-lease-id': l.id,
       cursor: 'ew-resize',
     });
-    // Visual grip dots
     const cx = x + Math.max(8, w) - handleW / 2;
     for (let dy = -6; dy <= 6; dy += 6) {
-      const dot = svgEl('circle', {
+      g.appendChild(svgEl('circle', {
         cx, cy: y + h / 2 + dy, r: 1.5,
         fill: dark ? '#64748b' : '#94a3b8',
         'pointer-events': 'none',
-      });
-      g.appendChild(dot);
+      }));
     }
   }
 
@@ -1147,12 +1559,11 @@ function drawLeaseBlock(svg, l) {
     });
     const cx = x + handleW / 2;
     for (let dy = -6; dy <= 6; dy += 6) {
-      const dot = svgEl('circle', {
+      g.appendChild(svgEl('circle', {
         cx, cy: y + h / 2 + dy, r: 1.5,
         fill: dark ? '#64748b' : '#94a3b8',
         'pointer-events': 'none',
-      });
-      g.appendChild(dot);
+      }));
     }
   }
 
@@ -1169,7 +1580,7 @@ function drawLeaseBlock(svg, l) {
   }
 }
 
-// ─── Table Rendering ─────────────────────────────────────────────────────────
+// ─── Table Rendering ────────────────────────────────────────────────────────
 function renderTable() {
   const body = $('#leasesTableBody');
 
@@ -1183,6 +1594,7 @@ function renderTable() {
     const b = new Date(l.begin_at || l.created_at);
     const e = new Date(l.end_at);
     const when = `${fmtTime(b)} → ${fmtTime(e)}`;
+    const durationSec = (e - b) / 1000;
 
     const statusBadge = l.conflict
       ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-red-500/15 text-red-300 border border-red-500/30">Conflict</span>`
@@ -1197,17 +1609,26 @@ function renderTable() {
             : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-300 border border-slate-500/30">${escapeHtml(l.state)}</span>`;
 
     let actions = '';
+
+    // Log button (if has slurm job)
+    const logBtn = l.slurm_job_id
+      ? `<button class="text-xs px-2 py-1 rounded bg-slate-600/20 text-slate-300 border border-slate-500/30 hover:bg-slate-600/30 transition" onclick="openLogModalForLease(${l.id})" title="View Logs">📋</button>`
+      : '';
+
     if (l.state === 'PLANNED') {
       actions = `
         <button class="text-xs px-2 py-1 rounded bg-brand-600/20 text-brand-300 border border-brand-500/30 hover:bg-brand-600/30 transition" onclick="editLease(${l.id})">Edit</button>
         <button class="text-xs px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition" onclick="extendLease(${l.id}, 3600)">+1h</button>
+        ${logBtn}
         <button class="text-xs px-2 py-1 rounded bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition" onclick="stopLease(${l.id})">Remove</button>
       `;
     } else {
-      actions = `
+            actions = `
         <button class="text-xs px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition" onclick="extendLease(${l.id}, 3600)">+1h</button>
         <button class="text-xs px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition" onclick="extendLease(${l.id}, 7200)">+2h</button>
-        <button class="text-xs px-2 py-1 rounded bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition" onclick="stopLease(${l.id})">Stop</button>
+        ${logBtn}
+        <button class="text-xs px-2 py-1 rounded bg-amber-600/20 text-amber-300 border border-amber-500/30 hover:bg-amber-600/30 transition" onclick="shortenLeasePrompt(${l.id})">Shorten</button>
+        <button class="text-xs px-2 py-1 rounded bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition" onclick="stopLeaseNow(${l.id})">Stop</button>
       `;
     }
 
@@ -1217,7 +1638,7 @@ function renderTable() {
         <td class="px-4 py-3 text-sm">${statusBadge}</td>
         <td class="px-4 py-3 text-sm text-slate-500 dark:text-slate-400 font-mono">${when}</td>
         <td class="px-4 py-3 text-sm text-slate-400 font-mono">${l.requested_gpus}</td>
-        <td class="px-4 py-3 text-sm text-right"><div class="flex justify-end gap-2">${actions}</div></td>
+        <td class="px-4 py-3 text-sm text-right"><div class="flex justify-end gap-2 flex-wrap">${actions}</div></td>
       </tr>
     `;
   }).join('');
@@ -1228,6 +1649,19 @@ window.stopLease = async (id) => {
   try {
     await api(`/admin/leases/${id}`, { method: "DELETE" });
     toast('Booking removed', 'success');
+    await refresh();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+};
+
+window.stopLeaseNow = async (id) => {
+  const lease = DASH?.leases?.find(l => l.id === id);
+  const name = lease?.model || 'this model';
+  if (!confirm(`Stop ${name} immediately? This will cancel the Slurm job.`)) return;
+  try {
+    await api(`/admin/leases/${id}/stop`, { method: "POST" });
+    toast('Model stopped', 'success');
     await refresh();
   } catch (e) {
     toast(e.message, 'error');
@@ -1257,7 +1691,58 @@ window.editLease = (id) => {
   openModal({ model: lease.model, beginAt: b, durationHours: hours, leaseId: lease.id });
 };
 
-// ─── Controls & Init ─────────────────────────────────────────────────────────
+window.shortenLeasePrompt = async (id) => {
+  const lease = DASH?.leases?.find(l => l.id === id);
+  if (!lease) return;
+
+  const now = new Date();
+  const currentEnd = new Date(lease.end_at);
+  const remainingMin = Math.round((currentEnd - now) / 60000);
+
+  if (remainingMin <= 5) {
+    toast('Booking ends too soon to shorten', 'info');
+    return;
+  }
+
+  // Simple prompt: ask how many minutes from now to end
+  const options = [];
+  if (remainingMin > 30) options.push('30 minutes');
+  if (remainingMin > 60) options.push('1 hour');
+  if (remainingMin > 120) options.push('2 hours');
+
+  const choice = prompt(
+    `Current end: ${fmtTime(currentEnd)} (${remainingMin}m remaining)\n\n` +
+    `Enter minutes from now to set new end time:\n` +
+    `(Suggestions: ${options.join(', ') || 'N/A'})`,
+    Math.min(60, Math.floor(remainingMin / 2)).toString()
+  );
+
+  if (!choice) return;
+  const mins = parseInt(choice, 10);
+  if (isNaN(mins) || mins < 1) {
+    toast('Invalid number of minutes', 'error');
+    return;
+  }
+
+  const newEnd = new Date(now.getTime() + mins * 60000);
+  if (newEnd >= currentEnd) {
+    toast('New end must be before current end. Use extend instead.', 'info');
+    return;
+  }
+
+  try {
+    await api(`/admin/leases/${id}/shorten`, {
+      method: "POST",
+      body: JSON.stringify({ new_end_at: newEnd.toISOString() })
+    });
+    toast(`Shortened to end at ${fmtTime(newEnd)}`, 'success');
+    await refresh();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+};
+
+// ─── Controls & Init ────────────────────────────────────────────────────────
 $('#refreshBtn').addEventListener('click', refresh);
 $('#windowSelect').addEventListener('change', () => { if (DASH) renderTimeline(); });
 $('#zoomSelect').addEventListener('change', () => { if (DASH) renderTimeline(); });

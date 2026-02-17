@@ -22,33 +22,21 @@
     .timeline-scroll::-webkit-scrollbar-thumb:hover { background: #64748b; }
     .timeline-scroll::-webkit-scrollbar-track { background: transparent; }
 
-    /* Popover animations */
     .popover-enter { animation: popIn 0.15s ease-out; }
     @keyframes popIn {
       from { opacity: 0; transform: scale(0.95) translateY(-4px); }
       to { opacity: 1; transform: scale(1) translateY(0); }
     }
 
-    /* Now line pulse */
-    .now-line-pulse {
-      animation: nowPulse 2s ease-in-out infinite;
-    }
+    .now-line-pulse { animation: nowPulse 2s ease-in-out infinite; }
     @keyframes nowPulse {
       0%, 100% { stroke-opacity: 0.9; }
       50% { stroke-opacity: 0.4; }
     }
 
-    /* Ghost block during drag */
-    .ghost-block {
-      pointer-events: none;
-      animation: ghostPulse 0.8s ease-in-out infinite alternate;
-    }
-    @keyframes ghostPulse {
-      from { opacity: 0.5; }
-      to { opacity: 0.8; }
-    }
+    .ghost-block { pointer-events: none; animation: ghostPulse 0.8s ease-in-out infinite alternate; }
+    @keyframes ghostPulse { from { opacity: 0.5; } to { opacity: 0.8; } }
 
-    /* Duration preset buttons */
     .dur-btn { transition: all 0.1s; }
     .dur-btn.active {
       background-color: rgba(14, 165, 233, 0.3) !important;
@@ -56,7 +44,6 @@
       color: #38bdf8 !important;
     }
 
-    /* Quick-time buttons */
     .qt-btn { transition: all 0.1s; }
     .qt-btn.active {
       background-color: rgba(14, 165, 233, 0.3) !important;
@@ -64,48 +51,36 @@
       color: #38bdf8 !important;
     }
 
-    /* Resize handles */
-    .resize-handle {
-      cursor: ew-resize;
-    }
-    .resize-handle:hover {
-      fill-opacity: 0.5;
-    }
+    .resize-handle { cursor: ew-resize; }
+    .resize-handle:hover { fill-opacity: 0.5; }
 
-    /* Toast notifications */
-    .toast-container {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 9999;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .toast {
-      padding: 12px 20px;
-      border-radius: 10px;
-      font-size: 14px;
-      animation: toastIn 0.25s ease-out, toastOut 0.3s ease-in 2.7s forwards;
-      max-width: 360px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
-    }
+    .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+    .toast { padding: 12px 20px; border-radius: 10px; font-size: 14px; animation: toastIn 0.25s ease-out, toastOut 0.3s ease-in 2.7s forwards; max-width: 360px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
     .toast-success { background: #065f46; color: #a7f3d0; border: 1px solid #059669; }
     .toast-error { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
     .toast-info { background: #1e3a5f; color: #93c5fd; border: 1px solid #3b82f6; }
     @keyframes toastIn { from { opacity:0; transform: translateY(16px); } to { opacity:1; transform: translateY(0); } }
     @keyframes toastOut { from { opacity:1; } to { opacity:0; transform: translateY(-8px); } }
 
-    /* Snap indicator */
-    .snap-indicator {
-      pointer-events: none;
-      stroke-dasharray: 4 4;
+    /* Drag-from-catalog visual */
+    .catalog-card[draggable="true"] { cursor: grab; }
+    .catalog-card[draggable="true"]:active { cursor: grabbing; }
+    .catalog-drag-ghost {
+      position: fixed; z-index: 9999; pointer-events: none;
+      padding: 8px 16px; border-radius: 10px;
+      background: rgba(14, 165, 233, 0.85); color: white;
+      font-size: 13px; font-weight: 600; white-space: nowrap;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     }
 
-    /* Conflict highlight during drag */
-    .lane-conflict {
-      fill: rgba(239, 68, 68, 0.08);
-    }
+    /* Log modal */
+    .log-content { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+
+    /* Status pulse */
+    .status-dot-ready { width: 8px; height: 8px; border-radius: 50%; background: #10b981; animation: statusPulse 2s ease-in-out infinite; }
+    .status-dot-starting { width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; animation: statusPulse 1s ease-in-out infinite; }
+    .status-dot-failed { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
+    @keyframes statusPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
   </style>
 </head>
 
@@ -126,6 +101,9 @@
       </div>
 
       <div class="flex items-center gap-3">
+        <!-- Status indicators -->
+        <div id="statusIndicators" class="hidden md:flex items-center gap-3 text-xs"></div>
+
         <button id="themeToggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-slate-800 transition" title="Toggle theme">
           <svg id="iconSun" class="hidden w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
           <svg id="iconMoon" class="block w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
@@ -165,6 +143,7 @@
             <h2 class="text-lg font-semibold">Model Catalog</h2>
             <span id="modelCount" class="text-xs text-slate-500">—</span>
           </div>
+          <p class="text-xs text-slate-500 mt-1">Drag a model onto the timeline, or click Schedule</p>
 
           <div class="mt-3 flex gap-2">
             <input id="searchInput" type="text" placeholder="Search models…" class="flex-1 px-3 py-2 rounded-md bg-white dark:bg-slate-900 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
@@ -190,7 +169,7 @@
             <div>
               <h2 class="text-lg font-semibold">GPU Schedule</h2>
               <p class="text-sm text-slate-500 dark:text-slate-400">
-                <strong>Drag</strong> empty lanes to create · <strong>Drag edges</strong> to resize · <strong>Drag center</strong> to move · <strong>Click</strong> block for actions
+                <strong>Drag model</strong> from catalog · <strong>Drag edges</strong> to resize · <strong>Click</strong> block for actions
               </p>
             </div>
 
@@ -204,17 +183,20 @@
 
           <div id="timelineContainer" class="timeline-scroll overflow-x-auto overflow-y-hidden border-t border-gray-200 dark:border-slate-700 relative">
             <svg id="timelineSvg" class="block no-select"></svg>
-            <!-- Tooltip overlay -->
             <div id="timelineTooltip" class="hidden absolute pointer-events-none z-30 px-3 py-2 rounded-lg text-xs font-mono bg-slate-800 text-slate-100 border border-slate-600 shadow-lg whitespace-nowrap"></div>
+            <!-- Drop zone overlay (shown during catalog drag) -->
+            <div id="dropZoneOverlay" class="hidden absolute inset-0 z-20 border-2 border-dashed border-brand-500/50 bg-brand-500/5 rounded-lg flex items-center justify-center pointer-events-none">
+              <span class="text-brand-400 font-semibold text-lg">Drop to schedule here</span>
+            </div>
           </div>
 
-          <div id="timelineLegend" class="px-4 py-3 border-t border-gray-200 dark:border-slate-700 flex flex-wrap items-center gap-4 text-xs text-slate-500 dark:text-slate-400">
+                    <div id="timelineLegend" class="px-4 py-3 border-t border-gray-200 dark:border-slate-700 flex flex-wrap items-center gap-4 text-xs text-slate-500 dark:text-slate-400">
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-emerald-500/30 border border-emerald-400"></span>Running</span>
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-amber-500/30 border border-amber-400"></span>Submitted</span>
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-sky-500/25 border border-sky-400 border-dashed"></span>Planned</span>
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-red-500/25 border border-red-400"></span>Conflict</span>
             <span class="text-slate-600 dark:text-slate-500">|</span>
-            <span>Drag to create · Resize edges · Move center</span>
+            <span>Drag model from catalog · Resize edges · Click block for actions</span>
           </div>
         </div>
 
@@ -244,7 +226,7 @@
     </div>
   </main>
 
-  <!-- Booking Modal (replaces drawer) -->
+  <!-- Booking Modal -->
   <div id="modalBackdrop" class="fixed inset-0 z-50 hidden bg-black/50 backdrop-blur-sm flex items-center justify-center" aria-hidden="true">
     <div id="bookingModal" class="bg-white dark:bg-slate-900 rounded-2xl border border-gray-200 dark:border-slate-700 shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto popover-enter">
 
@@ -277,6 +259,7 @@
           <label class="block text-sm font-medium mb-2">Start Time</label>
           <div id="quickTimeButtons" class="flex flex-wrap gap-2 mb-3">
             <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="0">Now</button>
+            <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="asap">ASAP ⚡</button>
             <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="30">+30m</button>
             <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="60">+1h</button>
             <button class="qt-btn px-3 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-800 transition" data-offset="120">+2h</button>
@@ -319,12 +302,46 @@
     </div>
   </div>
 
+  <!-- Log Viewer Modal -->
+  <div id="logModalBackdrop" class="fixed inset-0 z-50 hidden bg-black/50 backdrop-blur-sm flex items-center justify-center" aria-hidden="true">
+    <div id="logModal" class="bg-white dark:bg-slate-900 rounded-2xl border border-gray-200 dark:border-slate-700 shadow-2xl w-full max-w-4xl mx-4 max-h-[90vh] overflow-hidden popover-enter flex flex-col">
+
+      <div class="p-5 border-b border-gray-200 dark:border-slate-800 flex items-start justify-between shrink-0">
+        <div>
+          <div id="logModalTitle" class="text-lg font-semibold">Slurm Logs</div>
+          <div id="logModalSubtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-1">Job output</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="logRefreshBtn" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800 transition" title="Refresh logs">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          </button>
+          <button id="logModalClose" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800 transition">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex border-b border-gray-200 dark:border-slate-800 shrink-0">
+        <button id="logTabStdout" class="flex-1 px-4 py-2 text-sm font-medium border-b-2 border-brand-500 text-brand-400">stdout</button>
+        <button id="logTabStderr" class="flex-1 px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-300">stderr</button>
+      </div>
+
+      <div class="flex-1 overflow-auto p-4 bg-gray-950">
+        <div id="logTruncatedBanner" class="hidden mb-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300">
+          ⚠ Log output is truncated (showing last ~200KB)
+        </div>
+        <pre id="logContent" class="log-content text-gray-300 min-h-[200px]">Loading…</pre>
+      </div>
+    </div>
+  </div>
+
   <!-- Block Popover (context menu for clicking blocks) -->
   <div id="blockPopover" class="hidden fixed z-50 popover-enter">
-    <div class="bg-white dark:bg-slate-900 rounded-xl border border-gray-200 dark:border-slate-700 shadow-2xl w-72 overflow-hidden">
+    <div class="bg-white dark:bg-slate-900 rounded-xl border border-gray-200 dark:border-slate-700 shadow-2xl w-80 overflow-hidden">
       <div id="popoverHeader" class="p-4 border-b border-gray-200 dark:border-slate-800">
         <div id="popoverModel" class="font-semibold text-sm"></div>
         <div id="popoverTime" class="text-xs text-slate-500 mt-1"></div>
+        <div id="popoverStats" class="mt-2 text-xs text-slate-400"></div>
         <div id="popoverStatus" class="mt-2"></div>
       </div>
       <div id="popoverActions" class="p-3 space-y-2"></div>
@@ -334,3 +351,4 @@
   <script src="/ui/app.js"></script>
 </body>
 </html>
+

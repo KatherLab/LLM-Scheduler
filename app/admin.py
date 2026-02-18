@@ -75,7 +75,7 @@ def _build_job_env(lease: Lease) -> dict[str, str]:
         "MODEL_PATH": lease.model_path,
         "SERVED_MODEL_NAME": lease.model,
         "TP_SIZE": str(lease.requested_tp),
-        "API_KEY": "secret",
+        "API_KEY": settings.vllm_api_key,
         "GPU_MEM_UTIL": lease.gpu_memory_utilization or "0.95",
         "EXTRA_ARGS": lease.extra_args or "",
         "TOOL_ARGS": lease.tool_args or "",

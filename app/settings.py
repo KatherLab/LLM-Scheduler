@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     total_gpus: int = Field(default=8, alias="TOTAL_GPUS")
     scheduler_submit_lead_seconds: int = Field(default=120, alias="SCHEDULER_SUBMIT_LEAD_SECONDS")
 
+    vllm_api_key: str = Field(default="secret", alias="VLLM_API_KEY")
+
     allow_on_demand_start: bool = Field(default=False, alias="ALLOW_ON_DEMAND_START")
     on_demand_max_wait_seconds: int = Field(default=30, alias="ON_DEMAND_MAX_WAIT_SECONDS")
 

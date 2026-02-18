@@ -335,8 +335,8 @@ function onCatalogDragEnd(e) {
     const gpus = m.meta?.gpus || 1;
 
     const hoverDate = snapDate(xToDate(pt.x));
-    // Default 4h duration for preview
-    const endDate = new Date(hoverDate.getTime() + 4 * 3600000);
+    // Default 2h duration for preview
+    const endDate = new Date(hoverDate.getTime() + 2 * 3600000);
 
     const x = dateToX(hoverDate);
     const w = dateToX(endDate) - x;
@@ -375,15 +375,23 @@ function onCatalogDragEnd(e) {
     }
   });
 
-  container.addEventListener('drop', (e) => {
+    container.addEventListener('drop', (e) => {
     e.preventDefault();
     const old = document.querySelector('.catalog-drop-ghost');
     if (old) old.remove();
     $('#dropZoneOverlay').classList.add('hidden');
 
-    if (!catalogDragState.active) return;
+    // Grab model ID from dataTransfer (reliable even if dragend already fired)
+    let modelId = e.dataTransfer.getData('text/plain');
+    if (!modelId && catalogDragState.active) {
+      modelId = catalogDragState.modelId;
+    }
 
-    const modelId = catalogDragState.modelId;
+    catalogDragState.active = false;
+    catalogDragState.modelId = null;
+
+    if (!modelId) return;
+
     const svg = $('#timelineSvg');
     const pt = svgPoint(svg, e.clientX, e.clientY);
 
@@ -392,10 +400,7 @@ function onCatalogDragEnd(e) {
     const dropDate = snapDate(xToDate(pt.x));
 
     // Open booking modal pre-filled with the model and time
-    openModal({ model: modelId, beginAt: dropDate, durationHours: 4 });
-
-    catalogDragState.active = false;
-    catalogDragState.modelId = null;
+    openModal({ model: modelId, beginAt: dropDate, durationHours: 2 });
   });
 })();
 
@@ -591,8 +596,13 @@ function populateModalModels(selected = null) {
   if (!DASH) return;
   const sel = $('#modalModel');
   const models = DASH.models.slice().sort((a, b) => a.id.localeCompare(b.id));
-  sel.innerHTML = models.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('');
-  if (selected) sel.value = selected;
+  sel.innerHTML = models.map(m =>
+    `<option value="${m.id}">${escapeHtml(m.id)}</option>`
+  ).join('');
+  if (selected) {
+    sel.value = selected;
+  }
+  // Trigger change to update meta display
   sel.dispatchEvent(new Event('change'));
 }
 
@@ -1355,7 +1365,10 @@ function renderTimeline() {
   TL.height = TL.headerH + gpuTotal * TL.laneH + 16;
 
   const now = new Date(DASH.now);
-  TL.start = new Date(now.getTime() - 30 * 60000);
+  // Floor to the previous whole hour so grid labels are clean (9:00, 10:00, …)
+  TL.start = new Date(now);
+  TL.start.setMinutes(0, 0, 0);
+  TL.start.setHours(TL.start.getHours() - 1);
   TL.end = new Date(TL.start.getTime() + hours * 3600000);
 
   svg.setAttribute('width', TL.width);

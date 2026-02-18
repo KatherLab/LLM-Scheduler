@@ -759,6 +759,7 @@ function showBlockPopover(lease, anchorX, anchorY) {
   const b = new Date(lease.begin_at || lease.created_at);
   const e = new Date(lease.end_at);
   const durationSec = (e - b) / 1000;
+  const isFailed = lease.state === 'FAILED';
 
   $('#popoverModel').textContent = lease.model;
   $('#popoverTime').textContent = `${fmtTime(b)} → ${fmtTime(e)} (${formatDuration(durationSec)})`;
@@ -778,11 +779,12 @@ function showBlockPopover(lease, anchorX, anchorY) {
   }
 
   const stateColors = {
-    RUNNING: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-    SUBMITTED: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-    PLANNED: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+    RUNNING: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
+    SUBMITTED: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
+    PLANNED: 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30',
+    FAILED: 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/30',
   };
-  const colorClass = stateColors[lease.state] || 'bg-slate-500/15 text-slate-300 border-slate-500/30';
+  const colorClass = stateColors[lease.state] || 'bg-slate-500/15 text-slate-600 dark:text-slate-300 border-slate-500/30';
   $('#popoverStatus').innerHTML = `
     <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs border ${colorClass}">
       ${lease.state}${lease.conflict ? ' · CONFLICT' : ''}
@@ -793,146 +795,175 @@ function showBlockPopover(lease, anchorX, anchorY) {
   const actionsEl = $('#popoverActions');
   actionsEl.innerHTML = '';
 
-  // Extend buttons
-  if (['RUNNING', 'SUBMITTED', 'PLANNED'].includes(lease.state)) {
-    const extendRow = document.createElement('div');
-    extendRow.className = 'flex gap-2';
-    [
-      { label: '+1h', secs: 3600 },
-      { label: '+2h', secs: 7200 },
-      { label: '+4h', secs: 14400 },
-    ].forEach(({ label, secs }) => {
-      const btn = document.createElement('button');
-      btn.className = 'flex-1 px-2 py-1.5 text-xs rounded-lg bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition font-medium';
-      btn.textContent = label;
-      btn.addEventListener('click', async () => {
-        try {
-          await api(`/admin/leases/${lease.id}/extend`, {
-            method: "POST",
-            body: JSON.stringify({ duration_seconds: secs })
-          });
-          toast(`Extended by ${label}`, 'success');
-          hideBlockPopover();
-          await refresh();
-        } catch (err) {
-          toast(err.message, 'error');
-        }
-      });
-      extendRow.appendChild(btn);
-    });
-    actionsEl.appendChild(extendRow);
-  }
-
-  // Shorten (for RUNNING/SUBMITTED)
-  if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
-    const shortenRow = document.createElement('div');
-    shortenRow.className = 'flex gap-2';
-
-    // Shorten by 1h, 2h, or to "in 30 min"
-    const now = new Date();
-    const currentEnd = new Date(lease.end_at);
-    const remainingSec = (currentEnd - now) / 1000;
-
-    const shortenOptions = [];
-    if (remainingSec > 1800 + 300) {
-      shortenOptions.push({ label: 'End in 30m', newEnd: new Date(now.getTime() + 30 * 60000) });
-    }
-    if (remainingSec > 3600 + 300) {
-      shortenOptions.push({ label: 'End in 1h', newEnd: new Date(now.getTime() + 3600000) });
-    }
-    if (remainingSec > 7200 + 300) {
-      shortenOptions.push({ label: '-2h', newEnd: new Date(currentEnd.getTime() - 7200000) });
-    }
-
-    shortenOptions.forEach(({ label, newEnd }) => {
-      const btn = document.createElement('button');
-      btn.className = 'flex-1 px-2 py-1.5 text-xs rounded-lg bg-amber-600/20 text-amber-300 border border-amber-500/30 hover:bg-amber-600/30 transition font-medium';
-      btn.textContent = label;
-      btn.addEventListener('click', async () => {
-        try {
-          await api(`/admin/leases/${lease.id}/shorten`, {
-            method: "POST",
-            body: JSON.stringify({ new_end_at: newEnd.toISOString() })
-          });
-          toast(`Shortened: new end ${fmtTime(newEnd)}`, 'success');
-          hideBlockPopover();
-          await refresh();
-        } catch (err) {
-          toast(err.message, 'error');
-        }
-      });
-      shortenRow.appendChild(btn);
-    });
-
-    if (shortenOptions.length > 0) {
-      const label = document.createElement('div');
-      label.className = 'text-xs text-slate-500 mb-1';
-      label.textContent = 'Shorten:';
-      actionsEl.appendChild(label);
-      actionsEl.appendChild(shortenRow);
-    }
-  }
-
-  // Edit (PLANNED only)
-  if (lease.state === 'PLANNED') {
-    const editBtn = document.createElement('button');
-    editBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-brand-600/20 text-brand-300 border border-brand-500/30 hover:bg-brand-600/30 transition font-medium';
-    editBtn.textContent = 'Edit Booking';
-    editBtn.addEventListener('click', () => {
-      hideBlockPopover();
-      const hours = Math.max(1, Math.round((e - b) / 3600000));
-      openModal({ model: lease.model, beginAt: b, durationHours: hours, leaseId: lease.id });
-    });
-    actionsEl.appendChild(editBtn);
-  }
-
-  // Logs (if has slurm job)
-  if (lease.slurm_job_id) {
-    const logBtn = document.createElement('button');
-    logBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-slate-600/20 text-slate-300 border border-slate-500/30 hover:bg-slate-600/30 transition font-medium flex items-center justify-center gap-1.5';
-    logBtn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg> View Logs`;
-    logBtn.addEventListener('click', () => {
-      hideBlockPopover();
-      openLogModal(lease.id);
-    });
-    actionsEl.appendChild(logBtn);
-  }
-
-  // Stop Now (for RUNNING/SUBMITTED)
-  if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
-    const stopNowBtn = document.createElement('button');
-    stopNowBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition font-medium';
-    stopNowBtn.textContent = '⏹ Stop Now';
-    stopNowBtn.addEventListener('click', async () => {
-      if (!confirm(`Stop ${lease.model} immediately? This will cancel the Slurm job.`)) return;
-      try {
-        await api(`/admin/leases/${lease.id}/stop`, { method: "POST" });
-        toast('Model stopped', 'success');
+  if (isFailed) {
+    // Failed lease: show logs + dismiss
+    if (lease.slurm_job_id) {
+      const logBtn = document.createElement('button');
+      logBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-600/20 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-500/30 hover:bg-slate-200 dark:hover:bg-slate-600/30 transition font-medium flex items-center justify-center gap-1.5';
+      logBtn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg> View Logs`;
+      logBtn.addEventListener('click', () => {
         hideBlockPopover();
-        await refresh();
-      } catch (err) {
-        toast(err.message, 'error');
-      }
-    });
-    actionsEl.appendChild(stopNowBtn);
-  }
+        openLogModal(lease.id);
+      });
+      actionsEl.appendChild(logBtn);
+    }
 
-  // Cancel/Remove (for PLANNED)
-  if (lease.state === 'PLANNED') {
-    const removeBtn = document.createElement('button');
-    removeBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition font-medium';
-    removeBtn.textContent = 'Remove Booking';
-    removeBtn.addEventListener('click', async () => {
+    const dismissBtn = document.createElement('button');
+    dismissBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium';
+    dismissBtn.textContent = 'Dismiss Failed Booking';
+    dismissBtn.addEventListener('click', async () => {
       try {
         await api(`/admin/leases/${lease.id}`, { method: "DELETE" });
-        toast('Booking removed', 'success');
+        toast('Failed booking dismissed', 'success');
         hideBlockPopover();
         await refresh();
       } catch (err) {
         toast(err.message, 'error');
       }
     });
-    actionsEl.appendChild(removeBtn);
+    actionsEl.appendChild(dismissBtn);
+
+  } else {
+    // Extend buttons
+    if (['RUNNING', 'SUBMITTED', 'PLANNED'].includes(lease.state)) {
+      const extendRow = document.createElement('div');
+      extendRow.className = 'flex gap-2';
+      [
+        { label: '+1h', secs: 3600 },
+        { label: '+2h', secs: 7200 },
+        { label: '+4h', secs: 14400 },
+      ].forEach(({ label, secs }) => {
+        const btn = document.createElement('button');
+        btn.className = 'flex-1 px-2 py-1.5 text-xs rounded-lg bg-emerald-50 dark:bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 transition font-medium';
+        btn.textContent = label;
+        btn.addEventListener('click', async () => {
+          try {
+            await api(`/admin/leases/${lease.id}/extend`, {
+              method: "POST",
+              body: JSON.stringify({ duration_seconds: secs })
+            });
+            toast(`Extended by ${label}`, 'success');
+            hideBlockPopover();
+            await refresh();
+          } catch (err) {
+            toast(err.message, 'error');
+          }
+        });
+        extendRow.appendChild(btn);
+      });
+      actionsEl.appendChild(extendRow);
+    }
+
+    // Shorten (for RUNNING/SUBMITTED)
+    if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
+      const shortenRow = document.createElement('div');
+      shortenRow.className = 'flex gap-2';
+
+      const now = new Date();
+      const currentEnd = new Date(lease.end_at);
+      const remainingSec = (currentEnd - now) / 1000;
+
+      const shortenOptions = [];
+      if (remainingSec > 1800 + 300) {
+        shortenOptions.push({ label: 'End in 30m', newEnd: new Date(now.getTime() + 30 * 60000) });
+      }
+      if (remainingSec > 3600 + 300) {
+        shortenOptions.push({ label: 'End in 1h', newEnd: new Date(now.getTime() + 3600000) });
+      }
+      if (remainingSec > 7200 + 300) {
+        shortenOptions.push({ label: '-2h', newEnd: new Date(currentEnd.getTime() - 7200000) });
+      }
+
+      shortenOptions.forEach(({ label, newEnd }) => {
+        const btn = document.createElement('button');
+        btn.className = 'flex-1 px-2 py-1.5 text-xs rounded-lg bg-amber-50 dark:bg-amber-600/20 text-amber-700 dark:text-amber-300 border border-amber-300 dark:border-amber-500/30 hover:bg-amber-100 dark:hover:bg-amber-600/30 transition font-medium';
+        btn.textContent = label;
+        btn.addEventListener('click', async () => {
+          try {
+            await api(`/admin/leases/${lease.id}/shorten`, {
+              method: "POST",
+              body: JSON.stringify({ new_end_at: newEnd.toISOString() })
+            });
+            toast(`Shortened: new end ${fmtTime(newEnd)}`, 'success');
+            hideBlockPopover();
+            await refresh();
+          } catch (err) {
+            toast(err.message, 'error');
+          }
+        });
+        shortenRow.appendChild(btn);
+      });
+
+      if (shortenOptions.length > 0) {
+        const label = document.createElement('div');
+        label.className = 'text-xs text-slate-500 mb-1';
+        label.textContent = 'Shorten:';
+        actionsEl.appendChild(label);
+        actionsEl.appendChild(shortenRow);
+      }
+    }
+
+    // Edit (PLANNED only)
+    if (lease.state === 'PLANNED') {
+      const editBtn = document.createElement('button');
+      editBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-sky-50 dark:bg-brand-600/20 text-sky-700 dark:text-brand-300 border border-sky-300 dark:border-brand-500/30 hover:bg-sky-100 dark:hover:bg-brand-600/30 transition font-medium';
+      editBtn.textContent = 'Edit Booking';
+      editBtn.addEventListener('click', () => {
+        hideBlockPopover();
+        const hours = Math.max(1, Math.round((e - b) / 3600000));
+        openModal({ model: lease.model, beginAt: b, durationHours: hours, leaseId: lease.id });
+      });
+      actionsEl.appendChild(editBtn);
+    }
+
+    // Logs (if has slurm job)
+    if (lease.slurm_job_id) {
+      const logBtn = document.createElement('button');
+      logBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-slate-600/20 text-gray-700 dark:text-slate-300 border border-gray-300 dark:border-slate-500/30 hover:bg-gray-200 dark:hover:bg-slate-600/30 transition font-medium flex items-center justify-center gap-1.5';
+      logBtn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg> View Logs`;
+      logBtn.addEventListener('click', () => {
+        hideBlockPopover();
+        openLogModal(lease.id);
+      });
+      actionsEl.appendChild(logBtn);
+    }
+
+    // Stop Now (for RUNNING/SUBMITTED)
+    if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
+      const stopNowBtn = document.createElement('button');
+      stopNowBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium';
+      stopNowBtn.textContent = '⏹ Stop Now';
+      stopNowBtn.addEventListener('click', async () => {
+        if (!confirm(`Stop ${lease.model} immediately? This will cancel the Slurm job.`)) return;
+        try {
+          await api(`/admin/leases/${lease.id}/stop`, { method: "POST" });
+          toast('Model stopped', 'success');
+          hideBlockPopover();
+          await refresh();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      });
+      actionsEl.appendChild(stopNowBtn);
+    }
+
+    // Cancel/Remove (for PLANNED)
+    if (lease.state === 'PLANNED') {
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium';
+      removeBtn.textContent = 'Remove Booking';
+      removeBtn.addEventListener('click', async () => {
+        try {
+          await api(`/admin/leases/${lease.id}`, { method: "DELETE" });
+          toast('Booking removed', 'success');
+          hideBlockPopover();
+          await refresh();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      });
+      actionsEl.appendChild(removeBtn);
+    }
   }
 
   // Position
@@ -1439,9 +1470,13 @@ function renderTimeline() {
     'stroke-opacity': 0.15,
   });
 
-  // Draw blocks
+  // Draw blocks — include FAILED leases that still have future end_at
+  const nowDate = new Date(DASH.now);
   const leases = (DASH?.leases || [])
-    .filter(l => ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state))
+    .filter(l =>
+      ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) ||
+      (l.state === 'FAILED' && l.end_at && new Date(l.end_at) > nowDate)
+    )
     .sort((a, b) => new Date(a.begin_at || a.created_at) - new Date(b.begin_at || b.created_at));
 
   for (const l of leases) {
@@ -1486,12 +1521,17 @@ function drawLeaseBlock(svg, l) {
   const isRunning = l.state === 'RUNNING';
   const isSubmitted = l.state === 'SUBMITTED';
   const isPlanned = l.state === 'PLANNED';
+  const isFailed = l.state === 'FAILED';
   const isConflict = !!l.conflict;
 
   const dark = isDark();
 
   let fill, stroke, dash;
-  if (isConflict) {
+  if (isFailed) {
+    fill = 'rgba(239, 68, 68, 0.15)';
+    stroke = 'rgba(239, 68, 68, 0.7)';
+    dash = '4 4';
+  } else if (isConflict) {
     fill = 'rgba(239, 68, 68, 0.18)';
     stroke = 'rgba(239, 68, 68, 0.85)';
     dash = null;
@@ -1509,49 +1549,146 @@ function drawLeaseBlock(svg, l) {
     dash = '6 4';
   }
 
+  const blockW = Math.max(8, w);
+
   // Group for the block
   const g = drawGroup(svg, { 'data-lease-id': l.id, cursor: 'pointer' });
 
+  // Native browser tooltip on hover (always works, even on tiny blocks)
+  const stateLabel = isFailed ? 'FAILED ✕' : `${l.state}${isConflict ? ' ⚠' : ''}`;
+  const tooltipText = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}\n${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
+  const titleEl = svgEl('title');
+  titleEl.textContent = tooltipText;
+  g.appendChild(titleEl);
+
   // Main rect
-  drawRect(g, x, y, Math.max(8, w), h, {
+  drawRect(g, x, y, blockW, h, {
     fill, stroke, 'stroke-width': 2,
     ...(dash ? { 'stroke-dasharray': dash } : {}),
     rx: 10,
     'data-lease-id': l.id,
   });
 
-  // Model label
-  const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}`;
-  if (w > 60) {
-    drawText(g, x + 10, y + 18, label, {
-      fill: dark ? '#e2e8f0' : '#0f172a',
+  // Hatching pattern for FAILED blocks
+  if (isFailed && w > 20) {
+    const clipId = `clip-failed-${l.id}`;
+    const defsEl = svg.querySelector('defs');
+    if (defsEl) {
+      const clipPath = svgEl('clipPath', { id: clipId });
+      clipPath.appendChild(svgEl('rect', { x, y, width: blockW, height: h, rx: 10 }));
+      defsEl.appendChild(clipPath);
+
+      const hatchGroup = drawGroup(g, { 'clip-path': `url(#${clipId})`, 'pointer-events': 'none' });
+      const step = 16;
+      for (let i = -Math.ceil(h / step); i < Math.ceil(w / step) + Math.ceil(h / step); i++) {
+        drawLine(hatchGroup, x + i * step, y, x + i * step + h, y + h, {
+          stroke: 'rgba(239, 68, 68, 0.15)',
+          'stroke-width': 2,
+        });
+      }
+    }
+  }
+
+  // ── Text labels with clipping ──
+  // Create a clipPath so text never overflows the block rectangle
+  const textClipId = `clip-text-${l.id}`;
+  const defsEl = svg.querySelector('defs');
+  if (defsEl) {
+    const textClip = svgEl('clipPath', { id: textClipId });
+    // Inset the clip slightly so text doesn't touch the edges
+    textClip.appendChild(svgEl('rect', {
+      x: x + 6,
+      y: y,
+      width: Math.max(0, blockW - 12),
+      height: h,
+      rx: 6,
+    }));
+    defsEl.appendChild(textClip);
+  }
+
+  const textGroup = drawGroup(g, {
+    'clip-path': `url(#${textClipId})`,
+    'pointer-events': 'none',
+  });
+
+  const labelColor = isFailed
+    ? (dark ? '#fca5a5' : '#991b1b')
+    : (dark ? '#e2e8f0' : '#0f172a');
+  const subColor = isFailed
+    ? (dark ? '#f87171' : '#b91c1c')
+    : (dark ? '#94a3b8' : '#64748b');
+
+  // Progressive text detail based on available width:
+  //   w >= 120: full model name + GPU count + time range + state
+  //   w >= 60:  model name (truncated) + state only
+  //   w >= 30:  model name (heavily truncated)
+  //   w < 30:   no text at all (rely on hover tooltip)
+
+  if (w >= 120) {
+    // Full detail: two lines
+    const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}`;
+    drawText(textGroup, x + 10, y + 18, label, {
+      fill: labelColor,
       'font-size': 11,
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      'pointer-events': 'none',
     });
 
-    const timeLabel = `${fmtHour(b)} → ${fmtHour(e)} · ${l.state}${isConflict ? ' ⚠' : ''}`;
-    drawText(g, x + 10, y + 34, timeLabel, {
-      fill: dark ? '#94a3b8' : '#64748b',
+    const timeLabel = `${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
+    drawText(textGroup, x + 10, y + 34, timeLabel, {
+      fill: subColor,
       'font-size': 10,
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      'pointer-events': 'none',
+    });
+  } else if (w >= 60) {
+    // Medium: model name + state on one line
+    const label = `${l.model}`;
+    drawText(textGroup, x + 8, y + 18, label, {
+      fill: labelColor,
+      'font-size': 11,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    });
+    drawText(textGroup, x + 8, y + 32, stateLabel, {
+      fill: subColor,
+      'font-size': 9,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    });
+  } else if (w >= 30) {
+    // Compact: just the model name, single line, vertically centered
+    drawText(textGroup, x + 6, y + h / 2 + 4, l.model, {
+      fill: labelColor,
+      'font-size': 10,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
   }
+  // else: w < 30 → no text, hover tooltip only
+
+  // ── Hover highlight rect (invisible, shows a subtle highlight on mouseover) ──
+  const hoverRect = drawRect(g, x, y, blockW, h, {
+    fill: 'transparent',
+    rx: 10,
+    'pointer-events': 'all',
+    class: 'block-hover-target',
+  });
+  hoverRect.addEventListener('mouseenter', () => {
+    hoverRect.setAttribute('fill', dark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)');
+  });
+  hoverRect.addEventListener('mouseleave', () => {
+    hoverRect.setAttribute('fill', 'transparent');
+  });
 
   // Resize handles
   const handleW = 8;
 
-  // Right handle (for all active states — can extend or shorten)
+  // Right handle (for all active states — can extend or shorten, but NOT failed)
   if (['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) && w > 20) {
-    drawRect(g, x + Math.max(8, w) - handleW, y, handleW, h, {
+    drawRect(g, x + blockW - handleW, y, handleW, h, {
       fill: 'transparent',
       class: 'resize-handle',
       'data-handle': 'right',
       'data-lease-id': l.id,
       cursor: 'ew-resize',
     });
-    const cx = x + Math.max(8, w) - handleW / 2;
+    const cx = x + blockW - handleW / 2;
     for (let dy = -6; dy <= 6; dy += 6) {
       g.appendChild(svgEl('circle', {
         cx, cy: y + h / 2 + dy, r: 1.5,
@@ -1582,7 +1719,7 @@ function drawLeaseBlock(svg, l) {
 
   // Running glow effect
   if (isRunning && !isConflict) {
-    drawRect(g, x, y, Math.max(8, w), h, {
+    drawRect(g, x, y, blockW, h, {
       fill: 'none',
       stroke: 'rgba(16, 185, 129, 0.3)',
       'stroke-width': 6,
@@ -1597,11 +1734,17 @@ function drawLeaseBlock(svg, l) {
 function renderTable() {
   const body = $('#leasesTableBody');
 
+  const nowDate = new Date(DASH?.now || Date.now());
   const active = (DASH?.leases || [])
-    .filter(l => ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state))
+    .filter(l =>
+      ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) ||
+      (l.state === 'FAILED' && l.end_at && new Date(l.end_at) > nowDate)
+    )
     .sort((a, b) => new Date(a.begin_at || a.created_at) - new Date(b.begin_at || b.created_at));
 
-  $('#bookingHint').textContent = `${active.length} active / planned`;
+  const failedCount = active.filter(l => l.state === 'FAILED').length;
+  const activeCount = active.length - failedCount;
+  $('#bookingHint').textContent = `${activeCount} active / planned` + (failedCount > 0 ? ` · ${failedCount} failed` : '');
 
   body.innerHTML = active.map(l => {
     const b = new Date(l.begin_at || l.created_at);
@@ -1609,48 +1752,62 @@ function renderTable() {
     const when = `${fmtTime(b)} → ${fmtTime(e)}`;
     const durationSec = (e - b) / 1000;
 
-    const statusBadge = l.conflict
-      ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-red-500/15 text-red-300 border border-red-500/30">Conflict</span>`
-      : l.state === 'RUNNING'
-        ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>Running
-           </span>`
-        : l.state === 'SUBMITTED'
-          ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-amber-500/15 text-amber-300 border border-amber-500/30">Submitted</span>`
-          : l.state === 'PLANNED'
-            ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-sky-500/15 text-sky-300 border border-sky-500/30">Planned</span>`
-            : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-300 border border-slate-500/30">${escapeHtml(l.state)}</span>`;
+    const isFailed = l.state === 'FAILED';
+
+    const statusBadge = isFailed
+      ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-red-500/15 text-red-600 dark:text-red-300 border border-red-500/30">
+           <span class="w-1.5 h-1.5 rounded-full bg-red-500 mr-1.5"></span>Failed
+         </span>`
+      : l.conflict
+        ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-red-500/15 text-red-600 dark:text-red-300 border border-red-500/30">Conflict</span>`
+        : l.state === 'RUNNING'
+          ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">
+               <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>Running
+             </span>`
+          : l.state === 'SUBMITTED'
+            ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30">Submitted</span>`
+            : l.state === 'PLANNED'
+              ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-sky-500/15 text-sky-700 dark:text-sky-300 border border-sky-500/30">Planned</span>`
+              : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-600 dark:text-slate-300 border border-slate-500/30">${escapeHtml(l.state)}</span>`;
 
     let actions = '';
 
     // Log button (if has slurm job)
     const logBtn = l.slurm_job_id
-      ? `<button class="text-xs px-2 py-1 rounded bg-slate-600/20 text-slate-300 border border-slate-500/30 hover:bg-slate-600/30 transition" onclick="openLogModalForLease(${l.id})" title="View Logs">📋</button>`
+      ? `<button class="text-xs px-2.5 py-1.5 rounded-md bg-gray-100 dark:bg-slate-600/20 text-gray-700 dark:text-slate-300 border border-gray-300 dark:border-slate-500/30 hover:bg-gray-200 dark:hover:bg-slate-600/30 transition font-medium" onclick="openLogModalForLease(${l.id})" title="View Logs">📋 Logs</button>`
       : '';
 
-    if (l.state === 'PLANNED') {
+    if (isFailed) {
+      // Failed: only show logs and a dismiss/retry option
       actions = `
-        <button class="text-xs px-2 py-1 rounded bg-brand-600/20 text-brand-300 border border-brand-500/30 hover:bg-brand-600/30 transition" onclick="editLease(${l.id})">Edit</button>
-        <button class="text-xs px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition" onclick="extendLease(${l.id}, 3600)">+1h</button>
         ${logBtn}
-        <button class="text-xs px-2 py-1 rounded bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition" onclick="stopLease(${l.id})">Remove</button>
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium" onclick="dismissFailedLease(${l.id})">Dismiss</button>
+      `;
+    } else if (l.state === 'PLANNED') {
+      actions = `
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-sky-50 dark:bg-brand-600/20 text-sky-700 dark:text-brand-300 border border-sky-300 dark:border-brand-500/30 hover:bg-sky-100 dark:hover:bg-brand-600/30 transition font-medium" onclick="editLease(${l.id})">Edit</button>
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-50 dark:bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 transition font-medium" onclick="extendLease(${l.id}, 3600)">+1h</button>
+        ${logBtn}
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium" onclick="stopLease(${l.id})">Remove</button>
       `;
     } else {
-            actions = `
-        <button class="text-xs px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition" onclick="extendLease(${l.id}, 3600)">+1h</button>
-        <button class="text-xs px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 transition" onclick="extendLease(${l.id}, 7200)">+2h</button>
+      actions = `
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-50 dark:bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 transition font-medium" onclick="extendLease(${l.id}, 3600)">+1h</button>
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-50 dark:bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 transition font-medium" onclick="extendLease(${l.id}, 7200)">+2h</button>
         ${logBtn}
-        <button class="text-xs px-2 py-1 rounded bg-amber-600/20 text-amber-300 border border-amber-500/30 hover:bg-amber-600/30 transition" onclick="shortenLeasePrompt(${l.id})">Shorten</button>
-        <button class="text-xs px-2 py-1 rounded bg-red-600/20 text-red-300 border border-red-500/30 hover:bg-red-600/30 transition" onclick="stopLeaseNow(${l.id})">Stop</button>
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-amber-50 dark:bg-amber-600/20 text-amber-700 dark:text-amber-300 border border-amber-300 dark:border-amber-500/30 hover:bg-amber-100 dark:hover:bg-amber-600/30 transition font-medium" onclick="shortenLeasePrompt(${l.id})">Shorten</button>
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium" onclick="stopLeaseNow(${l.id})">Stop</button>
       `;
     }
 
+    const rowBg = isFailed ? 'bg-red-50/50 dark:bg-red-500/5' : (l.conflict ? 'bg-red-50/30 dark:bg-red-500/5' : '');
+
     return `
-      <tr class="${l.conflict ? 'bg-red-500/5' : ''} hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
-        <td class="px-4 py-3 text-sm font-medium break-all">${escapeHtml(l.model)}</td>
+      <tr class="${rowBg} hover:bg-gray-50 dark:hover:bg-slate-800/50 transition">
+        <td class="px-4 py-3 text-sm font-medium break-all ${isFailed ? 'text-red-700 dark:text-red-300' : ''}">${escapeHtml(l.model)}</td>
         <td class="px-4 py-3 text-sm">${statusBadge}</td>
-        <td class="px-4 py-3 text-sm text-slate-500 dark:text-slate-400 font-mono">${when}</td>
-        <td class="px-4 py-3 text-sm text-slate-400 font-mono">${l.requested_gpus}</td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-slate-400 font-mono">${when}</td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-slate-400 font-mono">${l.requested_gpus}</td>
         <td class="px-4 py-3 text-sm text-right"><div class="flex justify-end gap-2 flex-wrap">${actions}</div></td>
       </tr>
     `;
@@ -1749,6 +1906,16 @@ window.shortenLeasePrompt = async (id) => {
       body: JSON.stringify({ new_end_at: newEnd.toISOString() })
     });
     toast(`Shortened to end at ${fmtTime(newEnd)}`, 'success');
+    await refresh();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+};
+
+window.dismissFailedLease = async (id) => {
+  try {
+    await api(`/admin/leases/${id}`, { method: "DELETE" });
+    toast('Failed booking dismissed', 'success');
     await refresh();
   } catch (e) {
     toast(e.message, 'error');

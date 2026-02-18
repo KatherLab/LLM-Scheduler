@@ -188,8 +188,12 @@ async def endpoint_cleanup_worker():
                         e.state = "STOPPED"
                         if lease.state == "RUNNING":
                             lease.state = "ENDED"
-                    elif lease and lease.state in ("CANCELED", "FAILED", "ENDED"):
+                        elif lease.state == "FAILED":
+                            # Leave as FAILED but stop the endpoint
+                            pass
+                    elif lease and lease.state in ("CANCELED", "ENDED"):
                         e.state = "STOPPED"
+                    # Don't auto-stop FAILED leases — let them remain visible
                 db.commit()
         except Exception as e:
             print(f"endpoint_cleanup_worker error: {e}")
@@ -200,15 +204,29 @@ async def slurm_reconcile_worker():
     """
     Reconcile leases/endpoints with Slurm reality.
     - If Slurm job is no longer in squeue, mark lease ENDED/FAILED (depending on endpoint readiness).
+    - FAILED leases remain visible until their end_at passes, then get marked ENDED.
     """
     while True:
         try:
+            now = datetime.now(timezone.utc)
             with SessionLocal() as db:
                 active = db.execute(
-                    select(Lease).where(Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING"]))
+                    select(Lease).where(Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING", "FAILED"]))
                 ).scalars().all()
 
                 for l in active:
+                    # For FAILED leases: check if end_at has passed, then mark ENDED
+                    if l.state == "FAILED":
+                        if l.end_at and _ensure_aware_dt(l.end_at) < now:
+                            l.state = "ENDED"
+                            if l.slurm_job_id:
+                                ep = db.execute(
+                                    select(Endpoint).where(Endpoint.slurm_job_id == l.slurm_job_id)
+                                ).scalars().first()
+                                if ep:
+                                    ep.state = "STOPPED"
+                        continue
+
                     if not l.slurm_job_id:
                         continue
                     state = slurm.squeue_job_state(l.slurm_job_id)

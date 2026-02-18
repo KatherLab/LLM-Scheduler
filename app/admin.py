@@ -209,7 +209,12 @@ def dashboard():
 
         leases = db.execute(select(Lease).order_by(Lease.id.desc())).scalars().all()
 
-        active_like = [l for l in leases if l.state in ("PLANNED", "SUBMITTED", "RUNNING")]
+        # Include FAILED leases that haven't passed their end_at yet
+        active_like = [
+            l for l in leases
+            if l.state in ("PLANNED", "SUBMITTED", "RUNNING")
+            or (l.state == "FAILED" and l.end_at and _ensure_aware(l.end_at) > now)
+        ]
         placements = compute_placements(
             leases=active_like,
             total_gpus=settings.total_gpus,

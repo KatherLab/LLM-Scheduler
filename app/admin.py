@@ -19,11 +19,9 @@ from .schemas import (
 from .catalog import load_catalog
 from .planner import compute_placements, find_earliest_slot
 from . import slurm
+from .dependencies import SessionLocal, init_db
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-
-engine = make_engine(settings.database_url)
-SessionLocal = make_session_factory(engine)
 
 CATALOG = load_catalog("config/models.yaml")
 
@@ -125,7 +123,7 @@ def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
     horizon_end = now + timedelta(hours=48)
 
     leases = db.execute(
-        select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"]))
+        select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"]))
     ).scalars().all()
 
     leases = [l for l in leases if l.id != candidate.id] + [candidate]
@@ -147,7 +145,7 @@ def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: dateti
     existing = db.execute(
         select(Lease).where(
             Lease.model == req.model,
-            Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"])
+            Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"])
         ).order_by(Lease.id.desc())
     ).scalars().first()
     if not existing:
@@ -212,7 +210,7 @@ def dashboard():
         # Include FAILED leases that haven't passed their end_at yet
         active_like = [
             l for l in leases
-            if l.state in ("PLANNED", "SUBMITTED", "RUNNING")
+            if l.state in ("PLANNED", "SUBMITTED", "STARTING", "RUNNING")
             or (l.state == "FAILED" and l.end_at and _ensure_aware(l.end_at) > now)
         ]
         placements = compute_placements(
@@ -271,6 +269,7 @@ def dashboard():
             endpoint_stats=stats,
         )
 
+
 @router.get("/leases", response_model=list[LeaseOut])
 def list_leases():
     with SessionLocal() as db:
@@ -301,7 +300,7 @@ def create_lease(req: LeaseCreate):
     if req.asap:
         with SessionLocal() as db:
             active = db.execute(
-                select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "RUNNING"]))
+                select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"]))
             ).scalars().all()
 
             now = now_utc()
@@ -319,6 +318,7 @@ def create_lease(req: LeaseCreate):
                 raise HTTPException(status_code=409, detail="No available slot in the next 48h for this model.")
             begin = earliest
             end = begin + duration
+
     else:
         begin = req.begin_at or now_utc()
         end = begin + duration
@@ -433,7 +433,7 @@ def extend_lease(lease_id: int, req: LeaseExtend):
 
         _validate_no_conflicts(db, lease)
 
-        if lease.slurm_job_id and lease.state in ("SUBMITTED", "RUNNING"):
+        if lease.slurm_job_id and lease.state in ("SUBMITTED", "STARTING", "RUNNING"):
             total_seconds = int((new_end - b).total_seconds())
             total_seconds = max(60, total_seconds)
             new_time_limit = _time_limit_from_duration(total_seconds)
@@ -445,6 +445,7 @@ def extend_lease(lease_id: int, req: LeaseExtend):
         db.commit()
         return {"ok": True, "new_end_at": lease.end_at}
 
+
 @router.post("/leases/{lease_id}/shorten")
 def shorten_lease(lease_id: int, req: LeaseShortenRequest):
     """Shorten a running or submitted lease. The new end must be in the future and before the current end."""
@@ -453,7 +454,7 @@ def shorten_lease(lease_id: int, req: LeaseShortenRequest):
         if not lease:
             raise HTTPException(status_code=404, detail="Booking not found")
 
-        if lease.state not in ("RUNNING", "SUBMITTED", "PLANNED"):
+        if lease.state not in ("RUNNING", "SUBMITTED", "STARTING", "PLANNED"):
             raise HTTPException(status_code=409, detail="Can only shorten active bookings.")
 
         now = now_utc()
@@ -471,7 +472,7 @@ def shorten_lease(lease_id: int, req: LeaseShortenRequest):
         lease.end_at = new_end
 
         # Update Slurm time limit
-        if lease.slurm_job_id and lease.state in ("SUBMITTED", "RUNNING"):
+        if lease.slurm_job_id and lease.state in ("SUBMITTED", "STARTING", "RUNNING"):
             total_seconds = int((new_end - b).total_seconds())
             total_seconds = max(60, total_seconds)
             new_time_limit = _time_limit_from_duration(total_seconds)
@@ -483,6 +484,7 @@ def shorten_lease(lease_id: int, req: LeaseShortenRequest):
         db.commit()
         return {"ok": True, "new_end_at": lease.end_at}
 
+
 @router.post("/leases/{lease_id}/stop")
 def stop_lease_now(lease_id: int):
     """Immediately stop a running model — cancels the Slurm job."""
@@ -491,7 +493,7 @@ def stop_lease_now(lease_id: int):
         if not lease:
             raise HTTPException(status_code=404, detail="Booking not found")
 
-        if lease.state not in ("RUNNING", "SUBMITTED", "PLANNED"):
+        if lease.state not in ("RUNNING", "SUBMITTED", "STARTING", "PLANNED"):
             raise HTTPException(status_code=409, detail="Booking is not active.")
 
         if lease.slurm_job_id:

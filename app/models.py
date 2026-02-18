@@ -59,6 +59,13 @@ class Lease(Base):
 
     venv_activate: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Retry tracking
+    retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    failed_at: Mapped[datetime | None] = mapped_column(
+        TZDateTime(), nullable=True
+    )
 
 class Endpoint(Base):
     __tablename__ = "endpoints"

@@ -506,7 +506,7 @@ function renderLogContent() {
 // Global helper to open logs for a model (finds the active lease)
 window.viewLogs = (modelId) => {
   const lease = DASH?.leases?.find(l =>
-    l.model === modelId && ['RUNNING', 'SUBMITTED'].includes(l.state) && l.slurm_job_id
+    l.model === modelId && ['RUNNING', 'SUBMITTED', 'STARTING'].includes(l.state) && l.slurm_job_id
   );
   if (lease) {
     openLogModal(lease.id);
@@ -514,6 +514,7 @@ window.viewLogs = (modelId) => {
     toast('No active Slurm job found for this model', 'info');
   }
 };
+
 
 window.openLogModalForLease = (leaseId) => {
   openLogModal(leaseId);
@@ -764,7 +765,6 @@ function showBlockPopover(lease, anchorX, anchorY) {
   $('#popoverModel').textContent = lease.model;
   $('#popoverTime').textContent = `${fmtTime(b)} → ${fmtTime(e)} (${formatDuration(durationSec)})`;
 
-  // Stats from endpoint_stats
   const epStats = (DASH?.endpoint_stats || []).find(s => s.model === lease.model && s.state === 'READY');
   if (epStats) {
     const uptime = epStats.uptime_seconds ? formatDuration(Math.floor(epStats.uptime_seconds)) : '—';
@@ -781,6 +781,7 @@ function showBlockPopover(lease, anchorX, anchorY) {
   const stateColors = {
     RUNNING: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
     SUBMITTED: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
+    STARTING: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
     PLANNED: 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30',
     FAILED: 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/30',
   };
@@ -791,12 +792,10 @@ function showBlockPopover(lease, anchorX, anchorY) {
     </span>
   `;
 
-  // Actions
   const actionsEl = $('#popoverActions');
   actionsEl.innerHTML = '';
 
   if (isFailed) {
-    // Failed lease: show logs + dismiss
     if (lease.slurm_job_id) {
       const logBtn = document.createElement('button');
       logBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-600/20 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-500/30 hover:bg-slate-200 dark:hover:bg-slate-600/30 transition font-medium flex items-center justify-center gap-1.5';
@@ -824,8 +823,8 @@ function showBlockPopover(lease, anchorX, anchorY) {
     actionsEl.appendChild(dismissBtn);
 
   } else {
-    // Extend buttons
-    if (['RUNNING', 'SUBMITTED', 'PLANNED'].includes(lease.state)) {
+    // Extend buttons — now includes STARTING
+    if (['RUNNING', 'SUBMITTED', 'STARTING', 'PLANNED'].includes(lease.state)) {
       const extendRow = document.createElement('div');
       extendRow.className = 'flex gap-2';
       [
@@ -854,8 +853,8 @@ function showBlockPopover(lease, anchorX, anchorY) {
       actionsEl.appendChild(extendRow);
     }
 
-    // Shorten (for RUNNING/SUBMITTED)
-    if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
+    // Shorten — now includes STARTING
+    if (['RUNNING', 'SUBMITTED', 'STARTING'].includes(lease.state)) {
       const shortenRow = document.createElement('div');
       shortenRow.className = 'flex gap-2';
 
@@ -928,8 +927,8 @@ function showBlockPopover(lease, anchorX, anchorY) {
       actionsEl.appendChild(logBtn);
     }
 
-    // Stop Now (for RUNNING/SUBMITTED)
-    if (['RUNNING', 'SUBMITTED'].includes(lease.state)) {
+    // Stop Now — now includes STARTING
+    if (['RUNNING', 'SUBMITTED', 'STARTING'].includes(lease.state)) {
       const stopNowBtn = document.createElement('button');
       stopNowBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium';
       stopNowBtn.textContent = '⏹ Stop Now';
@@ -1222,7 +1221,7 @@ function checkVisualConflict(begin, end, gpusNeeded, excludeLeaseId = null) {
   if (!DASH) return false;
 
   const activeLeases = DASH.leases.filter(l =>
-    ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) && l.id !== excludeLeaseId
+    ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state) && l.id !== excludeLeaseId
   );
 
   const step = 15 * 60000;
@@ -1396,7 +1395,6 @@ function renderTimeline() {
   TL.height = TL.headerH + gpuTotal * TL.laneH + 16;
 
   const now = new Date(DASH.now);
-  // Floor to the previous whole hour so grid labels are clean (9:00, 10:00, …)
   TL.start = new Date(now);
   TL.start.setMinutes(0, 0, 0);
   TL.start.setHours(TL.start.getHours() - 1);
@@ -1408,10 +1406,8 @@ function renderTimeline() {
 
   const dark = isDark();
 
-  // Background
   drawRect(svg, 0, 0, TL.width, TL.height, { fill: dark ? '#0b1220' : '#ffffff' });
 
-  // SVG defs for glow filter
   const defs = svgEl('defs');
   const filter = svgEl('filter', { id: 'glow', x: '-50%', y: '-50%', width: '200%', height: '200%' });
   const blur = svgEl('feGaussianBlur', { stdDeviation: '3', result: 'coloredBlur' });
@@ -1425,7 +1421,6 @@ function renderTimeline() {
   defs.appendChild(filter);
   svg.appendChild(defs);
 
-  // Time grid
   for (let h = 0; h <= hours; h++) {
     const x = TL.leftPad + h * pxPerHour;
     drawLine(svg, x, 0, x, TL.height, {
@@ -1442,7 +1437,6 @@ function renderTimeline() {
     });
   }
 
-  // 30-min sub-grid
   for (let h = 0; h < hours; h++) {
     const x = TL.leftPad + (h + 0.5) * pxPerHour;
     drawLine(svg, x, TL.headerH, x, TL.height, {
@@ -1451,7 +1445,6 @@ function renderTimeline() {
     });
   }
 
-  // Lane labels + lines
   for (let i = 0; i < gpuTotal; i++) {
     const y = TL.headerH + i * TL.laneH;
     drawLine(svg, 0, y, TL.width, y, {
@@ -1464,17 +1457,15 @@ function renderTimeline() {
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
   }
-  // Bottom line
   drawLine(svg, 0, TL.headerH + gpuTotal * TL.laneH, TL.width, TL.headerH + gpuTotal * TL.laneH, {
     stroke: dark ? '#334155' : '#94a3b8',
     'stroke-opacity': 0.15,
   });
 
-  // Draw blocks — include FAILED leases that still have future end_at
   const nowDate = new Date(DASH.now);
   const leases = (DASH?.leases || [])
     .filter(l =>
-      ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) ||
+      ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state) ||
       (l.state === 'FAILED' && l.end_at && new Date(l.end_at) > nowDate)
     )
     .sort((a, b) => new Date(a.begin_at || a.created_at) - new Date(b.begin_at || b.created_at));
@@ -1483,7 +1474,6 @@ function renderTimeline() {
     drawLeaseBlock(svg, l);
   }
 
-  // Now marker (on top of blocks)
   const nowX = dateToX(now);
   drawLine(svg, nowX, 0, nowX, TL.height, {
     stroke: '#0ea5e9',
@@ -1498,7 +1488,6 @@ function renderTimeline() {
     'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
   });
 
-  // Auto-scroll to now on first render
   const container = $('#timelineContainer');
   const scrollTarget = nowX - 200;
   if (scrollTarget > 0 && !dragState.active && !catalogDragState.active) {
@@ -1520,6 +1509,7 @@ function drawLeaseBlock(svg, l) {
 
   const isRunning = l.state === 'RUNNING';
   const isSubmitted = l.state === 'SUBMITTED';
+  const isStarting = l.state === 'STARTING';
   const isPlanned = l.state === 'PLANNED';
   const isFailed = l.state === 'FAILED';
   const isConflict = !!l.conflict;
@@ -1539,7 +1529,7 @@ function drawLeaseBlock(svg, l) {
     fill = 'rgba(16, 185, 129, 0.18)';
     stroke = 'rgba(16, 185, 129, 0.85)';
     dash = null;
-  } else if (isSubmitted) {
+  } else if (isSubmitted || isStarting) {
     fill = 'rgba(245, 158, 11, 0.18)';
     stroke = 'rgba(245, 158, 11, 0.85)';
     dash = null;
@@ -1551,17 +1541,14 @@ function drawLeaseBlock(svg, l) {
 
   const blockW = Math.max(8, w);
 
-  // Group for the block
   const g = drawGroup(svg, { 'data-lease-id': l.id, cursor: 'pointer' });
 
-  // Native browser tooltip on hover (always works, even on tiny blocks)
   const stateLabel = isFailed ? 'FAILED ✕' : `${l.state}${isConflict ? ' ⚠' : ''}`;
   const tooltipText = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}\n${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
   const titleEl = svgEl('title');
   titleEl.textContent = tooltipText;
   g.appendChild(titleEl);
 
-  // Main rect
   drawRect(g, x, y, blockW, h, {
     fill, stroke, 'stroke-width': 2,
     ...(dash ? { 'stroke-dasharray': dash } : {}),
@@ -1569,7 +1556,6 @@ function drawLeaseBlock(svg, l) {
     'data-lease-id': l.id,
   });
 
-  // Hatching pattern for FAILED blocks
   if (isFailed && w > 20) {
     const clipId = `clip-failed-${l.id}`;
     const defsEl = svg.querySelector('defs');
@@ -1589,13 +1575,10 @@ function drawLeaseBlock(svg, l) {
     }
   }
 
-  // ── Text labels with clipping ──
-  // Create a clipPath so text never overflows the block rectangle
   const textClipId = `clip-text-${l.id}`;
   const defsEl = svg.querySelector('defs');
   if (defsEl) {
     const textClip = svgEl('clipPath', { id: textClipId });
-    // Inset the clip slightly so text doesn't touch the edges
     textClip.appendChild(svgEl('rect', {
       x: x + 6,
       y: y,
@@ -1618,14 +1601,7 @@ function drawLeaseBlock(svg, l) {
     ? (dark ? '#f87171' : '#b91c1c')
     : (dark ? '#94a3b8' : '#64748b');
 
-  // Progressive text detail based on available width:
-  //   w >= 120: full model name + GPU count + time range + state
-  //   w >= 60:  model name (truncated) + state only
-  //   w >= 30:  model name (heavily truncated)
-  //   w < 30:   no text at all (rely on hover tooltip)
-
   if (w >= 120) {
-    // Full detail: two lines
     const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}`;
     drawText(textGroup, x + 10, y + 18, label, {
       fill: labelColor,
@@ -1640,7 +1616,6 @@ function drawLeaseBlock(svg, l) {
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
   } else if (w >= 60) {
-    // Medium: model name + state on one line
     const label = `${l.model}`;
     drawText(textGroup, x + 8, y + 18, label, {
       fill: labelColor,
@@ -1653,16 +1628,13 @@ function drawLeaseBlock(svg, l) {
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
   } else if (w >= 30) {
-    // Compact: just the model name, single line, vertically centered
     drawText(textGroup, x + 6, y + h / 2 + 4, l.model, {
       fill: labelColor,
       'font-size': 10,
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
   }
-  // else: w < 30 → no text, hover tooltip only
 
-  // ── Hover highlight rect (invisible, shows a subtle highlight on mouseover) ──
   const hoverRect = drawRect(g, x, y, blockW, h, {
     fill: 'transparent',
     rx: 10,
@@ -1676,11 +1648,10 @@ function drawLeaseBlock(svg, l) {
     hoverRect.setAttribute('fill', 'transparent');
   });
 
-  // Resize handles
   const handleW = 8;
 
-  // Right handle (for all active states — can extend or shorten, but NOT failed)
-  if (['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) && w > 20) {
+  // Right handle — now includes STARTING
+  if (['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state) && w > 20) {
     drawRect(g, x + blockW - handleW, y, handleW, h, {
       fill: 'transparent',
       class: 'resize-handle',
@@ -1698,7 +1669,6 @@ function drawLeaseBlock(svg, l) {
     }
   }
 
-  // Left handle (only PLANNED)
   if (l.state === 'PLANNED' && w > 20) {
     drawRect(g, x, y, handleW, h, {
       fill: 'transparent',
@@ -1717,7 +1687,6 @@ function drawLeaseBlock(svg, l) {
     }
   }
 
-  // Running glow effect
   if (isRunning && !isConflict) {
     drawRect(g, x, y, blockW, h, {
       fill: 'none',
@@ -1737,7 +1706,7 @@ function renderTable() {
   const nowDate = new Date(DASH?.now || Date.now());
   const active = (DASH?.leases || [])
     .filter(l =>
-      ['PLANNED', 'SUBMITTED', 'RUNNING'].includes(l.state) ||
+      ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state) ||
       (l.state === 'FAILED' && l.end_at && new Date(l.end_at) > nowDate)
     )
     .sort((a, b) => new Date(a.begin_at || a.created_at) - new Date(b.begin_at || b.created_at));
@@ -1766,19 +1735,21 @@ function renderTable() {
              </span>`
           : l.state === 'SUBMITTED'
             ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30">Submitted</span>`
-            : l.state === 'PLANNED'
-              ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-sky-500/15 text-sky-700 dark:text-sky-300 border border-sky-500/30">Planned</span>`
-              : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-600 dark:text-slate-300 border border-slate-500/30">${escapeHtml(l.state)}</span>`;
+            : l.state === 'STARTING'
+              ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30">
+                   <span class="w-1.5 h-1.5 rounded-full bg-amber-400 mr-1.5 animate-pulse"></span>Starting
+                 </span>`
+              : l.state === 'PLANNED'
+                ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-sky-500/15 text-sky-700 dark:text-sky-300 border border-sky-500/30">Planned</span>`
+                : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-600 dark:text-slate-300 border border-slate-500/30">${escapeHtml(l.state)}</span>`;
 
     let actions = '';
 
-    // Log button (if has slurm job)
     const logBtn = l.slurm_job_id
       ? `<button class="text-xs px-2.5 py-1.5 rounded-md bg-gray-100 dark:bg-slate-600/20 text-gray-700 dark:text-slate-300 border border-gray-300 dark:border-slate-500/30 hover:bg-gray-200 dark:hover:bg-slate-600/30 transition font-medium" onclick="openLogModalForLease(${l.id})" title="View Logs">📋 Logs</button>`
       : '';
 
     if (isFailed) {
-      // Failed: only show logs and a dismiss/retry option
       actions = `
         ${logBtn}
         <button class="text-xs px-2.5 py-1.5 rounded-md bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium" onclick="dismissFailedLease(${l.id})">Dismiss</button>
@@ -1789,6 +1760,11 @@ function renderTable() {
         <button class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-50 dark:bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 hover:bg-emerald-100 dark:hover:bg-emerald-600/30 transition font-medium" onclick="extendLease(${l.id}, 3600)">+1h</button>
         ${logBtn}
         <button class="text-xs px-2.5 py-1.5 rounded-md bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium" onclick="stopLease(${l.id})">Remove</button>
+      `;
+    } else if (l.state === 'STARTING') {
+      actions = `
+        ${logBtn}
+        <button class="text-xs px-2.5 py-1.5 rounded-md bg-red-50 dark:bg-red-600/20 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-500/30 hover:bg-red-100 dark:hover:bg-red-600/30 transition font-medium" onclick="stopLeaseNow(${l.id})">Stop</button>
       `;
     } else {
       actions = `

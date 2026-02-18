@@ -556,13 +556,14 @@ def register_endpoint(req: EndpointRegister):
         lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
         if lease:
             lease.requested_port = req.port
-            # Only mark STARTING here; RUNNING will be set when endpoint is READY
             if lease.state in ("SUBMITTED", "PLANNED"):
                 lease.state = "STARTING"
             db.commit()
+            db.refresh(e)
 
-
-    return EndpointOut(
-        id=e.id, model=e.model, host=e.host, port=e.port, slurm_job_id=e.slurm_job_id, state=e.state,
-        last_health_at=e.last_health_at, last_error=e.last_error, created_at=e.created_at
-    )
+        return EndpointOut(
+            id=e.id, model=e.model, host=e.host, port=e.port,
+            slurm_job_id=e.slurm_job_id, state=e.state,
+            last_health_at=e.last_health_at, last_error=e.last_error,
+            created_at=e.created_at
+        )

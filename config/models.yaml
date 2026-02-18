@@ -19,3 +19,12 @@ models:
     tool_args: "--enable-auto-tool-choice --tool-call-parser glm45"
     venv_activate: /root/vllm-0.15.0-transformers5/.venv/bin/activate
     notes: "Vision model with xgrammar and FLASHINFER attention"
+  - name: Qwen3-0.6B-FP8
+    model_path: Qwen/Qwen3-0.6B-FP8
+    gpus: 1
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.03
+    reasoning_parser: deepseek_r1
+    extra_args: "--max-num-seqs 10 --enforce-eager --max-model-len 2048"
+    venv_activate: /root/vllm-nightly-16022026/.venv/bin/activate
+    notes: "small model"

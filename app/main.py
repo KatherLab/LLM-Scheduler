@@ -476,13 +476,13 @@ async def endpoint_cleanup_worker():
                             "action": "lease_done",
                         })
 
-            # ── Phase 2: scancel expired jobs (non-blocking) ────────────
+            # ── Phase 2: scancel jobs (non-blocking) ───────────────────
             for act in actions:
-                if act["action"] == "expired" and act["slurm_job_id"]:
+                if act["slurm_job_id"]:
                     try:
                         await slurm.async_cancel(act["slurm_job_id"])
                         print(
-                            f"endpoint_cleanup: scancel'd expired job "
+                            f"endpoint_cleanup: scancel'd {act['action']} job "
                             f"{act['slurm_job_id']}"
                         )
                     except Exception as ex:
@@ -491,6 +491,7 @@ async def endpoint_cleanup_worker():
                             f"endpoint_cleanup: scancel failed for "
                             f"{act['slurm_job_id']}: {ex}"
                         )
+
 
             # ── Phase 3: update DB state ────────────────────────────────
             if actions:
@@ -540,7 +541,7 @@ async def slurm_reconcile_worker():
                 active = db.execute(
                     select(Lease).where(
                         Lease.state.in_(
-                            ["SUBMITTED", "STARTING", "RUNNING", "FAILED"]
+                            ["SUBMITTED", "STARTING", "RUNNING", "FAILED", "RETRYING"]
                         )
                     )
                 ).scalars().all()
@@ -549,7 +550,7 @@ async def slurm_reconcile_worker():
                 failed_expiry: list[dict] = []
 
                 for l in active:
-                    if l.state == "FAILED":
+                    if l.state in ("FAILED", "RETRYING"):
                         if l.end_at and _ensure_aware_dt(l.end_at) < now:
                             failed_expiry.append({
                                 "id": l.id,
@@ -695,13 +696,14 @@ async def retry_worker():
             # ── Phase 2: attempt retries (NO DB session held) ───────────
             for snapshot in candidates:
                 try:
-                    # Phase 2a: mark retry in progress (quick DB write)
+                    # Phase 2a: mark retry in progress with RETRYING state
                     with SessionLocal() as db:
                         lease = db.get(Lease, snapshot["id"])
                         if not lease or lease.state != "FAILED":
                             continue
 
                         lease.retry_count += 1
+                        lease.state = "RETRYING"  # Intermediate state prevents other workers from touching it
                         print(
                             f"retry_worker: retrying lease {lease.id} "
                             f"({lease.model}), attempt "
@@ -746,9 +748,11 @@ async def retry_worker():
                         f"retry_worker: failed to resubmit "
                         f"lease {snapshot['id']}: {ex}"
                     )
+                    # Revert to FAILED so it can be retried again later
                     with SessionLocal() as db:
                         lease = db.get(Lease, snapshot["id"])
-                        if lease:
+                        if lease and lease.state == "RETRYING":
+                            lease.state = "FAILED"
                             lease.failed_at = now
                             db.commit()
 
@@ -777,9 +781,10 @@ def reconcile_on_startup():
         # 1. Check active leases against Slurm (batched)
         active_leases = db.execute(
             select(Lease).where(
-                Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING"])
+                Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING", "RETRYING"])
             )
         ).scalars().all()
+
 
         # Collect all job IDs we need to check
         lease_job_ids = [
@@ -841,6 +846,20 @@ def reconcile_on_startup():
                     f"→ ENDED (end_at {lease.end_at} already passed)"
                 )
                 changes += 1
+
+        # 2b. RETRYING leases left from a crash → revert to FAILED
+        retrying = db.execute(
+            select(Lease).where(Lease.state == "RETRYING")
+        ).scalars().all()
+
+        for lease in retrying:
+            lease.state = "FAILED"
+            lease.failed_at = now
+            print(
+                f"  reconcile: lease {lease.id} ({lease.model}) "
+                f"RETRYING → FAILED (crash recovery)"
+            )
+            changes += 1
 
         # 3. Orphaned endpoints (no matching active lease)
         eps = db.execute(

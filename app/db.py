@@ -19,7 +19,17 @@ def ensure_parent_dir(db_url: str) -> None:
 
 def make_engine(database_url: str):
     ensure_parent_dir(database_url)
-    eng = create_engine(database_url, future=True)
+
+    connect_args = {}
+    if database_url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+
+    eng = create_engine(
+        database_url,
+        future=True,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+    )
 
     # SQLite-specific: enable WAL mode and set a busy timeout so concurrent
     # writers wait instead of immediately raising "database is locked".

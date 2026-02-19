@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import glob
 import os
 from datetime import datetime, timedelta, timezone
@@ -254,6 +255,10 @@ def _read_log_file(path: str, max_bytes: int = 200_000) -> tuple[str, bool]:
 
 def _find_log_files(slurm_job_id: str) -> tuple[str, str]:
     """Find stdout/stderr log files for a Slurm job."""
+    # Validate that slurm_job_id is purely numeric to prevent path traversal
+    if not slurm_job_id.isdigit():
+        return "", ""
+
     log_dir = os.path.abspath(settings.vllm_log_dir)
 
     stdout_pattern = os.path.join(log_dir, f"*-{slurm_job_id}.out")
@@ -262,10 +267,15 @@ def _find_log_files(slurm_job_id: str) -> tuple[str, str]:
     stdout_files = glob.glob(stdout_pattern)
     stderr_files = glob.glob(stderr_pattern)
 
-    stdout_path = stdout_files[0] if stdout_files else ""
-    stderr_path = stderr_files[0] if stderr_files else ""
-    return stdout_path, stderr_path
+    # Extra safety: ensure resolved paths are within log_dir
+    stdout_path = ""
+    stderr_path = ""
+    if stdout_files and os.path.abspath(stdout_files[0]).startswith(log_dir):
+        stdout_path = stdout_files[0]
+    if stderr_files and os.path.abspath(stderr_files[0]).startswith(log_dir):
+        stderr_path = stderr_files[0]
 
+    return stdout_path, stderr_path
 
 
 # ---------- endpoints ------------------------------------------------------------
@@ -363,7 +373,7 @@ def list_endpoints():
         ) for e in eps]
 
 @router.post("/leases", response_model=LeaseOut)
-def create_lease(req: LeaseCreate):
+async def create_lease(req: LeaseCreate):
     catalog = get_catalog()
     if req.model not in catalog:
         raise HTTPException(status_code=404, detail=f"Unknown model '{req.model}'")
@@ -398,18 +408,36 @@ def create_lease(req: LeaseCreate):
             end = begin + duration
 
     else:
-        begin = req.begin_at or now_utc()
+        begin = _ensure_aware(req.begin_at) if req.begin_at else now_utc()
         end = begin + duration
+
 
     with SessionLocal() as db:
         merged = _merge_same_model_if_applicable(db, req, begin, end)
         if merged:
             _validate_no_conflicts(db, merged)
+
+            # If the lease already has a Slurm job running, extend its time limit
+            if merged.slurm_job_id and merged.state in ("SUBMITTED", "STARTING", "RUNNING"):
+                total_seconds = int((_lease_end(merged) - _lease_begin(merged)).total_seconds())
+                total_seconds = max(60, total_seconds)
+                new_time_limit = _time_limit_from_duration(total_seconds)
+                try:
+                    await asyncio.to_thread(slurm.extend_time, merged.slurm_job_id, new_time_limit)
+                    print(
+                        f"create_lease: extended Slurm job {merged.slurm_job_id} "
+                        f"time to {new_time_limit} after merge"
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to extend Slurm time for merged lease {merged.id}: {e}")
+
             db.add(merged)
             db.commit()
             db.refresh(merged)
             return _lease_to_out(merged)
 
+        begin = _ensure_aware(begin)
+        end = _ensure_aware(end)
         planned = (begin > now_utc() + timedelta(seconds=30))
 
         lease = Lease(
@@ -439,10 +467,11 @@ def create_lease(req: LeaseCreate):
 
         if lease.state == "SUBMITTED":
             try:
-                job_id = _submit_to_slurm(lease)
+                job_id = await asyncio.to_thread(_submit_to_slurm, lease)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
             lease.slurm_job_id = job_id
+
 
         db.add(lease)
         db.commit()
@@ -493,7 +522,7 @@ def update_lease_notes(lease_id: int, req: dict):
         return {"ok": True, "notes": lease.notes}
 
 @router.delete("/leases/{lease_id}")
-def cancel_lease(lease_id: int):
+async def cancel_lease(lease_id: int):
     with SessionLocal() as db:
         lease = db.get(Lease, lease_id)
         if not lease:
@@ -501,7 +530,7 @@ def cancel_lease(lease_id: int):
 
         if lease.slurm_job_id:
             try:
-                slurm.cancel(lease.slurm_job_id)
+                await slurm.async_cancel(lease.slurm_job_id)
             except Exception as e:
                 print(f"Warning: Slurm cancel failed: {e}")
 
@@ -516,7 +545,7 @@ def cancel_lease(lease_id: int):
     return {"ok": True}
 
 @router.post("/leases/{lease_id}/extend")
-def extend_lease(lease_id: int, req: LeaseExtend):
+async def extend_lease(lease_id: int, req: LeaseExtend):
     with SessionLocal() as db:
         lease = db.get(Lease, lease_id)
         if not lease:
@@ -535,7 +564,7 @@ def extend_lease(lease_id: int, req: LeaseExtend):
             total_seconds = max(60, total_seconds)
             new_time_limit = _time_limit_from_duration(total_seconds)
             try:
-                slurm.extend_time(lease.slurm_job_id, new_time_limit)
+                await slurm.async_extend_time(lease.slurm_job_id, new_time_limit)
             except Exception as e:
                 print(f"Warning: failed to extend Slurm time: {e}")
 
@@ -544,7 +573,7 @@ def extend_lease(lease_id: int, req: LeaseExtend):
 
 
 @router.post("/leases/{lease_id}/shorten")
-def shorten_lease(lease_id: int, req: LeaseShortenRequest):
+async def shorten_lease(lease_id: int, req: LeaseShortenRequest):
     """Shorten a running or submitted lease. The new end must be in the future and before the current end."""
     with SessionLocal() as db:
         lease = db.get(Lease, lease_id)
@@ -574,7 +603,7 @@ def shorten_lease(lease_id: int, req: LeaseShortenRequest):
             total_seconds = max(60, total_seconds)
             new_time_limit = _time_limit_from_duration(total_seconds)
             try:
-                slurm.extend_time(lease.slurm_job_id, new_time_limit)
+                await slurm.async_extend_time(lease.slurm_job_id, new_time_limit)
             except Exception as e:
                 print(f"Warning: failed to shorten Slurm time: {e}")
 
@@ -583,7 +612,7 @@ def shorten_lease(lease_id: int, req: LeaseShortenRequest):
 
 
 @router.post("/leases/{lease_id}/stop")
-def stop_lease_now(lease_id: int):
+async def stop_lease_now(lease_id: int):
     """Immediately stop a running model — cancels the Slurm job."""
     with SessionLocal() as db:
         lease = db.get(Lease, lease_id)
@@ -595,7 +624,7 @@ def stop_lease_now(lease_id: int):
 
         if lease.slurm_job_id:
             try:
-                slurm.cancel(lease.slurm_job_id)
+                await slurm.async_cancel(lease.slurm_job_id)
             except Exception as e:
                 print(f"Warning: Slurm cancel failed: {e}")
 

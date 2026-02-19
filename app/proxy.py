@@ -107,6 +107,7 @@ async def proxy_json_or_stream(
                     {"error": {"message": str(e), "type": "proxy_error"}}
                 )
                 yield f"data: {error_data}\n\n".encode()
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
     else:

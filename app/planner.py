@@ -89,44 +89,88 @@ def find_earliest_slot(
     Find the earliest time within [search_start, search_end] where `gpus_needed`
     GPUs are free for the full `duration`.
 
-    Returns the start datetime, or None if no slot exists.
+    Uses a sweep-line approach: builds a sorted list of GPU usage change events,
+    then sweeps to find windows where enough GPUs are free.
     """
     search_start = _ensure_aware(search_start)
     search_end = _ensure_aware(search_end)
 
-    # Pre-process existing leases into (begin, end, gpus) tuples
-    intervals = []
+    if gpus_needed > total_gpus:
+        return None
+
+    # Build event list: (time, gpu_delta)
+    # +gpus at lease begin, -gpus at lease end
+    events: list[tuple[datetime, int]] = []
     for l in existing_leases:
         begin = _t(l.begin_at, l.created_at)
         end = _ensure_aware(l.end_at) if l.end_at else (begin + timedelta(hours=1))
         g = max(1, int(getattr(l, "requested_gpus", 1) or 1))
-        intervals.append((begin, end, g))
+        # Only consider leases that overlap with our search window
+        if end <= search_start or begin >= search_end + duration:
+            continue
+        events.append((begin, g))
+        events.append((end, -g))
 
-    def gpus_free_at(t: datetime) -> int:
+    # Sort events by time (ties broken by delta: releases before acquisitions)
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    # Build a sorted list of all "interesting" time points to check
+    # These are: search_start, every event time, and step-aligned times
+    interesting_times: set[datetime] = {search_start}
+    for evt_time, _ in events:
+        if search_start <= evt_time <= search_end:
+            interesting_times.add(evt_time)
+        # Also add step-snapped version
+        snapped = search_start + step * int((evt_time - search_start) / step)
+        if search_start <= snapped <= search_end:
+            interesting_times.add(snapped)
+
+    # Also add step-aligned times for completeness (but limit to reasonable count)
+    t = search_start
+    while t + duration <= search_end:
+        interesting_times.add(t)
+        t += step
+
+    sorted_times = sorted(interesting_times)
+
+    # For each candidate start, check if GPUs are free for the entire duration
+    # We use the events to compute GPU usage at any point
+    def gpus_used_at(t: datetime) -> int:
+        """Compute GPUs in use at time t by summing all events before t."""
         used = 0
-        for (b, e, g) in intervals:
-            if b <= t < e:
-                used += g
-        return total_gpus - used
+        for evt_time, delta in events:
+            if evt_time <= t:
+                used += delta
+            else:
+                break
+        return used
 
-    def slot_available(candidate_start: datetime) -> bool:
-        """Check if gpus_needed are free for the entire [candidate_start, candidate_start + duration)."""
-        candidate_end = candidate_start + duration
+    # Precompute: for each candidate, we need to check that gpus_used < threshold
+    # for the entire [candidate, candidate+duration) window.
+    # Collect all event times within each candidate window.
+    for candidate in sorted_times:
+        candidate_end = candidate + duration
         if candidate_end > search_end:
-            return False
-        # Check at every step within the candidate window
-        t = candidate_start
-        while t < candidate_end:
-            if gpus_free_at(t) < gpus_needed:
-                return False
-            t += step
-        return True
+            break
 
-    # Scan from search_start in `step` increments
-    candidate = search_start
-    while candidate + duration <= search_end:
-        if slot_available(candidate):
+        # Check at candidate start and at every event within the window
+        ok = True
+
+        # Check at candidate start
+        if total_gpus - gpus_used_at(candidate) < gpus_needed:
+            continue
+
+        # Check at every event time within [candidate, candidate_end)
+        for evt_time, _ in events:
+            if evt_time < candidate:
+                continue
+            if evt_time >= candidate_end:
+                break
+            if total_gpus - gpus_used_at(evt_time) < gpus_needed:
+                ok = False
+                break
+
+        if ok:
             return candidate
-        candidate += step
 
     return None

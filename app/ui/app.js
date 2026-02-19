@@ -1427,15 +1427,63 @@ function resetDrag() {
 }
 
 // ─── Timeline Rendering ─────────────────────────────────────────────────────
+
+/**
+ * Compute adaptive time-axis parameters based on the window size.
+ * Returns { gridStepHours, labelStepHours, showDayHeader }
+ */
+function getTimeAxisParams(totalHours) {
+  if (totalHours <= 24) {
+    return { gridStepHours: 1, labelStepHours: 1, showDayHeader: false };
+  } else if (totalHours <= 72) {
+    return { gridStepHours: 2, labelStepHours: 6, showDayHeader: true };
+  } else if (totalHours <= 168) {
+    return { gridStepHours: 6, labelStepHours: 12, showDayHeader: true };
+  } else {
+    return { gridStepHours: 12, labelStepHours: 24, showDayHeader: true };
+  }
+}
+
+/**
+ * Format a day header label, e.g. "Mon Feb 24"
+ */
+function fmtDayHeader(d) {
+  return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
 function renderTimeline() {
   const svg = $('#timelineSvg');
   const hours = parseInt($('#windowSelect').value, 10);
-  const pxPerHour = parseInt($('#zoomSelect').value, 10);
+  const zoomVal = $('#zoomSelect').value;
   const gpuTotal = DASH?.total_gpus || 8;
+
+  const container = $('#timelineContainer');
+  const containerWidth = container.clientWidth || 1200;
+
+  // Compute pxPerHour
+  let pxPerHour;
+  if (zoomVal === 'fit') {
+    // Fit entire window into the visible container width
+    pxPerHour = Math.max(4, (containerWidth - TL.leftPad - 20) / hours);
+  } else {
+    pxPerHour = parseInt(zoomVal, 10);
+  }
+
+  // For very long windows with fixed zoom, clamp minimum pxPerHour
+  // so the SVG doesn't become absurdly wide (optional safety)
+  // pxPerHour = Math.max(4, pxPerHour);
+
+  const { gridStepHours, labelStepHours, showDayHeader } = getTimeAxisParams(hours);
 
   TL.hours = hours;
   TL.pxPerHour = pxPerHour;
   TL.gpuTotal = gpuTotal;
+
+  // Two-tier header: day row + hour row (or just hour row for short windows)
+  const dayHeaderH = showDayHeader ? 22 : 0;
+  const hourHeaderH = 28;
+  TL.headerH = dayHeaderH + hourHeaderH;
+
   TL.width = TL.leftPad + (hours * pxPerHour);
   TL.height = TL.headerH + gpuTotal * TL.laneH + 16;
 
@@ -1451,8 +1499,10 @@ function renderTimeline() {
 
   const dark = isDark();
 
+  // Background
   drawRect(svg, 0, 0, TL.width, TL.height, { fill: dark ? '#0b1220' : '#ffffff' });
 
+  // Defs (glow filter)
   const defs = svgEl('defs');
   const filter = svgEl('filter', { id: 'glow', x: '-50%', y: '-50%', width: '200%', height: '200%' });
   const blur = svgEl('feGaussianBlur', { stdDeviation: '3', result: 'coloredBlur' });
@@ -1466,30 +1516,100 @@ function renderTimeline() {
   defs.appendChild(filter);
   svg.appendChild(defs);
 
-  for (let h = 0; h <= hours; h++) {
+  // ── Day header row (if multi-day) ──
+  if (showDayHeader) {
+    // Draw day separator lines and labels
+    const startDay = new Date(TL.start);
+    startDay.setHours(0, 0, 0, 0);
+
+    // Find the first midnight at or after TL.start
+    let firstMidnight = new Date(startDay);
+    if (firstMidnight < TL.start) {
+      firstMidnight.setDate(firstMidnight.getDate() + 1);
+    }
+
+    // Draw a label for the starting partial day
+    const startDayLabel = fmtDayHeader(TL.start);
+    const startLabelX = TL.leftPad + 6;
+    drawText(svg, startLabelX, 15, startDayLabel, {
+      fill: dark ? '#e2e8f0' : '#1e293b',
+      'font-size': 11,
+      class: 'day-separator-label',
+      'font-family': 'ui-sans-serif, system-ui, -apple-system, sans-serif',
+    });
+
+    // Draw day separators and labels for each midnight
+    for (let d = new Date(firstMidnight); d < TL.end; d.setDate(d.getDate() + 1)) {
+      const x = dateToX(d);
+      if (x <= TL.leftPad) continue;
+
+      // Prominent day separator line (full height)
+      drawLine(svg, x, 0, x, TL.height, {
+        stroke: dark ? '#475569' : '#64748b',
+        'stroke-opacity': 0.5,
+        'stroke-width': 1.5,
+      });
+
+      // Day label
+      const label = fmtDayHeader(d);
+      drawText(svg, x + 6, 15, label, {
+        fill: dark ? '#e2e8f0' : '#1e293b',
+        'font-size': 11,
+        class: 'day-separator-label',
+        'font-family': 'ui-sans-serif, system-ui, -apple-system, sans-serif',
+      });
+    }
+
+    // Day header bottom border
+    drawLine(svg, 0, dayHeaderH, TL.width, dayHeaderH, {
+      stroke: dark ? '#334155' : '#94a3b8',
+      'stroke-opacity': 0.3,
+    });
+  }
+
+  // ── Hour grid lines and labels ──
+  for (let h = 0; h <= hours; h += gridStepHours) {
     const x = TL.leftPad + h * pxPerHour;
-    drawLine(svg, x, 0, x, TL.height, {
-      stroke: dark ? '#334155' : '#94a3b8',
-      'stroke-opacity': 0.2,
-    });
-
     const t = new Date(TL.start.getTime() + h * 3600000);
-    const label = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
-    drawText(svg, x + 4, 22, label, {
-      fill: dark ? '#94a3b8' : '#64748b',
-      'font-size': 12,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
+
+    // Grid line
+    const isMidnight = t.getHours() === 0 && t.getMinutes() === 0;
+    if (!isMidnight || !showDayHeader) {
+      // Don't double-draw midnight lines if day header already drew them
+      drawLine(svg, x, dayHeaderH, x, TL.height, {
+        stroke: dark ? '#334155' : '#94a3b8',
+        'stroke-opacity': showDayHeader ? 0.12 : 0.2,
+      });
+    }
+
+    // Hour label (only at labelStep intervals)
+    if (h % labelStepHours === 0 || !showDayHeader) {
+      const hourLabel = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+      // For multi-day views, skip the "00:00" label since the day header covers it
+      const skipLabel = showDayHeader && isMidnight;
+      if (!skipLabel) {
+        drawText(svg, x + 4, dayHeaderH + 18, hourLabel, {
+          fill: dark ? '#94a3b8' : '#64748b',
+          'font-size': hours > 72 ? 10 : 12,
+          'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        });
+      }
+    }
   }
 
-  for (let h = 0; h < hours; h++) {
-    const x = TL.leftPad + (h + 0.5) * pxPerHour;
-    drawLine(svg, x, TL.headerH, x, TL.height, {
-      stroke: dark ? '#334155' : '#94a3b8',
-      'stroke-opacity': 0.08,
-    });
+  // Sub-grid lines (half-step) — only for shorter windows
+  if (hours <= 48) {
+    for (let h = 0; h < hours; h += gridStepHours) {
+      const x = TL.leftPad + (h + gridStepHours / 2) * pxPerHour;
+      if (x < TL.leftPad || x > TL.width) continue;
+      drawLine(svg, x, TL.headerH, x, TL.height, {
+        stroke: dark ? '#334155' : '#94a3b8',
+        'stroke-opacity': 0.08,
+      });
+    }
   }
 
+  // ── GPU lane labels and lines ──
   for (let i = 0; i < gpuTotal; i++) {
     const y = TL.headerH + i * TL.laneH;
     drawLine(svg, 0, y, TL.width, y, {
@@ -1507,6 +1627,7 @@ function renderTimeline() {
     'stroke-opacity': 0.15,
   });
 
+  // ── Lease blocks ──
   const nowDate = new Date(DASH.now);
   const leases = (DASH?.leases || [])
     .filter(l =>
@@ -1519,26 +1640,168 @@ function renderTimeline() {
     drawLeaseBlock(svg, l);
   }
 
+  // ── Now line ──
   const nowX = dateToX(now);
   drawLine(svg, nowX, 0, nowX, TL.height, {
     stroke: '#0ea5e9',
     'stroke-width': 2,
     class: 'now-line-pulse',
   });
-
-  drawText(svg, nowX + 4, 12, 'now', {
+  drawText(svg, nowX + 4, dayHeaderH > 0 ? dayHeaderH + 11 : 12, 'now', {
     fill: '#0ea5e9',
     'font-size': 10,
     'font-weight': 'bold',
     'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
   });
 
-  const container = $('#timelineContainer');
+  // ── Auto-scroll to now ──
   const scrollTarget = nowX - 200;
   if (scrollTarget > 0 && !dragState.active && !catalogDragState.active) {
     container.scrollLeft = scrollTarget;
   }
+
+  // ── Render minimap ──
+  renderMinimap(leases);
 }
+
+// ─── Minimap ────────────────────────────────────────────────────────────────
+function renderMinimap(leases) {
+  const minimapContainer = $('#minimapContainer');
+  const minimapSvg = $('#minimapSvg');
+  const minimapViewport = $('#minimapViewport');
+
+  // Only show minimap when the timeline is wider than the container
+  const container = $('#timelineContainer');
+  const containerWidth = container.clientWidth || 1200;
+
+  if (TL.width <= containerWidth + 50) {
+    minimapContainer.classList.add('hidden');
+    return;
+  }
+
+  minimapContainer.classList.remove('hidden');
+
+  const mmWidth = containerWidth;
+  const mmHeight = 40;
+  const mmPxPerHour = (mmWidth - TL.leftPad) / TL.hours;
+
+  minimapSvg.setAttribute('width', mmWidth);
+  minimapSvg.setAttribute('height', mmHeight);
+  minimapSvg.innerHTML = '';
+
+  const dark = isDark();
+
+  // Background
+  drawRect(minimapSvg, 0, 0, mmWidth, mmHeight, { fill: dark ? '#0f172a' : '#f8fafc' });
+
+  // GPU lanes (thin lines)
+  const laneMiniH = (mmHeight - 4) / TL.gpuTotal;
+  for (let i = 0; i <= TL.gpuTotal; i++) {
+    const y = 2 + i * laneMiniH;
+    drawLine(minimapSvg, TL.leftPad, y, mmWidth, y, {
+      stroke: dark ? '#334155' : '#cbd5e1',
+      'stroke-opacity': 0.3,
+    });
+  }
+
+  // Day separators
+  if (TL.hours > 24) {
+    const startDay = new Date(TL.start);
+    startDay.setHours(0, 0, 0, 0);
+    let firstMidnight = new Date(startDay);
+    if (firstMidnight < TL.start) firstMidnight.setDate(firstMidnight.getDate() + 1);
+    for (let d = new Date(firstMidnight); d < TL.end; d.setDate(d.getDate() + 1)) {
+      const hoursFromStart = (d.getTime() - TL.start.getTime()) / 3600000;
+      const x = TL.leftPad + hoursFromStart * mmPxPerHour;
+      drawLine(minimapSvg, x, 0, x, mmHeight, {
+        stroke: dark ? '#475569' : '#94a3b8',
+        'stroke-opacity': 0.4,
+      });
+    }
+  }
+
+  // Lease blocks (simplified colored rectangles)
+  for (const l of leases) {
+    const b = new Date(l.begin_at || l.created_at);
+    const e = new Date(l.end_at);
+    if (e <= TL.start || b >= TL.end) continue;
+
+    const bClamped = new Date(Math.max(b.getTime(), TL.start.getTime()));
+    const eClamped = new Date(Math.min(e.getTime(), TL.end.getTime()));
+
+    const hoursFromStartB = (bClamped.getTime() - TL.start.getTime()) / 3600000;
+    const hoursFromStartE = (eClamped.getTime() - TL.start.getTime()) / 3600000;
+    const x = TL.leftPad + hoursFromStartB * mmPxPerHour;
+    const w = Math.max(2, (hoursFromStartE - hoursFromStartB) * mmPxPerHour);
+
+    const laneStart = l.lane_start ?? 0;
+    const laneCount = l.lane_count ?? l.requested_gpus ?? 1;
+    const y = 2 + laneStart * laneMiniH + 1;
+    const h = laneCount * laneMiniH - 2;
+
+    let fill;
+    if (l.state === 'FAILED') fill = 'rgba(239, 68, 68, 0.5)';
+    else if (l.conflict) fill = 'rgba(239, 68, 68, 0.6)';
+    else if (l.state === 'RUNNING') fill = 'rgba(16, 185, 129, 0.6)';
+    else if (l.state === 'SUBMITTED' || l.state === 'STARTING') fill = 'rgba(245, 158, 11, 0.6)';
+    else fill = 'rgba(14, 165, 233, 0.5)';
+
+    drawRect(minimapSvg, x, y, w, Math.max(2, h), {
+      fill,
+      rx: 2,
+    });
+  }
+
+  // Now line
+  const nowHoursFromStart = (new Date(DASH.now).getTime() - TL.start.getTime()) / 3600000;
+  const nowMmX = TL.leftPad + nowHoursFromStart * mmPxPerHour;
+  drawLine(minimapSvg, nowMmX, 0, nowMmX, mmHeight, {
+    stroke: '#0ea5e9',
+    'stroke-width': 1.5,
+  });
+
+  // GPU labels (tiny)
+  drawText(minimapSvg, 4, mmHeight / 2 + 3, `${TL.gpuTotal} GPUs`, {
+    fill: dark ? '#64748b' : '#94a3b8',
+    'font-size': 8,
+    'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  });
+
+  // Update viewport indicator
+  updateMinimapViewport();
+
+  // Remove old listeners and add new ones
+  minimapContainer._clickHandler && minimapContainer.removeEventListener('click', minimapContainer._clickHandler);
+  minimapContainer._clickHandler = (e) => {
+    const rect = minimapContainer.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const fraction = (clickX - TL.leftPad) / (mmWidth - TL.leftPad);
+    const scrollX = fraction * TL.width - containerWidth / 2;
+    container.scrollLeft = Math.max(0, scrollX);
+  };
+  minimapContainer.addEventListener('click', minimapContainer._clickHandler);
+}
+
+function updateMinimapViewport() {
+  const container = $('#timelineContainer');
+  const minimapContainer = $('#minimapContainer');
+  const minimapViewport = $('#minimapViewport');
+
+  if (minimapContainer.classList.contains('hidden')) return;
+
+  const containerWidth = container.clientWidth || 1200;
+  const mmWidth = containerWidth;
+
+  const scrollLeft = container.scrollLeft;
+  const scrollWidth = container.scrollWidth || TL.width;
+
+  const vpLeft = (scrollLeft / scrollWidth) * mmWidth;
+  const vpWidth = (containerWidth / scrollWidth) * mmWidth;
+
+  minimapViewport.style.left = `${vpLeft}px`;
+  minimapViewport.style.width = `${vpWidth}px`;
+}
+
 
 function drawLeaseBlock(svg, l) {
   const b = new Date(l.begin_at || l.created_at);
@@ -1646,7 +1909,7 @@ function drawLeaseBlock(svg, l) {
     ? (dark ? '#f87171' : '#b91c1c')
     : (dark ? '#94a3b8' : '#64748b');
 
-  if (w >= 120) {
+    if (w >= 120) {
     const notesSnippet = l.notes ? ` · 📝 ${l.notes.substring(0, 30)}${l.notes.length > 30 ? '…' : ''}` : '';
     const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}${notesSnippet}`;
     drawText(textGroup, x + 10, y + 18, label, {
@@ -1677,6 +1940,14 @@ function drawLeaseBlock(svg, l) {
     drawText(textGroup, x + 6, y + h / 2 + 4, l.model, {
       fill: labelColor,
       'font-size': 10,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    });
+  } else if (w >= 12) {
+    // Ultra-compact: just a short abbreviation or first few chars
+    const shortName = l.model.length > 6 ? l.model.substring(0, 5) + '…' : l.model;
+    drawText(textGroup, x + 3, y + h / 2 + 3, shortName, {
+      fill: labelColor,
+      'font-size': 8,
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
   }
@@ -1949,6 +2220,7 @@ window.dismissFailedLease = async (id) => {
 
 // ─── Controls & Init ────────────────────────────────────────────────────────
 $('#refreshBtn').addEventListener('click', refresh);
+$('#timelineContainer').addEventListener('scroll', updateMinimapViewport);
 $('#windowSelect').addEventListener('change', () => { if (DASH) renderTimeline(); });
 $('#zoomSelect').addEventListener('change', () => { if (DASH) renderTimeline(); });
 $('#searchInput').addEventListener('input', () => { if (DASH) renderCatalog(); });
@@ -1956,6 +2228,12 @@ $('#filterSelect').addEventListener('change', () => { if (DASH) renderCatalog();
 
 $('#newBookingBtn').addEventListener('click', () => {
   openModal();
+});
+
+window.addEventListener('resize', () => {
+  if ($('#zoomSelect').value === 'fit' && DASH) {
+    renderTimeline();
+  }
 });
 
 // Init

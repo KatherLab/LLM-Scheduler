@@ -81,6 +81,22 @@
     .status-dot-starting { width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; animation: statusPulse 1s ease-in-out infinite; }
     .status-dot-failed { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
     @keyframes statusPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    /* Day separator labels */
+    .day-separator-label {
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    /* Minimap */
+    #minimapContainer {
+      transition: opacity 0.2s;
+    }
+    #minimapContainer:hover #minimapViewport {
+      border-color: rgba(14, 165, 233, 0.9);
+      background: rgba(14, 165, 233, 0.15);
+    }
   </style>
 </head>
 
@@ -120,11 +136,16 @@
             <option value="12">12h</option>
             <option value="24" selected>24h</option>
             <option value="48">48h</option>
+            <option value="72">3 days</option>
+            <option value="120">5 days</option>
+            <option value="168">7 days</option>
+            <option value="336">14 days</option>
           </select>
           <select id="zoomSelect" class="bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-700 text-sm rounded-md px-2 py-1">
             <option value="60">Compact</option>
             <option value="90" selected>Normal</option>
             <option value="130">Large</option>
+            <option value="fit">Fit to view</option>
           </select>
         </div>
 
@@ -183,6 +204,12 @@
                 New Booking
               </button>
             </div>
+          </div>
+
+          <!-- Minimap -->
+          <div id="minimapContainer" class="hidden border-t border-gray-200 dark:border-slate-700 relative cursor-pointer" style="height: 40px; overflow: hidden;">
+            <svg id="minimapSvg" class="block w-full" style="height: 40px;"></svg>
+            <div id="minimapViewport" class="absolute top-0 bottom-0 border-2 border-brand-500/60 bg-brand-500/10 rounded-sm pointer-events-none" style="min-width: 4px;"></div>
           </div>
 
           <div id="timelineContainer" class="timeline-scroll overflow-x-auto overflow-y-hidden border-t border-gray-200 dark:border-slate-700 relative">

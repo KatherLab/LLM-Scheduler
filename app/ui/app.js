@@ -546,6 +546,10 @@ function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = 
   $('#modalSaveText').textContent = leaseId ? 'Update Booking' : 'Create Booking';
   $('#modalError').classList.add('hidden');
 
+  // Populate notes from existing lease if editing
+  const existingLease = leaseId ? DASH?.leases?.find(l => l.id === leaseId) : null;
+  $('#modalNotes').value = existingLease?.notes || '';
+
   populateModalModels(model);
 
   // Duration
@@ -710,6 +714,7 @@ $('#modalSave').addEventListener('click', async () => {
       const payload = {
         model,
         duration_seconds: durationHours * 3600,
+        notes: $('#modalNotes').value.trim() || null,
       };
 
       if (modalState.asap) {
@@ -733,6 +738,7 @@ $('#modalSave').addEventListener('click', async () => {
         body: JSON.stringify({
           begin_at: begin.toISOString(),
           end_at: end.toISOString(),
+          notes: $('#modalNotes').value.trim() || null,
         })
       });
       toast('Booking updated', 'success');
@@ -763,7 +769,8 @@ function showBlockPopover(lease, anchorX, anchorY) {
   const isFailed = lease.state === 'FAILED';
 
   $('#popoverModel').textContent = lease.model;
-  $('#popoverTime').textContent = `${fmtTime(b)} → ${fmtTime(e)} (${formatDuration(durationSec)})`;
+  $('#popoverTime').innerHTML = `${fmtTime(b)} → ${fmtTime(e)} (${formatDuration(durationSec)})` +
+    (lease.notes ? `<div class="mt-1.5 text-xs text-slate-400 italic">📝 ${escapeHtml(lease.notes)}</div>` : '');
 
   const epStats = (DASH?.endpoint_stats || []).find(s => s.model === lease.model && s.state === 'READY');
   if (epStats) {
@@ -915,8 +922,32 @@ function showBlockPopover(lease, anchorX, anchorY) {
       actionsEl.appendChild(editBtn);
     }
 
+    // Edit notes (any active state)
+    if (['RUNNING', 'SUBMITTED', 'STARTING'].includes(lease.state)) {
+      const notesBtn = document.createElement('button');
+      notesBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-slate-600/20 text-gray-700 dark:text-slate-300 border border-gray-300 dark:border-slate-500/30 hover:bg-gray-200 dark:hover:bg-slate-600/30 transition font-medium';
+      notesBtn.textContent = '📝 Edit Notes';
+      notesBtn.addEventListener('click', async () => {
+        const newNotes = prompt('Booking notes:', lease.notes || '');
+        if (newNotes === null) return; // cancelled
+        try {
+          await api(`/admin/leases/${lease.id}/notes`, {
+            method: "PATCH",
+            body: JSON.stringify({ notes: newNotes })
+          });
+          toast('Notes updated', 'success');
+          hideBlockPopover();
+          await refresh();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      });
+      actionsEl.appendChild(notesBtn);
+    }
+
     // Logs (if has slurm job)
     if (lease.slurm_job_id) {
+
       const logBtn = document.createElement('button');
       logBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-slate-600/20 text-gray-700 dark:text-slate-300 border border-gray-300 dark:border-slate-500/30 hover:bg-gray-200 dark:hover:bg-slate-600/30 transition font-medium flex items-center justify-center gap-1.5';
       logBtn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg> View Logs`;
@@ -1602,7 +1633,8 @@ function drawLeaseBlock(svg, l) {
     : (dark ? '#94a3b8' : '#64748b');
 
   if (w >= 120) {
-    const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}`;
+    const notesSnippet = l.notes ? ` · 📝 ${l.notes.substring(0, 30)}${l.notes.length > 30 ? '…' : ''}` : '';
+    const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}${notesSnippet}`;
     drawText(textGroup, x + 10, y + 18, label, {
       fill: labelColor,
       'font-size': 11,
@@ -1780,7 +1812,10 @@ function renderTable() {
 
     return `
       <tr class="${rowBg} hover:bg-gray-50 dark:hover:bg-slate-800/50 transition">
-        <td class="px-4 py-3 text-sm font-medium break-all ${isFailed ? 'text-red-700 dark:text-red-300' : ''}">${escapeHtml(l.model)}</td>
+        <td class="px-4 py-3 text-sm break-all ${isFailed ? 'text-red-700 dark:text-red-300' : ''}">
+          <div class="font-medium">${escapeHtml(l.model)}</div>
+          ${l.notes ? `<div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 italic">📝 ${escapeHtml(l.notes)}</div>` : ''}
+        </td>
         <td class="px-4 py-3 text-sm">${statusBadge}</td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-slate-400 font-mono">${when}</td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-slate-400 font-mono">${l.requested_gpus}</td>

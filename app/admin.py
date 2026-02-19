@@ -56,6 +56,7 @@ def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Option
         id=l.id,
         model=l.model,
         owner=l.owner,
+        notes=l.notes,
         state=l.state,
         slurm_job_id=l.slurm_job_id,
         host=settings.public_hostname,
@@ -340,6 +341,7 @@ def create_lease(req: LeaseCreate):
             requested_tp=tp,
             requested_port=0,
             owner=req.owner,
+            notes=req.notes,
             begin_at=begin if planned else None,
             end_at=end,
             created_at=now_utc(),
@@ -382,6 +384,8 @@ def update_lease(lease_id: int, req: LeaseUpdate):
             lease.begin_at = req.begin_at
         if req.end_at is not None:
             lease.end_at = req.end_at
+        if req.notes is not None:
+            lease.notes = req.notes
 
         b = _lease_begin(lease)
         e = _lease_end(lease)
@@ -394,6 +398,20 @@ def update_lease(lease_id: int, req: LeaseUpdate):
         db.commit()
         db.refresh(lease)
         return _lease_to_out(lease)
+
+
+@router.patch("/leases/{lease_id}/notes")
+def update_lease_notes(lease_id: int, req: dict):
+    """Update notes on any active lease (not just PLANNED)."""
+    with SessionLocal() as db:
+        lease = db.get(Lease, lease_id)
+        if not lease:
+            raise HTTPException(status_code=404, detail="Booking not found")
+        if lease.state in ("CANCELED", "ENDED"):
+            raise HTTPException(status_code=409, detail="Cannot edit notes on a finished booking.")
+        lease.notes = req.get("notes", "")
+        db.commit()
+        return {"ok": True, "notes": lease.notes}
 
 @router.delete("/leases/{lease_id}")
 def cancel_lease(lease_id: int):

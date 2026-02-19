@@ -6,6 +6,7 @@ from typing import Optional, Any
 class LeaseCreate(BaseModel):
     model: str
     owner: Optional[str] = None
+    notes: Optional[str] = None
     begin_at: Optional[datetime] = None
     duration_seconds: int = Field(default=6*3600, ge=60)
     asap: bool = False  # NEW: find earliest available slot
@@ -22,11 +23,13 @@ class LeaseUpdate(BaseModel):
     end_at: Optional[datetime] = None
     requested_gpus: Optional[int] = Field(default=None, ge=1)
     requested_tp: Optional[int] = Field(default=None, ge=1)
+    notes: Optional[str] = None
 
 class LeaseOut(BaseModel):
     id: int
     model: str
     owner: Optional[str]
+    notes: Optional[str] = None
     state: str
     slurm_job_id: Optional[str]
     host: str

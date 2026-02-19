@@ -59,6 +59,9 @@ class Lease(Base):
 
     venv_activate: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # User-facing notes (who booked it, why, hints)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Retry tracking
     retry_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0"

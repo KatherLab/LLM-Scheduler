@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-
+import asyncio
 
 @dataclass
 class SlurmSubmitResult:
@@ -94,3 +94,22 @@ def squeue_job_state(job_id: str) -> str | None:
         return out.strip() or None
     except subprocess.CalledProcessError:
         return None
+
+async def async_squeue_job_state(job_id: str) -> str | None:
+    """Non-blocking version of squeue_job_state for async contexts."""
+    return await asyncio.to_thread(squeue_job_state, job_id)
+
+
+async def async_cancel(job_id: str) -> None:
+    """Non-blocking version of cancel for async contexts."""
+    await asyncio.to_thread(cancel, job_id)
+
+
+async def async_extend_time(job_id: str, new_time_limit: str) -> None:
+    """Non-blocking version of extend_time for async contexts."""
+    await asyncio.to_thread(extend_time, job_id, new_time_limit)
+
+
+async def async_submit_vllm_job(**kwargs) -> SlurmSubmitResult:
+    """Non-blocking version of submit_vllm_job for async contexts."""
+    return await asyncio.to_thread(lambda: submit_vllm_job(**kwargs))

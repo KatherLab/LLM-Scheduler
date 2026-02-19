@@ -62,7 +62,6 @@ async function api(path, opts = {}) {
 // ─── Global State ───────────────────────────────────────────────────────────
 let DASH = null;
 let MODEL_MAP = new Map();
-let EDITING_LEASE_ID = null;
 let REFRESH_INTERVAL = null;
 
 // Timeline geometry
@@ -284,10 +283,6 @@ function renderCatalog() {
     card.addEventListener('dragend', onCatalogDragEnd);
   });
 }
-
-window.openChat = (modelId) => {
-  window.open(`/v1/chat/ui?model=${encodeURIComponent(modelId)}`, '_blank');
-};
 
 window.openNewBookingForModel = (modelId) => {
   openModal({ model: modelId });
@@ -605,7 +600,6 @@ function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = 
 function closeModal() {
   modalBackdrop.classList.add('hidden');
   modalBackdrop.setAttribute('aria-hidden', 'true');
-  EDITING_LEASE_ID = null;
 }
 
 $('#modalClose').addEventListener('click', closeModal);
@@ -1427,14 +1421,6 @@ function resetDrag() {
   dragState._hasConflict = false;
   document.body.style.cursor = '';
   hideTimelineTooltip();
-}
-
-// Helper for catalog drag ghost conflict detection
-function snapDate(d) {
-  // Already defined above but needed for catalog drag context
-  const snapped = new Date(d);
-  snapped.setMinutes(Math.round(snapped.getMinutes() / SNAP_MINUTES) * SNAP_MINUTES, 0, 0);
-  return snapped;
 }
 
 // ─── Timeline Rendering ─────────────────────────────────────────────────────

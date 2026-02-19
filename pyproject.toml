@@ -14,10 +14,6 @@ dependencies = [
     "SQLAlchemy==2.0.46"
 ]
 
-# [build-system]
-# requires = ["hatchling"]
-# build-backend = "hatchling.build"
-
 [tool.uv]
 dev-dependencies = [
     "ruff>=0.15.1",

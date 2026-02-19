@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
+from .utils import ensure_utc
 
 @dataclass
 class Placement:
@@ -10,15 +11,8 @@ class Placement:
     lane_count: Optional[int]
     conflict: bool
 
-def _ensure_aware(dt: datetime) -> datetime:
-    if dt is None:
-        return datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
 def _t(dt: Optional[datetime], fallback: datetime) -> datetime:
-    dt = _ensure_aware(dt) if dt is not None else _ensure_aware(fallback)
+    dt = ensure_utc(dt) if dt is not None else ensure_utc(fallback)
     return dt
 
 def compute_placements(
@@ -28,14 +22,14 @@ def compute_placements(
     horizon_start: datetime,
     horizon_end: datetime,
 ) -> dict[int, Placement]:
-    horizon_start = _ensure_aware(horizon_start)
-    horizon_end = _ensure_aware(horizon_end)
+    horizon_start = ensure_utc(horizon_start)
+    horizon_end = ensure_utc(horizon_end)
 
     occ: list[list[tuple[datetime, datetime]]] = [[] for _ in range(total_gpus)]
     items = []
     for l in leases:
         begin = _t(l.begin_at, l.created_at)
-        end = _ensure_aware(l.end_at) if l.end_at else (begin + timedelta(hours=1))
+        end = ensure_utc(l.end_at) if l.end_at else (begin + timedelta(hours=1))
         if end <= horizon_start or begin >= horizon_end:
             continue
         items.append((begin, end, l))
@@ -92,8 +86,8 @@ def find_earliest_slot(
     Uses a sweep-line approach: builds a sorted list of GPU usage change events,
     then sweeps to find windows where enough GPUs are free.
     """
-    search_start = _ensure_aware(search_start)
-    search_end = _ensure_aware(search_end)
+    search_start = ensure_utc(search_start)
+    search_end = ensure_utc(search_end)
 
     if gpus_needed > total_gpus:
         return None
@@ -103,7 +97,7 @@ def find_earliest_slot(
     events: list[tuple[datetime, int]] = []
     for l in existing_leases:
         begin = _t(l.begin_at, l.created_at)
-        end = _ensure_aware(l.end_at) if l.end_at else (begin + timedelta(hours=1))
+        end = ensure_utc(l.end_at) if l.end_at else (begin + timedelta(hours=1))
         g = max(1, int(getattr(l, "requested_gpus", 1) or 1))
         # Only consider leases that overlap with our search window
         if end <= search_start or begin >= search_end + duration:

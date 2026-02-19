@@ -11,7 +11,6 @@ from sqlalchemy import select
 from typing import Optional
 
 from .settings import settings
-from .db import make_engine, make_session_factory
 from .models import Lease, Endpoint
 from .schemas import (
     LeaseCreate, LeaseOut, LeaseExtend, LeaseUpdate, LeaseShortenRequest,
@@ -22,6 +21,7 @@ from .catalog import get_catalog
 from .planner import compute_placements, find_earliest_slot
 from . import slurm
 from .dependencies import SessionLocal, init_db
+from .utils import ensure_utc
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_auth)])
 
@@ -36,19 +36,12 @@ def _time_limit_from_duration(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def _ensure_aware(dt: Optional[datetime]) -> datetime:
-    if dt is None:
-        return now_utc()
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
 def _lease_begin(l: Lease) -> datetime:
-    return _ensure_aware(l.begin_at) if l.begin_at is not None else _ensure_aware(l.created_at)
+    return ensure_utc(l.begin_at) if l.begin_at is not None else ensure_utc(l.created_at)
 
 def _lease_end(l: Lease) -> datetime:
     if l.end_at is not None:
-        return _ensure_aware(l.end_at)
+        return ensure_utc(l.end_at)
     return _lease_begin(l) + timedelta(hours=1)
 
 def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Optional[int] = None, conflict: bool = False) -> LeaseOut:
@@ -128,8 +121,8 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     """
     Submit a Slurm job using a plain-dict snapshot instead of an ORM object.
     """
-    begin = _ensure_aware(snapshot["begin_at"]) if snapshot["begin_at"] else _ensure_aware(snapshot["created_at"])
-    end = _ensure_aware(snapshot["end_at"])
+    begin = ensure_utc(snapshot["begin_at"]) if snapshot["begin_at"] else ensure_utc(snapshot["created_at"])
+    end = ensure_utc(snapshot["end_at"])
     seconds = int((end - begin).total_seconds())
     seconds = max(60, seconds)
     time_limit = _time_limit_from_duration(seconds)
@@ -230,13 +223,17 @@ def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: dateti
         return None
     ex_begin = _lease_begin(existing)
     ex_end = _lease_end(existing)
-    begin = _ensure_aware(begin)
-    end = _ensure_aware(end)
+    begin = ensure_utc(begin)
+    end = ensure_utc(end)
     touch = timedelta(minutes=5)
     overlaps_or_touches = not (end < ex_begin - touch or begin > ex_end + touch)
     if overlaps_or_touches:
         existing.end_at = max(ex_end, end)
-        existing.begin_at = min(ex_begin, begin) if existing.begin_at else None
+        # Don't move start backward for active leases — only extend end
+        if existing.state in ("RUNNING", "SUBMITTED", "STARTING"):
+            pass  # keep existing.begin_at as-is
+        elif existing.begin_at is not None:
+            existing.begin_at = min(ex_begin, begin)
         return existing
     return None
 
@@ -298,7 +295,7 @@ def dashboard():
         active_like = [
             l for l in leases
             if l.state in ("PLANNED", "SUBMITTED", "STARTING", "RUNNING")
-            or (l.state == "FAILED" and l.end_at and _ensure_aware(l.end_at) > now)
+            or (l.state == "FAILED" and l.end_at and ensure_utc(l.end_at) > now)
         ]
         placements = compute_placements(
             leases=active_like,
@@ -338,7 +335,7 @@ def dashboard():
         for e in eps:
             uptime = None
             if e.created_at:
-                uptime = (now - _ensure_aware(e.created_at)).total_seconds()
+                uptime = (now - ensure_utc(e.created_at)).total_seconds()
             stats.append(EndpointStats(
                 model=e.model,
                 host=e.host,
@@ -409,16 +406,19 @@ async def create_lease(req: LeaseCreate):
             end = begin + duration
 
     else:
-        begin = _ensure_aware(req.begin_at) if req.begin_at else now_utc()
+        begin = ensure_utc(req.begin_at) if req.begin_at else now_utc()
         end = begin + duration
 
+
+    snapshot = None
+    lease_id = None
+    out = None
 
     with SessionLocal() as db:
         merged = _merge_same_model_if_applicable(db, req, begin, end)
         if merged:
             _validate_no_conflicts(db, merged)
 
-            # If the lease already has a Slurm job running, extend its time limit
             if merged.slurm_job_id and merged.state in ("SUBMITTED", "STARTING", "RUNNING"):
                 total_seconds = int((_lease_end(merged) - _lease_begin(merged)).total_seconds())
                 total_seconds = max(60, total_seconds)
@@ -437,8 +437,8 @@ async def create_lease(req: LeaseCreate):
             db.refresh(merged)
             return _lease_to_out(merged)
 
-        begin = _ensure_aware(begin)
-        end = _ensure_aware(end)
+        begin = ensure_utc(begin)
+        end = ensure_utc(end)
         planned = (begin > now_utc() + timedelta(seconds=30))
 
         lease = Lease(
@@ -466,18 +466,38 @@ async def create_lease(req: LeaseCreate):
 
         _validate_no_conflicts(db, lease)
 
-        if lease.state == "SUBMITTED":
-            try:
-                job_id = await asyncio.to_thread(_submit_to_slurm, lease)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
-            lease.slurm_job_id = job_id
-
-
         db.add(lease)
         db.commit()
         db.refresh(lease)
-        return _lease_to_out(lease)
+
+        out = _lease_to_out(lease)
+        lease_id = lease.id
+
+        if lease.state == "SUBMITTED":
+            snapshot = _snapshot_lease(lease)
+
+    # ── Outside DB session: submit to Slurm if needed ──
+    if snapshot is not None:
+        try:
+            job_id = await asyncio.to_thread(_submit_to_slurm_from_snapshot, snapshot)
+        except Exception as e:
+            with SessionLocal() as db:
+                lease = db.get(Lease, lease_id)
+                if lease:
+                    lease.state = "FAILED"
+                    lease.failed_at = now_utc()
+                    db.commit()
+            raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
+
+        with SessionLocal() as db:
+            lease = db.get(Lease, lease_id)
+            if lease:
+                lease.slurm_job_id = job_id
+                db.commit()
+                db.refresh(lease)
+                out = _lease_to_out(lease)
+
+    return out
 
 @router.patch("/leases/{lease_id}", response_model=LeaseOut)
 def update_lease(lease_id: int, req: LeaseUpdate):
@@ -585,7 +605,7 @@ async def shorten_lease(lease_id: int, req: LeaseShortenRequest):
             raise HTTPException(status_code=409, detail="Can only shorten active bookings.")
 
         now = now_utc()
-        new_end = _ensure_aware(req.new_end_at)
+        new_end = ensure_utc(req.new_end_at)
         current_end = _lease_end(lease)
         b = _lease_begin(lease)
 

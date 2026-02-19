@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     slurm_account: str | None = Field(default=None, alias="SLURM_ACCOUNT")
     slurm_qos: str | None = Field(default=None, alias="SLURM_QOS")
     slurm_nodelist: str | None = Field(default=None, alias="SLURM_NODELIST")
-    slurm_cpus_per_task: int = Field(default=32, alias="SLURM_CPUS_PER_TASK")
+    slurm_cpus_per_task: int = Field(default=16, alias="SLURM_CPUS_PER_TASK")
 
     # Logs: default to repo-local logs for dev
     vllm_log_dir: str = Field(default="./logs", alias="VLLM_LOG_DIR")
@@ -39,9 +39,10 @@ class Settings(BaseSettings):
     on_demand_max_wait_seconds: int = Field(default=30, alias="ON_DEMAND_MAX_WAIT_SECONDS")
 
     # vLLM job behavior (fail fast + one retry)
-    vllm_health_timeout_seconds: int = Field(default=180, alias="VLLM_HEALTH_TIMEOUT_SECONDS")
-    vllm_max_retries: int = Field(default=2, alias="VLLM_MAX_RETRIES")
-    vllm_retry_delay_seconds: int = Field(default=60, alias="VLLM_RETRY_DELAY_SECONDS")
+    vllm_health_timeout_seconds: int = Field(default=800, alias="VLLM_HEALTH_TIMEOUT_SECONDS")
+    vllm_max_retries: int = Field(default=1, alias="VLLM_MAX_RETRIES")
+    vllm_retry_delay_seconds: int = Field(default=10, alias="VLLM_RETRY_DELAY_SECONDS")
+
 
 
 settings = Settings()

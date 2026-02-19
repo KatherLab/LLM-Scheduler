@@ -19,12 +19,11 @@ def _run(cmd: list[str], extra_env: dict[str, str] | None = None) -> str:
         cmd,
         check=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
         env=env,
     )
     return p.stdout.strip()
-
 
 
 def submit_vllm_job(
@@ -119,10 +118,17 @@ async def async_submit_vllm_job(**kwargs) -> SlurmSubmitResult:
     """Non-blocking version of submit_vllm_job for async contexts."""
     return await asyncio.to_thread(lambda: submit_vllm_job(**kwargs))
 
+class SlurmUnavailableError(Exception):
+    """Raised when the Slurm controller itself is unreachable."""
+    pass
+
 def squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
     """
     Query Slurm for multiple job states in a single squeue call.
     Returns a dict of {job_id: state_or_None}.
+
+    Raises SlurmUnavailableError if the Slurm controller is down,
+    so callers don't mistakenly treat all jobs as gone.
     """
     if not job_ids:
         return {}
@@ -137,11 +143,21 @@ def squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
                 jid, state = parts[0], parts[1]
                 if jid in result:
                     result[jid] = state
-    except subprocess.CalledProcessError:
-        # If the batch call fails (e.g., all jobs gone), individual results stay None
-        pass
+    except subprocess.CalledProcessError as e:
+        output = (e.stdout or "") + " " + (e.stderr or "")
+        # Slurm controller errors → don't assume jobs are gone
+        slurm_down_indicators = [
+            "slurm_load_jobs error",
+            "Unable to contact slurm controller",
+            "Socket timed out",
+            "Connection refused",
+            "slurmdbd:",
+        ]
+        if any(indicator in output for indicator in slurm_down_indicators):
+            raise SlurmUnavailableError(f"Slurm controller unavailable: {output.strip()}")
+        # Otherwise: the jobs are genuinely gone (e.g., "Invalid job id specified")
+        # result stays all-None, which is correct
     return result
-
 
 async def async_squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
     """Non-blocking version of squeue_job_states_batch."""

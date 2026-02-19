@@ -18,9 +18,9 @@ from .schemas import OpenAIModelsResponse
 from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
 from .proxy import proxy_json_or_stream
-from .admin import _submit_to_slurm  # internal helper
 from .admin import internal_router
 from . import slurm
+from .utils import ensure_utc
 
 # ── Supervised task wrapper ─────────────────────────────────────────────────
 async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
@@ -180,14 +180,6 @@ async def messages(request: Request):
         is_stream=is_stream,
     )
 
-def _ensure_aware_dt(dt: datetime) -> datetime:
-    if dt is None:
-        return datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 # =============================================================================
 # HEALTH WORKER — unified, adaptive polling
 #
@@ -225,7 +217,7 @@ async def health_worker():
                     # Adaptive polling: skip READY endpoints checked recently
                     if e.state == "READY" and e.last_health_at:
                         since_last = (
-                            now - _ensure_aware_dt(e.last_health_at)
+                            now - ensure_utc(e.last_health_at)
                         ).total_seconds()
                         if since_last < 12:
                             continue
@@ -304,7 +296,7 @@ async def health_worker():
                         elif ep.state == "STARTING":
                             age = (
                                 now
-                                - _ensure_aware_dt(check_info["created_at"])
+                                - ensure_utc(check_info["created_at"])
                             ).total_seconds()
                             if age > settings.vllm_health_timeout_seconds:
                                 ep.state = "FAILED"
@@ -382,11 +374,11 @@ async def planned_submit_worker():
                         continue
 
                     # Guard: skip leases whose end_at has already passed
-                    if l.end_at and _ensure_aware_dt(l.end_at) < now:
+                    if l.end_at and ensure_utc(l.end_at) < now:
                         to_expire.append(l.id)
                         continue
 
-                    if _ensure_aware_dt(l.begin_at) <= now + lead:
+                    if ensure_utc(l.begin_at) <= now + lead:
                         to_submit.append(_snapshot_lease(l))
 
                 # Mark expired leases immediately
@@ -466,7 +458,7 @@ async def endpoint_cleanup_worker():
                         )
                     ).scalars().first()
 
-                    if lease and lease.end_at and _ensure_aware_dt(lease.end_at) < now:
+                    if lease and lease.end_at and ensure_utc(lease.end_at) < now:
                         actions.append({
                             "endpoint_id": e.id,
                             "lease_id": lease.id,
@@ -558,7 +550,7 @@ async def slurm_reconcile_worker():
 
                 for l in active:
                     if l.state in ("FAILED", "RETRYING"):
-                        if l.end_at and _ensure_aware_dt(l.end_at) < now:
+                        if l.end_at and ensure_utc(l.end_at) < now:
                             failed_expiry.append({
                                 "id": l.id,
                                 "slurm_job_id": l.slurm_job_id,
@@ -578,11 +570,17 @@ async def slurm_reconcile_worker():
             # ── Phase 2: batch query Slurm (single subprocess call) ─────
             job_ids_to_check = [c["slurm_job_id"] for c in checks]
             if job_ids_to_check:
-                squeue_results = await slurm.async_squeue_job_states_batch(
-                    job_ids_to_check
-                )
+                try:
+                    squeue_results = await slurm.async_squeue_job_states_batch(
+                        job_ids_to_check
+                    )
+                except slurm.SlurmUnavailableError as e:
+                    print(f"slurm_reconcile: Slurm controller unavailable ({e}), skipping this cycle")
+                    await asyncio.sleep(5)
+                    continue
             else:
                 squeue_results = {}
+
 
             # ── Phase 3: apply state changes ────────────────────────────
             with SessionLocal() as db:
@@ -673,20 +671,20 @@ async def retry_worker():
                 ).scalars().all()
 
                 for lease in failed:
-                    if lease.end_at and _ensure_aware_dt(lease.end_at) < now:
+                    if lease.end_at and ensure_utc(lease.end_at) < now:
                         continue
                     if lease.retry_count >= settings.vllm_max_retries:
                         continue
                     if not lease.failed_at:
                         continue
                     since_fail = (
-                        now - _ensure_aware_dt(lease.failed_at)
+                        now - ensure_utc(lease.failed_at)
                     ).total_seconds()
                     if since_fail < settings.vllm_retry_delay_seconds:
                         continue
                     if lease.end_at:
                         remaining = (
-                            _ensure_aware_dt(lease.end_at) - now
+                            ensure_utc(lease.end_at) - now
                         ).total_seconds()
                         if remaining < 120:
                             print(
@@ -799,46 +797,54 @@ def reconcile_on_startup():
         ]
 
         # Single batched squeue call
-        job_states = slurm.squeue_job_states_batch(lease_job_ids) if lease_job_ids else {}
+        try:
+            job_states = slurm.squeue_job_states_batch(lease_job_ids) if lease_job_ids else {}
+        except slurm.SlurmUnavailableError as e:
+            print(f"  reconcile: Slurm controller unavailable ({e}), skipping lease reconciliation")
+            job_states = None
 
-        for lease in active_leases:
-            if not lease.slurm_job_id:
-                continue
+        if job_states is None:
+            # Skip lease reconciliation but still handle PLANNED expiry below
+            pass
+        else:
+            for lease in active_leases:
+                if not lease.slurm_job_id:
+                    continue
 
-            state = job_states.get(lease.slurm_job_id)
+                state = job_states.get(lease.slurm_job_id)
 
-            if state is None:
-                # Job is gone from Slurm
-                ep = db.execute(
-                    select(Endpoint).where(
-                        Endpoint.slurm_job_id == lease.slurm_job_id
-                    )
-                ).scalars().first()
+                if state is None:
+                    # Job is gone from Slurm
+                    ep = db.execute(
+                        select(Endpoint).where(
+                            Endpoint.slurm_job_id == lease.slurm_job_id
+                        )
+                    ).scalars().first()
 
-                if ep and ep.state == "READY":
-                    # Was running fine, job ended (time limit, etc.)
-                    lease.state = "ENDED"
-                    ep.state = "STOPPED"
-                    print(
-                        f"  reconcile: lease {lease.id} ({lease.model}) "
-                        f"→ ENDED (job {lease.slurm_job_id} gone, was READY)"
-                    )
+                    if ep and ep.state == "READY":
+                        # Was running fine, job ended (time limit, etc.)
+                        lease.state = "ENDED"
+                        ep.state = "STOPPED"
+                        print(
+                            f"  reconcile: lease {lease.id} ({lease.model}) "
+                            f"→ ENDED (job {lease.slurm_job_id} gone, was READY)"
+                        )
+                    else:
+                        # Never became READY or was in STARTING
+                        lease.state = "FAILED"
+                        lease.failed_at = now
+                        if ep:
+                            ep.state = "FAILED"
+                        print(
+                            f"  reconcile: lease {lease.id} ({lease.model}) "
+                            f"→ FAILED (job {lease.slurm_job_id} gone from squeue)"
+                        )
+                    changes += 1
                 else:
-                    # Never became READY or was in STARTING
-                    lease.state = "FAILED"
-                    lease.failed_at = now
-                    if ep:
-                        ep.state = "FAILED"
                     print(
                         f"  reconcile: lease {lease.id} ({lease.model}) "
-                        f"→ FAILED (job {lease.slurm_job_id} gone from squeue)"
+                        f"— Slurm job {lease.slurm_job_id} still {state}"
                     )
-                changes += 1
-            else:
-                print(
-                    f"  reconcile: lease {lease.id} ({lease.model}) "
-                    f"— Slurm job {lease.slurm_job_id} still {state}"
-                )
 
         # 2. PLANNED leases whose end_at has passed
         planned = db.execute(
@@ -846,7 +852,7 @@ def reconcile_on_startup():
         ).scalars().all()
 
         for lease in planned:
-            if lease.end_at and _ensure_aware_dt(lease.end_at) < now:
+            if lease.end_at and ensure_utc(lease.end_at) < now:
                 lease.state = "ENDED"
                 print(
                     f"  reconcile: planned lease {lease.id} ({lease.model}) "
@@ -891,17 +897,21 @@ def reconcile_on_startup():
                 orphan_eps.append(ep)
 
         # Batch check orphan endpoints
-        orphan_states = slurm.squeue_job_states_batch(orphan_job_ids) if orphan_job_ids else {}
+        try:
+            orphan_states = slurm.squeue_job_states_batch(orphan_job_ids) if orphan_job_ids else {}
+        except slurm.SlurmUnavailableError:
+            orphan_states = None
 
-        for ep in orphan_eps:
-            state = orphan_states.get(ep.slurm_job_id)
-            if state is None:
-                ep.state = "STOPPED"
-                print(
-                    f"  reconcile: orphan endpoint {ep.model} "
-                    f"(job {ep.slurm_job_id}) → STOPPED"
-                )
-                changes += 1
+        if orphan_states is not None:
+            for ep in orphan_eps:
+                state = orphan_states.get(ep.slurm_job_id)
+                if state is None:
+                    ep.state = "STOPPED"
+                    print(
+                        f"  reconcile: orphan endpoint {ep.model} "
+                        f"(job {ep.slurm_job_id}) → STOPPED"
+                    )
+                    changes += 1
 
         db.commit()
 

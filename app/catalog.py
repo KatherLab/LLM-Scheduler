@@ -1,7 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 import yaml
+
 
 @dataclass(frozen=True)
 class CatalogModel:
@@ -15,6 +17,7 @@ class CatalogModel:
     reasoning_parser: str | None = None
     venv_activate: str | None = None
     notes: str = ""
+
 
 def load_catalog(path: str) -> dict[str, CatalogModel]:
     p = Path(path)
@@ -35,3 +38,39 @@ def load_catalog(path: str) -> dict[str, CatalogModel]:
         )
         out[m.name] = m
     return out
+
+
+# ---------------------------------------------------------------------------
+# Auto-reloading catalog: re-reads models.yaml only when the file changes
+# ---------------------------------------------------------------------------
+_catalog_cache: dict[str, CatalogModel] | None = None
+_catalog_mtime: float = 0.0
+_catalog_lock = Lock()
+_CATALOG_PATH = "config/models.yaml"
+
+
+def get_catalog(path: str = _CATALOG_PATH) -> dict[str, CatalogModel]:
+    """Return the catalog, reloading from disk if the file's mtime has changed."""
+    global _catalog_cache, _catalog_mtime
+
+    p = Path(path)
+    try:
+        current_mtime = p.stat().st_mtime
+    except OSError:
+        if _catalog_cache is not None:
+            return _catalog_cache
+        raise
+
+    # Fast path: no change
+    if _catalog_cache is not None and current_mtime <= _catalog_mtime:
+        return _catalog_cache
+
+    with _catalog_lock:
+        # Double-check after acquiring lock
+        if _catalog_cache is not None and current_mtime <= _catalog_mtime:
+            return _catalog_cache
+
+        _catalog_cache = load_catalog(path)
+        _catalog_mtime = current_mtime
+        print(f"catalog: reloaded {len(_catalog_cache)} models from {path}")
+        return _catalog_cache

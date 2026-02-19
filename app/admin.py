@@ -16,14 +16,12 @@ from .schemas import (
     EndpointRegister, EndpointOut, DashboardResponse, DashboardModel,
     EndpointStats, LogResponse,
 )
-from .catalog import load_catalog
+from .catalog import get_catalog
 from .planner import compute_placements, find_earliest_slot
 from . import slurm
 from .dependencies import SessionLocal, init_db
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-
-CATALOG = load_catalog("config/models.yaml")
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -231,8 +229,9 @@ def dashboard():
                 conflict=p.conflict if p else False,
             ))
 
+        catalog = get_catalog()
         models: list[DashboardModel] = []
-        for name, m in CATALOG.items():
+        for name, m in catalog.items():
             models.append(DashboardModel(
                 id=name,
                 ready=(name in ready),
@@ -288,10 +287,11 @@ def list_endpoints():
 
 @router.post("/leases", response_model=LeaseOut)
 def create_lease(req: LeaseCreate):
-    if req.model not in CATALOG:
+    catalog = get_catalog()
+    if req.model not in catalog:
         raise HTTPException(status_code=404, detail=f"Unknown model '{req.model}'")
 
-    cat = CATALOG[req.model]
+    cat = catalog[req.model]
     gpus = cat.gpus
     tp = cat.tensor_parallel_size
 

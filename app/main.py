@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from .settings import settings
 from .dependencies import SessionLocal, init_db  # <-- shared engine
 from .models import Endpoint, Lease
-from .catalog import load_catalog
+from .catalog import get_catalog
 from .schemas import OpenAIModelsResponse
 from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
@@ -23,8 +23,6 @@ app.include_router(admin_router)
 
 # Initialize DB tables (uses shared engine from dependencies.py)
 init_db()
-
-CATALOG = load_catalog("config/models.yaml")
 
 app.mount("/ui", StaticFiles(directory="app/ui", html=True), name="ui")
 
@@ -41,10 +39,11 @@ def health():
 
 @app.get("/v1/models", response_model=OpenAIModelsResponse)
 def v1_models():
+    catalog = get_catalog()
     with SessionLocal() as db:
         ready = set(db.execute(select(Endpoint.model).where(Endpoint.state == "READY")).scalars().all())
     data = []
-    for name, m in CATALOG.items():
+    for name, m in catalog.items():
         data.append({
             "id": name,
             "object": "model",

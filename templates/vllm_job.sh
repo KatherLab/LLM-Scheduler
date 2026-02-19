@@ -12,11 +12,23 @@ fi
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')"
 echo "Assigned Port: ${PORT}"
 
-# Register with router (state=STARTING, router polls /health)
-curl -fsS -X POST "${ROUTER_REGISTER_URL}" \
-  -H "Content-Type: application/json" \
-  -d "{\"slurm_job_id\":\"${SLURM_JOB_ID}\",\"model\":\"${SERVED_MODEL_NAME}\",\"host\":\"${SLURMD_NODENAME}\",\"port\":${PORT}}" \
-  || echo "Warning: failed to register endpoint"
+# Register with router (retry for up to 60s in case router is restarting)
+REGISTERED=0
+for i in $(seq 1 12); do
+  if curl -fsS -X POST "${ROUTER_REGISTER_URL}" \
+    -H "Content-Type: application/json" \
+    -d "{\"slurm_job_id\":\"${SLURM_JOB_ID}\",\"model\":\"${SERVED_MODEL_NAME}\",\"host\":\"${SLURMD_NODENAME}\",\"port\":${PORT}}"; then
+    REGISTERED=1
+    echo "Registered with router on attempt ${i}"
+    break
+  fi
+  echo "Registration attempt ${i} failed, retrying in 5s..."
+  sleep 5
+done
+
+if [ "${REGISTERED}" -eq 0 ]; then
+  echo "Warning: failed to register endpoint after 12 attempts — continuing anyway"
+fi
 
 # Start vLLM — job lifetime == vLLM lifetime
 exec vllm serve "${MODEL_PATH}" \

@@ -97,6 +97,45 @@
       border-color: rgba(14, 165, 233, 0.9);
       background: rgba(14, 165, 233, 0.15);
     }
+
+        /* Scroll-wheel zoom indicator */
+    #zoomIndicator {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 30;
+      padding: 6px 14px;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.85);
+      color: #e2e8f0;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 500;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(-4px);
+      transition: opacity 0.2s, transform 0.2s;
+      border: 1px solid rgba(51, 65, 85, 0.5);
+      backdrop-filter: blur(8px);
+    }
+    #zoomIndicator.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* Minimap drag */
+    #minimapViewport.dragging {
+      cursor: grabbing !important;
+      border-color: rgba(14, 165, 233, 1) !important;
+      background: rgba(14, 165, 233, 0.25) !important;
+    }
+    #minimapViewport:hover {
+      border-color: rgba(14, 165, 233, 0.9);
+      background: rgba(14, 165, 233, 0.15);
+    }
+
+    /* Semantic zoom transitions */
+    .block-hover-target { transition: fill 0.1s; }
   </style>
 </head>
 
@@ -129,24 +168,42 @@
           <svg id="iconMoon" class="hidden w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
         </button>
 
-        <div class="hidden md:flex items-center gap-2 text-sm">
-          <label class="text-slate-500 dark:text-slate-400">View</label>
-          <select id="windowSelect" class="bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-700 text-sm rounded-md px-2 py-1">
-            <option value="6">6h</option>
-            <option value="12">12h</option>
-            <option value="24" selected>24h</option>
-            <option value="48">48h</option>
-            <option value="72">3 days</option>
-            <option value="120">5 days</option>
-            <option value="168">7 days</option>
-            <option value="336">14 days</option>
-          </select>
-          <select id="zoomSelect" class="bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-700 text-sm rounded-md px-2 py-1">
-            <option value="60">Compact</option>
-            <option value="90" selected>Normal</option>
-            <option value="130">Large</option>
-            <option value="fit">Fit to view</option>
-          </select>
+                <div class="hidden md:flex items-center gap-2 text-sm">
+          <!-- Zoom indicator badge (click to open settings popover) -->
+          <div id="zoomBadgeContainer" class="relative">
+            <button id="zoomBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-gray-300 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition text-xs font-medium text-slate-600 dark:text-slate-300" title="Zoom settings">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7"/></svg>
+              <span id="zoomBadgeText">24h visible</span>
+            </button>
+            <!-- Settings popover (hidden by default) -->
+            <div id="zoomSettingsPopover" class="hidden absolute right-0 top-full mt-2 z-50 bg-white dark:bg-slate-900 rounded-xl border border-gray-200 dark:border-slate-700 shadow-2xl w-72 popover-enter">
+              <div class="p-4 space-y-4">
+                <div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">View Settings</div>
+                <div>
+                  <label class="text-xs text-slate-500 dark:text-slate-400 mb-1 block">View window</label>
+                  <select id="windowSelect" class="w-full bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-700 text-sm rounded-md px-2 py-1.5">
+                    <option value="6">6 hours</option>
+                    <option value="12">12 hours</option>
+                    <option value="24" selected>24 hours</option>
+                    <option value="48">2 days</option>
+                    <option value="72">3 days</option>
+                    <option value="120">5 days</option>
+                    <option value="168">7 days</option>
+                    <option value="336">14 days</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="text-xs text-slate-500 dark:text-slate-400 mb-1 block">Zoom / scale</label>
+                  <select id="zoomSelect" class="w-full bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-700 text-sm rounded-md px-2 py-1.5">
+                    <option value="60">Compact</option>
+                    <option value="90" selected>Normal</option>
+                    <option value="130">Large</option>
+                    <option value="fit">Fit to view</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <button id="refreshBtn" class="px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-md hover:bg-brand-500 transition flex items-center gap-2">
@@ -207,14 +264,15 @@
           </div>
 
           <!-- Minimap -->
-          <div id="minimapContainer" class="hidden border-t border-gray-200 dark:border-slate-700 relative cursor-pointer" style="height: 40px; overflow: hidden;">
-            <svg id="minimapSvg" class="block w-full" style="height: 40px;"></svg>
-            <div id="minimapViewport" class="absolute top-0 bottom-0 border-2 border-brand-500/60 bg-brand-500/10 rounded-sm pointer-events-none" style="min-width: 4px;"></div>
+          <div id="minimapContainer" class="hidden border-t border-gray-200 dark:border-slate-700 relative cursor-pointer" style="height: 44px; overflow: hidden;">
+            <svg id="minimapSvg" class="block w-full" style="height: 44px;"></svg>
+            <div id="minimapViewport" class="absolute top-0 bottom-0 border-2 border-brand-500/60 bg-brand-500/10 rounded-sm transition-colors duration-100" style="min-width: 8px; cursor: grab;"></div>
           </div>
 
           <div id="timelineContainer" class="timeline-scroll overflow-x-auto overflow-y-hidden border-t border-gray-200 dark:border-slate-700 relative">
             <svg id="timelineSvg" class="block no-select"></svg>
             <div id="timelineTooltip" class="hidden absolute pointer-events-none z-30 px-3 py-2 rounded-lg text-xs font-mono bg-slate-800 text-slate-100 border border-slate-600 shadow-lg whitespace-nowrap"></div>
+            <div id="zoomIndicator"></div>
             <!-- Drop zone overlay (shown during catalog drag) -->
             <div id="dropZoneOverlay" class="hidden absolute inset-0 z-20 border-2 border-dashed border-brand-500/50 bg-brand-500/5 rounded-lg flex items-center justify-center pointer-events-none">
               <span class="text-brand-400 font-semibold text-lg">Drop to schedule here</span>

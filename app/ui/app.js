@@ -78,13 +78,45 @@ let TL = {
   height: 0,
 };
 
+// ─── Zoom State ─────────────────────────────────────────────────────────────
+let zoomState = {
+  // Current continuous pxPerHour (the "truth" for zoom level)
+  pxPerHour: 90,
+  // Current window hours
+  hours: 24,
+  // For the zoom indicator fade
+  indicatorTimeout: null,
+  // Semantic zoom level: 'detail' | 'day' | 'week'
+  semanticLevel: 'detail',
+};
+
+// Zoom presets: natural breakpoints that scroll-wheel snaps through
+const ZOOM_PRESETS = [
+  { hours: 336, pxPerHour: 4, label: '14 days' },
+  { hours: 168, pxPerHour: 8, label: '7 days' },
+  { hours: 120, pxPerHour: 12, label: '5 days' },
+  { hours: 72, pxPerHour: 20, label: '3 days' },
+  { hours: 48, pxPerHour: 30, label: '2 days' },
+  { hours: 24, pxPerHour: 60, label: '24 hours' },
+  { hours: 24, pxPerHour: 90, label: '24h normal' },
+  { hours: 12, pxPerHour: 130, label: '12h large' },
+  { hours: 6, pxPerHour: 200, label: '6h detail' },
+];
+
+function getSemanticLevel(hours) {
+  if (hours <= 24) return 'detail';
+  if (hours <= 72) return 'day';
+  return 'week';
+}
+
+
 // ─── Utilities ──────────────────────────────────────────────────────────────
 function parseDT(s) { return s ? new Date(s) : null; }
 function fmtTime(d) { return d.toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
 function fmtHour(d) { return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function escapeHtml(s) {
-  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+  return String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 }
 function snapTo15Min(date) {
   const d = new Date(date);
@@ -93,7 +125,7 @@ function snapTo15Min(date) {
 }
 function toLocalDTInput(date) {
   const pad = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 function formatDuration(seconds) {
   const h = Math.floor(seconds / 3600);
@@ -395,7 +427,7 @@ function onCatalogDragEnd(e) {
     }
   });
 
-    container.addEventListener('drop', (e) => {
+  container.addEventListener('drop', (e) => {
     e.preventDefault();
     const old = document.querySelector('.catalog-drop-ghost');
     if (old) old.remove();
@@ -1133,7 +1165,7 @@ function startDrag(e, type, lease, pt) {
 
   document.body.style.cursor =
     type === 'create' ? 'crosshair' :
-    type.startsWith('resize') ? 'ew-resize' : 'grabbing';
+      type.startsWith('resize') ? 'ew-resize' : 'grabbing';
 }
 
 function onPointerMove(e) {
@@ -1451,29 +1483,244 @@ function fmtDayHeader(d) {
   return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
+// ─── Zoom Helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Sync the hidden dropdown values to match the current zoomState.
+ * This keeps the fallback settings popover in sync when scroll-wheel zoom changes values.
+ */
+function syncDropdownsToZoomState() {
+  const windowSelect = $('#windowSelect');
+  const zoomSelect = $('#zoomSelect');
+
+  // Find closest window option
+  const windowOptions = [...windowSelect.options].map(o => parseInt(o.value, 10));
+  const closestWindow = windowOptions.reduce((prev, curr) =>
+    Math.abs(curr - zoomState.hours) < Math.abs(prev - zoomState.hours) ? curr : prev
+  );
+  windowSelect.value = String(closestWindow);
+
+  // Find closest zoom option
+  const zoomOptions = [...zoomSelect.options]
+    .filter(o => o.value !== 'fit')
+    .map(o => parseInt(o.value, 10));
+  const closestZoom = zoomOptions.reduce((prev, curr) =>
+    Math.abs(curr - zoomState.pxPerHour) < Math.abs(prev - zoomState.pxPerHour) ? curr : prev
+  );
+  zoomSelect.value = String(closestZoom);
+}
+
+/**
+ * Update the zoom badge text in the header.
+ */
+function updateZoomBadge() {
+  const badge = $('#zoomBadgeText');
+  if (!badge) return;
+
+  const hours = zoomState.hours;
+  let label;
+  if (hours < 24) {
+    label = `${hours}h visible`;
+  } else if (hours < 48) {
+    label = `${Math.round(hours / 24 * 10) / 10} day visible`;
+  } else {
+    label = `${Math.round(hours / 24)} days visible`;
+  }
+
+  badge.textContent = label;
+}
+
+/**
+ * Show a temporary zoom indicator overlay on the timeline.
+ */
+function showZoomIndicator(text) {
+  const indicator = $('#zoomIndicator');
+  if (!indicator) return;
+
+  indicator.textContent = text;
+  indicator.classList.add('visible');
+
+  if (zoomState.indicatorTimeout) {
+    clearTimeout(zoomState.indicatorTimeout);
+  }
+  zoomState.indicatorTimeout = setTimeout(() => {
+    indicator.classList.remove('visible');
+  }, 1200);
+}
+
+/**
+ * Apply a zoom preset (or interpolated values) and re-render.
+ */
+function applyZoom(hours, pxPerHour, preserveScrollCenter = true) {
+  const container = $('#timelineContainer');
+
+  // Remember what time is at the center of the viewport before zoom
+  let centerTime = null;
+  if (preserveScrollCenter && TL.start) {
+    const centerX = container.scrollLeft + container.clientWidth / 2;
+    centerTime = xToDate(centerX);
+  }
+
+  zoomState.hours = hours;
+  zoomState.pxPerHour = pxPerHour;
+
+  renderTimeline();
+
+  // Restore the center time after re-render
+  if (centerTime && TL.start) {
+    const newCenterX = dateToX(centerTime);
+    container.scrollLeft = newCenterX - container.clientWidth / 2;
+  }
+}
+
+// ─── Scroll-Wheel Zoom on Timeline ─────────────────────────────────────────
+(function setupScrollWheelZoom() {
+  const container = $('#timelineContainer');
+
+  container.addEventListener('wheel', (e) => {
+    // Only zoom on Ctrl+wheel or pinch (ctrlKey is true for trackpad pinch)
+    if (!e.ctrlKey && !e.metaKey) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Determine zoom direction
+    const zoomIn = e.deltaY < 0;
+
+    // Find current position in the preset list
+    // We'll interpolate between presets for smooth zooming
+    const currentHours = zoomState.hours;
+    const currentPxPerHour = zoomState.pxPerHour;
+
+    // Sort presets by hours descending (zoomed out → zoomed in)
+    const sorted = [...ZOOM_PRESETS].sort((a, b) => b.hours - a.hours);
+
+    // Find which two presets we're between
+    let presetIdx = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      if (currentHours >= sorted[i].hours) {
+        presetIdx = i;
+        break;
+      }
+    }
+
+    // Determine the step size (how fast we zoom)
+    const ZOOM_SPEED = 0.15; // 15% per scroll tick
+
+    let newHours, newPxPerHour;
+
+    if (zoomIn) {
+      // Zoom in: decrease hours, increase pxPerHour
+      newHours = Math.max(6, currentHours * (1 - ZOOM_SPEED));
+      newPxPerHour = Math.min(200, currentPxPerHour * (1 + ZOOM_SPEED));
+
+      // Snap to nearest preset if close
+      const nearestPreset = sorted.find(p => p.hours <= newHours);
+      if (nearestPreset && Math.abs(newHours - nearestPreset.hours) / nearestPreset.hours < 0.08) {
+        newHours = nearestPreset.hours;
+        newPxPerHour = nearestPreset.pxPerHour;
+      }
+    } else {
+      // Zoom out: increase hours, decrease pxPerHour
+      newHours = Math.min(336, currentHours * (1 + ZOOM_SPEED));
+      newPxPerHour = Math.max(4, currentPxPerHour * (1 - ZOOM_SPEED));
+
+      // Snap to nearest preset if close
+      const nearestPreset = [...sorted].reverse().find(p => p.hours >= newHours);
+      if (nearestPreset && Math.abs(newHours - nearestPreset.hours) / nearestPreset.hours < 0.08) {
+        newHours = nearestPreset.hours;
+        newPxPerHour = nearestPreset.pxPerHour;
+      }
+    }
+
+    // Round hours to a nice number
+    newHours = Math.round(newHours);
+
+    // Show zoom indicator
+    let label;
+    if (newHours < 24) {
+      label = `${newHours}h`;
+    } else if (newHours < 48) {
+      label = `~1 day`;
+    } else {
+      label = `~${Math.round(newHours / 24)} days`;
+    }
+    showZoomIndicator(`🔍 ${label} · ${Math.round(newPxPerHour)}px/h`);
+
+    applyZoom(newHours, newPxPerHour, true);
+
+  }, { passive: false });
+})();
+
+// ─── Zoom Badge Popover ─────────────────────────────────────────────────────
+(function setupZoomBadgePopover() {
+  const badge = $('#zoomBadge');
+  const popover = $('#zoomSettingsPopover');
+  if (!badge || !popover) return;
+
+  badge.addEventListener('click', (e) => {
+    e.stopPropagation();
+    popover.classList.toggle('hidden');
+  });
+
+  // Close popover when clicking outside
+  document.addEventListener('click', (e) => {
+    if (!popover.contains(e.target) && e.target !== badge) {
+      popover.classList.add('hidden');
+    }
+  });
+
+  // When dropdowns change inside the popover, update zoomState and re-render
+  $('#windowSelect').addEventListener('change', () => {
+    const hours = parseInt($('#windowSelect').value, 10);
+    const zoomVal = $('#zoomSelect').value;
+    let pxPerHour;
+    if (zoomVal === 'fit') {
+      const container = $('#timelineContainer');
+      const containerWidth = container.clientWidth || 1200;
+      pxPerHour = Math.max(4, (containerWidth - TL.leftPad - 20) / hours);
+    } else {
+      pxPerHour = parseInt(zoomVal, 10);
+    }
+    zoomState.hours = hours;
+    zoomState.pxPerHour = pxPerHour;
+    if (DASH) renderTimeline();
+  });
+
+  $('#zoomSelect').addEventListener('change', () => {
+    const hours = zoomState.hours;
+    const zoomVal = $('#zoomSelect').value;
+    let pxPerHour;
+    if (zoomVal === 'fit') {
+      const container = $('#timelineContainer');
+      const containerWidth = container.clientWidth || 1200;
+      pxPerHour = Math.max(4, (containerWidth - TL.leftPad - 20) / hours);
+    } else {
+      pxPerHour = parseInt(zoomVal, 10);
+    }
+    zoomState.pxPerHour = pxPerHour;
+    if (DASH) renderTimeline();
+  });
+})();
+
+
 function renderTimeline() {
   const svg = $('#timelineSvg');
-  const hours = parseInt($('#windowSelect').value, 10);
-  const zoomVal = $('#zoomSelect').value;
   const gpuTotal = DASH?.total_gpus || 8;
 
   const container = $('#timelineContainer');
   const containerWidth = container.clientWidth || 1200;
 
-  // Compute pxPerHour
-  let pxPerHour;
-  if (zoomVal === 'fit') {
-    // Fit entire window into the visible container width
-    pxPerHour = Math.max(4, (containerWidth - TL.leftPad - 20) / hours);
-  } else {
-    pxPerHour = parseInt(zoomVal, 10);
-  }
+  // Use zoom state as the source of truth
+  const hours = zoomState.hours;
+  const pxPerHour = zoomState.pxPerHour;
 
-  // For very long windows with fixed zoom, clamp minimum pxPerHour
-  // so the SVG doesn't become absurdly wide (optional safety)
-  // pxPerHour = Math.max(4, pxPerHour);
+  // Sync dropdown values to match current zoom state (for the settings popover)
+  syncDropdownsToZoomState();
 
   const { gridStepHours, labelStepHours, showDayHeader } = getTimeAxisParams(hours);
+  const semanticLevel = getSemanticLevel(hours);
+  zoomState.semanticLevel = semanticLevel;
 
   TL.hours = hours;
   TL.pxPerHour = pxPerHour;
@@ -1518,17 +1765,14 @@ function renderTimeline() {
 
   // ── Day header row (if multi-day) ──
   if (showDayHeader) {
-    // Draw day separator lines and labels
     const startDay = new Date(TL.start);
     startDay.setHours(0, 0, 0, 0);
 
-    // Find the first midnight at or after TL.start
     let firstMidnight = new Date(startDay);
     if (firstMidnight < TL.start) {
       firstMidnight.setDate(firstMidnight.getDate() + 1);
     }
 
-    // Draw a label for the starting partial day
     const startDayLabel = fmtDayHeader(TL.start);
     const startLabelX = TL.leftPad + 6;
     drawText(svg, startLabelX, 15, startDayLabel, {
@@ -1538,19 +1782,16 @@ function renderTimeline() {
       'font-family': 'ui-sans-serif, system-ui, -apple-system, sans-serif',
     });
 
-    // Draw day separators and labels for each midnight
     for (let d = new Date(firstMidnight); d < TL.end; d.setDate(d.getDate() + 1)) {
       const x = dateToX(d);
       if (x <= TL.leftPad) continue;
 
-      // Prominent day separator line (full height)
       drawLine(svg, x, 0, x, TL.height, {
         stroke: dark ? '#475569' : '#64748b',
         'stroke-opacity': 0.5,
         'stroke-width': 1.5,
       });
 
-      // Day label
       const label = fmtDayHeader(d);
       drawText(svg, x + 6, 15, label, {
         fill: dark ? '#e2e8f0' : '#1e293b',
@@ -1560,7 +1801,6 @@ function renderTimeline() {
       });
     }
 
-    // Day header bottom border
     drawLine(svg, 0, dayHeaderH, TL.width, dayHeaderH, {
       stroke: dark ? '#334155' : '#94a3b8',
       'stroke-opacity': 0.3,
@@ -1572,20 +1812,16 @@ function renderTimeline() {
     const x = TL.leftPad + h * pxPerHour;
     const t = new Date(TL.start.getTime() + h * 3600000);
 
-    // Grid line
     const isMidnight = t.getHours() === 0 && t.getMinutes() === 0;
     if (!isMidnight || !showDayHeader) {
-      // Don't double-draw midnight lines if day header already drew them
       drawLine(svg, x, dayHeaderH, x, TL.height, {
         stroke: dark ? '#334155' : '#94a3b8',
         'stroke-opacity': showDayHeader ? 0.12 : 0.2,
       });
     }
 
-    // Hour label (only at labelStep intervals)
     if (h % labelStepHours === 0 || !showDayHeader) {
       const hourLabel = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
-      // For multi-day views, skip the "00:00" label since the day header covers it
       const skipLabel = showDayHeader && isMidnight;
       if (!skipLabel) {
         drawText(svg, x + 4, dayHeaderH + 18, hourLabel, {
@@ -1597,7 +1833,7 @@ function renderTimeline() {
     }
   }
 
-  // Sub-grid lines (half-step) — only for shorter windows
+  // Sub-grid lines — only for shorter windows
   if (hours <= 48) {
     for (let h = 0; h < hours; h += gridStepHours) {
       const x = TL.leftPad + (h + gridStepHours / 2) * pxPerHour;
@@ -1647,7 +1883,7 @@ function renderTimeline() {
     'stroke-width': 2,
     class: 'now-line-pulse',
   });
-  drawText(svg, nowX + 4, dayHeaderH > 0 ? dayHeaderH + 11 : 12, 'now', {
+  drawText(svg, nowX + 4, (showDayHeader ? dayHeaderH + 11 : 12), 'now', {
     fill: '#0ea5e9',
     'font-size': 10,
     'font-weight': 'bold',
@@ -1660,15 +1896,25 @@ function renderTimeline() {
     container.scrollLeft = scrollTarget;
   }
 
+  // ── Update zoom badge ──
+  updateZoomBadge();
+
   // ── Render minimap ──
   renderMinimap(leases);
 }
 
 // ─── Minimap ────────────────────────────────────────────────────────────────
+
+// Minimap drag state
+const minimapDrag = {
+  active: false,
+  startX: 0,
+  startScrollLeft: 0,
+};
+
 function renderMinimap(leases) {
   const minimapContainer = $('#minimapContainer');
   const minimapSvg = $('#minimapSvg');
-  const minimapViewport = $('#minimapViewport');
 
   // Only show minimap when the timeline is wider than the container
   const container = $('#timelineContainer');
@@ -1682,8 +1928,10 @@ function renderMinimap(leases) {
   minimapContainer.classList.remove('hidden');
 
   const mmWidth = containerWidth;
-  const mmHeight = 40;
-  const mmPxPerHour = (mmWidth - TL.leftPad) / TL.hours;
+  const mmHeight = 44;
+  // The data area of the minimap starts after leftPad
+  const mmDataWidth = mmWidth - TL.leftPad;
+  const mmPxPerHour = mmDataWidth / TL.hours;
 
   minimapSvg.setAttribute('width', mmWidth);
   minimapSvg.setAttribute('height', mmHeight);
@@ -1717,6 +1965,15 @@ function renderMinimap(leases) {
         stroke: dark ? '#475569' : '#94a3b8',
         'stroke-opacity': 0.4,
       });
+      // Day label in minimap
+      if (mmPxPerHour * 24 > 40) {
+        const dayLabel = d.toLocaleDateString([], { weekday: 'short', day: 'numeric' });
+        drawText(minimapSvg, x + 3, 10, dayLabel, {
+          fill: dark ? '#64748b' : '#94a3b8',
+          'font-size': 7,
+          'font-family': 'ui-sans-serif, system-ui, sans-serif',
+        });
+      }
     }
   }
 
@@ -1769,17 +2026,6 @@ function renderMinimap(leases) {
 
   // Update viewport indicator
   updateMinimapViewport();
-
-  // Remove old listeners and add new ones
-  minimapContainer._clickHandler && minimapContainer.removeEventListener('click', minimapContainer._clickHandler);
-  minimapContainer._clickHandler = (e) => {
-    const rect = minimapContainer.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const fraction = (clickX - TL.leftPad) / (mmWidth - TL.leftPad);
-    const scrollX = fraction * TL.width - containerWidth / 2;
-    container.scrollLeft = Math.max(0, scrollX);
-  };
-  minimapContainer.addEventListener('click', minimapContainer._clickHandler);
 }
 
 function updateMinimapViewport() {
@@ -1791,17 +2037,97 @@ function updateMinimapViewport() {
 
   const containerWidth = container.clientWidth || 1200;
   const mmWidth = containerWidth;
+  const mmDataWidth = mmWidth - TL.leftPad;
 
   const scrollLeft = container.scrollLeft;
   const scrollWidth = container.scrollWidth || TL.width;
+  const dataScrollWidth = scrollWidth - TL.leftPad;
 
-  const vpLeft = (scrollLeft / scrollWidth) * mmWidth;
-  const vpWidth = (containerWidth / scrollWidth) * mmWidth;
+  // Map scroll position to the data area of the minimap (after leftPad)
+  const scrollFraction = Math.max(0, (scrollLeft - 0) / (scrollWidth));
+  const viewFraction = containerWidth / scrollWidth;
 
-  minimapViewport.style.left = `${vpLeft}px`;
-  minimapViewport.style.width = `${vpWidth}px`;
+  // Position viewport within the full minimap width, but offset to align with data area
+  const vpLeft = TL.leftPad + ((scrollLeft) / scrollWidth) * mmDataWidth;
+  const vpWidth = Math.max(8, viewFraction * mmDataWidth);
+
+  minimapViewport.style.left = `${Math.max(TL.leftPad, vpLeft)}px`;
+  minimapViewport.style.width = `${Math.min(vpWidth, mmWidth - parseFloat(minimapViewport.style.left))}px`;
 }
 
+// ─── Minimap Drag (click-and-drag the viewport indicator) ───────────────────
+(function setupMinimapDrag() {
+  const minimapContainer = $('#minimapContainer');
+  const minimapViewport = $('#minimapViewport');
+  const container = $('#timelineContainer');
+
+  // Click on minimap background → jump to that position
+  minimapContainer.addEventListener('mousedown', (e) => {
+    // Check if clicking on the viewport indicator itself
+    if (e.target === minimapViewport || minimapViewport.contains(e.target)) {
+      // Start dragging the viewport
+      e.preventDefault();
+      e.stopPropagation();
+      minimapDrag.active = true;
+      minimapDrag.startX = e.clientX;
+      minimapDrag.startScrollLeft = container.scrollLeft;
+      minimapViewport.classList.add('dragging');
+      document.body.style.cursor = 'grabbing';
+      return;
+    }
+
+    // Click on background → jump
+    const rect = minimapContainer.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const mmWidth = minimapContainer.clientWidth;
+    const mmDataWidth = mmWidth - TL.leftPad;
+
+    if (clickX < TL.leftPad) return;
+
+    const fraction = (clickX - TL.leftPad) / mmDataWidth;
+    const scrollWidth = container.scrollWidth || TL.width;
+    const targetScroll = fraction * scrollWidth - container.clientWidth / 2;
+    container.scrollLeft = Math.max(0, Math.min(targetScroll, scrollWidth - container.clientWidth));
+
+    // Also start drag from here so user can click+drag in one motion
+    minimapDrag.active = true;
+    minimapDrag.startX = e.clientX;
+    minimapDrag.startScrollLeft = container.scrollLeft;
+    minimapViewport.classList.add('dragging');
+    document.body.style.cursor = 'grabbing';
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!minimapDrag.active) return;
+    e.preventDefault();
+
+    const mmWidth = minimapContainer.clientWidth;
+    const mmDataWidth = mmWidth - TL.leftPad;
+    const scrollWidth = container.scrollWidth || TL.width;
+
+    // How many pixels moved in minimap space
+    const deltaX = e.clientX - minimapDrag.startX;
+
+    // Convert minimap pixels to timeline scroll pixels
+    // minimap data area maps to the full scroll range
+    const scrollRange = scrollWidth - container.clientWidth;
+    const scrollDelta = (deltaX / mmDataWidth) * scrollWidth;
+
+    container.scrollLeft = clamp(
+      minimapDrag.startScrollLeft + scrollDelta,
+      0,
+      scrollRange
+    );
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (minimapDrag.active) {
+      minimapDrag.active = false;
+      minimapViewport.classList.remove('dragging');
+      document.body.style.cursor = '';
+    }
+  });
+})();
 
 function drawLeaseBlock(svg, l) {
   const b = new Date(l.begin_at || l.created_at);
@@ -1909,47 +2235,87 @@ function drawLeaseBlock(svg, l) {
     ? (dark ? '#f87171' : '#b91c1c')
     : (dark ? '#94a3b8' : '#64748b');
 
-    if (w >= 120) {
-    const notesSnippet = l.notes ? ` · 📝 ${l.notes.substring(0, 30)}${l.notes.length > 30 ? '…' : ''}` : '';
-    const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}${notesSnippet}`;
-    drawText(textGroup, x + 10, y + 18, label, {
-      fill: labelColor,
-      'font-size': 11,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
+    const semanticLevel = zoomState.semanticLevel;
 
-    const timeLabel = `${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
-    drawText(textGroup, x + 10, y + 34, timeLabel, {
-      fill: subColor,
-      'font-size': 10,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
-  } else if (w >= 60) {
-    const label = `${l.model}`;
-    drawText(textGroup, x + 8, y + 18, label, {
-      fill: labelColor,
-      'font-size': 11,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
-    drawText(textGroup, x + 8, y + 32, stateLabel, {
-      fill: subColor,
-      'font-size': 9,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
-  } else if (w >= 30) {
-    drawText(textGroup, x + 6, y + h / 2 + 4, l.model, {
-      fill: labelColor,
-      'font-size': 10,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
-  } else if (w >= 12) {
-    // Ultra-compact: just a short abbreviation or first few chars
-    const shortName = l.model.length > 6 ? l.model.substring(0, 5) + '…' : l.model;
-    drawText(textGroup, x + 3, y + h / 2 + 3, shortName, {
-      fill: labelColor,
-      'font-size': 8,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
+  if (semanticLevel === 'week') {
+    // Week level: ultra-compact — just colored bar, model name on hover (title already set)
+    if (w >= 20) {
+      drawText(textGroup, x + 4, y + h / 2 + 3, l.model.length > 8 ? l.model.substring(0, 7) + '…' : l.model, {
+        fill: labelColor,
+        'font-size': 8,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        opacity: 0.8,
+      });
+    }
+  } else if (semanticLevel === 'day') {
+    // Day level: simpler bars with model name and state
+    if (w >= 80) {
+      drawText(textGroup, x + 8, y + 18, l.model, {
+        fill: labelColor,
+        'font-size': 11,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+      drawText(textGroup, x + 8, y + 32, stateLabel, {
+        fill: subColor,
+        'font-size': 9,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    } else if (w >= 30) {
+      drawText(textGroup, x + 6, y + h / 2 + 4, l.model, {
+        fill: labelColor,
+        'font-size': 10,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    } else if (w >= 12) {
+      const shortName = l.model.length > 6 ? l.model.substring(0, 5) + '…' : l.model;
+      drawText(textGroup, x + 3, y + h / 2 + 3, shortName, {
+        fill: labelColor,
+        'font-size': 8,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    }
+  } else {
+    // Detail level: full info
+    if (w >= 120) {
+      const notesSnippet = l.notes ? ` · 📝 ${l.notes.substring(0, 30)}${l.notes.length > 30 ? '…' : ''}` : '';
+      const label = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}${notesSnippet}`;
+      drawText(textGroup, x + 10, y + 18, label, {
+        fill: labelColor,
+        'font-size': 11,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+
+      const timeLabel = `${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
+      drawText(textGroup, x + 10, y + 34, timeLabel, {
+        fill: subColor,
+        'font-size': 10,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    } else if (w >= 60) {
+      drawText(textGroup, x + 8, y + 18, l.model, {
+        fill: labelColor,
+        'font-size': 11,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+      drawText(textGroup, x + 8, y + 32, stateLabel, {
+        fill: subColor,
+        'font-size': 9,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    } else if (w >= 30) {
+      drawText(textGroup, x + 6, y + h / 2 + 4, l.model, {
+        fill: labelColor,
+        'font-size': 10,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    } else if (w >= 12) {
+      const shortName = l.model.length > 6 ? l.model.substring(0, 5) + '…' : l.model;
+      drawText(textGroup, x + 3, y + h / 2 + 3, shortName, {
+        fill: labelColor,
+        'font-size': 8,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    }
   }
 
   const hoverRect = drawRect(g, x, y, blockW, h, {
@@ -2221,8 +2587,10 @@ window.dismissFailedLease = async (id) => {
 // ─── Controls & Init ────────────────────────────────────────────────────────
 $('#refreshBtn').addEventListener('click', refresh);
 $('#timelineContainer').addEventListener('scroll', updateMinimapViewport);
-$('#windowSelect').addEventListener('change', () => { if (DASH) renderTimeline(); });
-$('#zoomSelect').addEventListener('change', () => { if (DASH) renderTimeline(); });
+
+// The windowSelect and zoomSelect change handlers are now inside setupZoomBadgePopover()
+// (no duplicate listeners needed here)
+
 $('#searchInput').addEventListener('input', () => { if (DASH) renderCatalog(); });
 $('#filterSelect').addEventListener('change', () => { if (DASH) renderCatalog(); });
 
@@ -2231,7 +2599,14 @@ $('#newBookingBtn').addEventListener('click', () => {
 });
 
 window.addEventListener('resize', () => {
-  if ($('#zoomSelect').value === 'fit' && DASH) {
+  if (DASH) {
+    // On resize, if we're using fit-to-view, recalculate
+    const zoomVal = $('#zoomSelect').value;
+    if (zoomVal === 'fit') {
+      const container = $('#timelineContainer');
+      const containerWidth = container.clientWidth || 1200;
+      zoomState.pxPerHour = Math.max(4, (containerWidth - TL.leftPad - 20) / zoomState.hours);
+    }
     renderTimeline();
   }
 });

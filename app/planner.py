@@ -4,6 +4,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 from .utils import ensure_utc
 
+# Bookings ending within this tolerance of another's start are NOT overlapping.
+# This allows back-to-back scheduling (e.g., model A ends 18:00, model B starts 18:00).
+OVERLAP_TOLERANCE = timedelta(seconds=30)
+
 @dataclass
 class Placement:
     lease_id: int
@@ -37,7 +41,12 @@ def compute_placements(
     placements: dict[int, Placement] = {}
 
     def overlaps(a0, a1, b0, b1):
-        return not (a1 <= b0 or b1 <= a0)
+        """
+        Check if two time intervals overlap, with a tolerance for back-to-back bookings.
+        Intervals that are merely adjacent (or within OVERLAP_TOLERANCE of each other)
+        are NOT considered overlapping.
+        """
+        return not (a1 <= b0 + OVERLAP_TOLERANCE or b1 <= a0 + OVERLAP_TOLERANCE)
 
     def block_free(lane_idx, begin, end):
         for (s, e) in occ[lane_idx]:
@@ -109,17 +118,14 @@ def find_earliest_slot(
     events.sort(key=lambda e: (e[0], e[1]))
 
     # Build a sorted list of all "interesting" time points to check
-    # These are: search_start, every event time, and step-aligned times
     interesting_times: set[datetime] = {search_start}
     for evt_time, _ in events:
         if search_start <= evt_time <= search_end:
             interesting_times.add(evt_time)
-        # Also add step-snapped version
         snapped = search_start + step * int((evt_time - search_start) / step)
         if search_start <= snapped <= search_end:
             interesting_times.add(snapped)
 
-    # Also add step-aligned times for completeness (but limit to reasonable count)
     t = search_start
     while t + duration <= search_end:
         interesting_times.add(t)
@@ -127,8 +133,6 @@ def find_earliest_slot(
 
     sorted_times = sorted(interesting_times)
 
-    # For each candidate start, check if GPUs are free for the entire duration
-    # We use the events to compute GPU usage at any point
     def gpus_used_at(t: datetime) -> int:
         """Compute GPUs in use at time t by summing all events before t."""
         used = 0
@@ -139,22 +143,16 @@ def find_earliest_slot(
                 break
         return used
 
-    # Precompute: for each candidate, we need to check that gpus_used < threshold
-    # for the entire [candidate, candidate+duration) window.
-    # Collect all event times within each candidate window.
     for candidate in sorted_times:
         candidate_end = candidate + duration
         if candidate_end > search_end:
             break
 
-        # Check at candidate start and at every event within the window
         ok = True
 
-        # Check at candidate start
         if total_gpus - gpus_used_at(candidate) < gpus_needed:
             continue
 
-        # Check at every event time within [candidate, candidate_end)
         for evt_time, _ in events:
             if evt_time < candidate:
                 continue

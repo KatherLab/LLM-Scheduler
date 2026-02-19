@@ -1270,18 +1270,21 @@ function updateDragGhost(pt) {
 function checkVisualConflict(begin, end, gpusNeeded, excludeLeaseId = null) {
   if (!DASH) return false;
 
+  const OVERLAP_TOLERANCE_MS = 30 * 1000; // 30s, matching backend planner.py
+
   const activeLeases = DASH.leases.filter(l =>
     ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state) && l.id !== excludeLeaseId
   );
 
   const step = 15 * 60000;
   for (let t = begin.getTime(); t < end.getTime(); t += step) {
-    const moment = new Date(t);
     let usedGpus = 0;
     for (const l of activeLeases) {
-      const lb = new Date(l.begin_at || l.created_at);
-      const le = new Date(l.end_at);
-      if (moment >= lb && moment < le) {
+      const lb = new Date(l.begin_at || l.created_at).getTime();
+      const le = new Date(l.end_at).getTime();
+      // Mirror backend: intervals within OVERLAP_TOLERANCE of each other
+      // are NOT overlapping (allows back-to-back scheduling)
+      if (t >= lb && t < le - OVERLAP_TOLERANCE_MS) {
         usedGpus += l.requested_gpus || 0;
       }
     }

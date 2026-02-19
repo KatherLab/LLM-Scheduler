@@ -37,6 +37,8 @@ class Lease(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     model: Mapped[str] = mapped_column(String(256), index=True)
     requested_gpus: Mapped[int] = mapped_column(Integer)
+    requested_cpus: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requested_mem: Mapped[str | None] = mapped_column(String(32), nullable=True)
     requested_tp: Mapped[int] = mapped_column(Integer)
     requested_port: Mapped[int] = mapped_column(Integer)
     slurm_job_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)

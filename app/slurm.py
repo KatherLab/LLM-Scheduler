@@ -26,6 +26,7 @@ def _run(cmd: list[str], extra_env: dict[str, str] | None = None) -> str:
     return p.stdout.strip()
 
 
+
 def submit_vllm_job(
     *,
     template_path: str,
@@ -39,6 +40,7 @@ def submit_vllm_job(
     qos: str | None = None,
     nodelist: str | None = None,
     cpus_per_task: int = 32,
+    mem: str | None = None,          # NEW
     log_dir: str = "./logs",
 ) -> SlurmSubmitResult:
     # Make logs deterministic and independent of router working directory:
@@ -59,6 +61,9 @@ def submit_vllm_job(
         f"--output={stdout_path}",
         f"--error={stderr_path}",
     ]
+
+    if mem:
+        cmd.append(f"--mem={mem}")
 
     if begin is not None:
         cmd.append(f"--begin={begin.strftime('%Y-%m-%dT%H:%M:%S')}")

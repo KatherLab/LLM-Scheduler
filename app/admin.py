@@ -99,6 +99,10 @@ def _submit_to_slurm(lease: Lease) -> str:
 
     env = _build_job_env(lease)
 
+    # Per-model CPU/mem from lease, fall back to global settings
+    cpus = lease.requested_cpus if lease.requested_cpus else settings.slurm_cpus_per_task
+    mem = lease.requested_mem  # None is fine — slurm.py won't add --mem
+
     res = slurm.submit_vllm_job(
         template_path=settings.sbatch_template_path,
         job_name=f"vllm-{lease.model}",
@@ -110,18 +114,18 @@ def _submit_to_slurm(lease: Lease) -> str:
         account=settings.slurm_account,
         qos=settings.slurm_qos,
         nodelist=settings.slurm_nodelist,
-        cpus_per_task=settings.slurm_cpus_per_task,
-        log_dir=settings.vllm_log_dir,  # NEW
+        cpus_per_task=cpus,
+        mem=mem,
+        log_dir=settings.vllm_log_dir,
     )
 
     return res.job_id
 
+
 def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     """
     Submit a Slurm job using a plain-dict snapshot instead of an ORM object.
-    This avoids holding a DB session open during the subprocess call.
     """
-    # Compute time limit from begin/end
     begin = _ensure_aware(snapshot["begin_at"]) if snapshot["begin_at"] else _ensure_aware(snapshot["created_at"])
     end = _ensure_aware(snapshot["end_at"])
     seconds = int((end - begin).total_seconds())
@@ -145,6 +149,10 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     if snapshot.get("venv_activate"):
         env["VENV_ACTIVATE"] = snapshot["venv_activate"]
 
+    # Per-model CPU/mem from snapshot, fall back to global settings
+    cpus = snapshot.get("requested_cpus") or settings.slurm_cpus_per_task
+    mem = snapshot.get("requested_mem")  # None is fine
+
     res = slurm.submit_vllm_job(
         template_path=settings.sbatch_template_path,
         job_name=f"vllm-{snapshot['model']}",
@@ -156,11 +164,11 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
         account=settings.slurm_account,
         qos=settings.slurm_qos,
         nodelist=settings.slurm_nodelist,
-        cpus_per_task=settings.slurm_cpus_per_task,
+        cpus_per_task=cpus,
+        mem=mem,
         log_dir=settings.vllm_log_dir,
     )
     return res.job_id
-
 
 def _snapshot_lease(lease: "Lease") -> dict:
     """Create a plain-dict snapshot of a Lease for use outside a DB session."""
@@ -170,6 +178,8 @@ def _snapshot_lease(lease: "Lease") -> dict:
         "model_path": lease.model_path,
         "requested_tp": lease.requested_tp,
         "requested_gpus": lease.requested_gpus,
+        "requested_cpus": lease.requested_cpus,
+        "requested_mem": lease.requested_mem,
         "gpu_memory_utilization": lease.gpu_memory_utilization,
         "extra_args": lease.extra_args,
         "tool_args": lease.tool_args,
@@ -180,6 +190,7 @@ def _snapshot_lease(lease: "Lease") -> dict:
         "created_at": lease.created_at,
         "slurm_job_id": lease.slurm_job_id,
     }
+
 
 
 def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
@@ -405,6 +416,8 @@ def create_lease(req: LeaseCreate):
             model=req.model,
             requested_gpus=gpus,
             requested_tp=tp,
+            requested_cpus=cat.cpus,
+            requested_mem=cat.mem,
             requested_port=0,
             owner=req.owner,
             notes=req.notes,

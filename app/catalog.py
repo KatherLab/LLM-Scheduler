@@ -4,7 +4,6 @@ from pathlib import Path
 from threading import Lock
 import yaml
 
-
 @dataclass(frozen=True)
 class CatalogModel:
     name: str
@@ -17,6 +16,8 @@ class CatalogModel:
     reasoning_parser: str | None = None
     venv_activate: str | None = None
     notes: str = ""
+    cpus: int | None = None        # NEW: per-model CPU cores
+    mem: str | None = None          # NEW: per-model memory (e.g. "64G", "128000M")
 
 
 def load_catalog(path: str) -> dict[str, CatalogModel]:
@@ -35,6 +36,8 @@ def load_catalog(path: str) -> dict[str, CatalogModel]:
             reasoning_parser=item.get("reasoning_parser"),
             venv_activate=item.get("venv_activate"),
             notes=str(item.get("notes", "") or ""),
+            cpus=int(item["cpus"]) if item.get("cpus") else None,
+            mem=str(item["mem"]) if item.get("mem") else None,
         )
         out[m.name] = m
     return out

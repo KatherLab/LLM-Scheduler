@@ -148,7 +148,16 @@ async function refresh() {
     renderTimeline();
     renderTable();
     renderStatusIndicators();
-    populateModalModels();
+
+    // Only repopulate modal models if the modal is NOT currently open,
+    // or preserve the current selection if it is.
+    const modalOpen = !modalBackdrop.classList.contains('hidden');
+    if (modalOpen) {
+      const currentSelection = $('#modalModel').value;
+      populateModalModels(currentSelection);  // preserve selection
+    } else {
+      populateModalModels();
+    }
   } catch (e) {
     toast(e.message, 'error');
   }

@@ -1,8 +1,10 @@
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 # KatherLab LLM Scheduler
 
 A web-based tool for scheduling and running large language models (LLMs) on a shared GPU server. Built for research teams that need to share limited GPU resources across multiple models and users.
 
-![License](https://img.shields.io/badge/license-MIT-blue)
+![UI Screenshot](assets/ui.png)
 
 ---
 
@@ -31,10 +33,10 @@ If your lab has a powerful GPU server (e.g., an HGX node with 8 GPUs) and multip
 
 ```
   You (browser)          KatherLab LLM Scheduler           GPU Server (Slurm)
-  ┌──────────┐           ┌─────────────────────┐           ┌──────────────────┐
-  │  Web UI  │──────────▶│  Scheduler + Router  │──────────▶│  vLLM instances   │
-  │          │◀──────────│                     │◀──────────│  (Slurm jobs)     │
-  └──────────┘           └─────────────────────┘           └──────────────────┘
+  ┌──────────┐           ┌──────────────────────┐           ┌──────────────────┐
+  │  Web UI  │──────────▶│  Scheduler + Router  │──────────▶│  vLLM instances  │
+  │          │◀──────────│                      │◀──────────│  (Slurm jobs)    │
+  └──────────┘           └──────────────────────┘           └──────────────────┘
 ```
 
 1. **You open the web UI** and see a timeline of GPU usage and a catalog of available models.
@@ -54,7 +56,7 @@ If your lab has a powerful GPU server (e.g., an HGX node with 8 GPUs) and multip
 - 🔀 **OpenAI-compatible proxy** — apps like LiteLLM, Open WebUI, or custom scripts connect to one stable endpoint
 - 📋 **Live Slurm logs** — view stdout/stderr from the web UI
 - 🔒 **Simple authentication** — password-protected access
-- 🌙 **Dark mode** — because of course
+- 🌙 **Dark mode** — But only if absolutly necessary!
 
 ---
 

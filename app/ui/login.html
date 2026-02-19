@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Model Hub — Login</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: { brand: { 50:'#f0f9ff', 500:'#0ea5e9', 600:'#0284c7', 900:'#0c4a6e' } }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Match the main app dark mode default */
+    @media (prefers-color-scheme: dark) {
+      html:not(.light) { color-scheme: dark; }
+    }
+  </style>
+</head>
+<body class="bg-gray-50 dark:bg-slate-900 min-h-screen flex items-center justify-center">
+
+  <div class="w-full max-w-sm mx-4">
+    <div class="bg-white dark:bg-slate-800 rounded-2xl border border-gray-200 dark:border-slate-700 shadow-xl p-8">
+
+      <!-- Logo / Title -->
+      <div class="flex flex-col items-center mb-8">
+        <div class="w-12 h-12 rounded-xl bg-sky-500 flex items-center justify-center text-white font-bold text-2xl mb-3">M</div>
+        <h1 class="text-xl font-semibold text-gray-900 dark:text-gray-100">Model Hub</h1>
+        <p class="text-sm text-gray-500 dark:text-slate-400 mt-1">Sign in to continue</p>
+      </div>
+
+      <!-- Login Form -->
+      <form id="loginForm" class="space-y-5">
+        <div>
+          <label for="password" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Password</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            required
+            autofocus
+            autocomplete="current-password"
+            placeholder="Enter password"
+            class="w-full px-4 py-2.5 rounded-lg bg-white dark:bg-slate-900 border border-gray-300 dark:border-slate-600 text-gray-900 dark:text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition"
+          />
+        </div>
+
+        <div id="errorMsg" class="hidden text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 rounded-lg p-3"></div>
+
+        <button
+          type="submit"
+          id="submitBtn"
+          class="w-full px-4 py-2.5 rounded-lg bg-sky-600 text-white font-medium hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-2 dark:focus:ring-offset-slate-800 transition flex items-center justify-center gap-2"
+        >
+          <span id="submitText">Sign In</span>
+          <svg id="submitSpinner" class="hidden w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+          </svg>
+        </button>
+      </form>
+
+      <!-- SSO placeholder (uncomment when ready) -->
+      <!--
+      <div class="mt-6 pt-6 border-t border-gray-200 dark:border-slate-700">
+        <a href="/auth/sso" class="w-full inline-flex items-center justify-center px-4 py-2.5 rounded-lg border border-gray-300 dark:border-slate-600 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-slate-700 transition">
+          Sign in with SSO
+        </a>
+      </div>
+      -->
+
+      <p class="mt-6 text-center text-xs text-gray-400 dark:text-slate-500">
+        <!-- Future: "Sign in with your organization account" -->
+        Internal access only
+      </p>
+    </div>
+  </div>
+
+  <script>
+    // Auto-detect dark mode
+    if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      document.documentElement.classList.add('dark');
+    }
+
+    const form = document.getElementById('loginForm');
+    const passwordInput = document.getElementById('password');
+    const errorMsg = document.getElementById('errorMsg');
+    const submitBtn = document.getElementById('submitBtn');
+    const submitText = document.getElementById('submitText');
+    const submitSpinner = document.getElementById('submitSpinner');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorMsg.classList.add('hidden');
+      submitBtn.disabled = true;
+      submitText.textContent = 'Signing in…';
+      submitSpinner.classList.remove('hidden');
+
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: passwordInput.value }),
+        });
+
+        if (res.ok) {
+          // Redirect to main app
+          const params = new URLSearchParams(window.location.search);
+          const next = params.get('next') || '/';
+          window.location.href = next;
+        } else {
+          const data = await res.json().catch(() => ({}));
+          errorMsg.textContent = data.detail || 'Invalid password';
+          errorMsg.classList.remove('hidden');
+          passwordInput.select();
+        }
+      } catch (err) {
+        errorMsg.textContent = 'Connection error. Please try again.';
+        errorMsg.classList.remove('hidden');
+      } finally {
+        submitBtn.disabled = false;
+        submitText.textContent = 'Sign In';
+        submitSpinner.classList.add('hidden');
+      }
+    });
+  </script>
+</body>
+</html>

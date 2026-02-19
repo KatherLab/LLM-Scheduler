@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     public_hostname: str = Field(default="127.0.0.1", alias="PUBLIC_HOSTNAME")
     database_url: str = Field(default="sqlite:////var/lib/vllm-router/router.db", alias="DATABASE_URL")
 
+    # --- Auth ---
+    auth_password: str = Field(default="changeme", alias="AUTH_PASSWORD")
+    auth_secret_key: str = Field(default="", alias="AUTH_SECRET_KEY")
+    auth_session_max_age_seconds: int = Field(default=86400, alias="AUTH_SESSION_MAX_AGE_SECONDS")
+
     slurm_partition: str | None = Field(default=None, alias="SLURM_PARTITION")
     slurm_account: str | None = Field(default=None, alias="SLURM_ACCOUNT")
     slurm_qos: str | None = Field(default=None, alias="SLURM_QOS")

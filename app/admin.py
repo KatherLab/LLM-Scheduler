@@ -4,7 +4,8 @@ import asyncio
 import glob
 import os
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException
+from .auth import require_auth, require_internal_token
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from typing import Optional
@@ -22,7 +23,7 @@ from .planner import compute_placements, find_earliest_slot
 from . import slurm
 from .dependencies import SessionLocal, init_db
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_auth)])
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -662,16 +663,18 @@ def get_lease_logs(lease_id: int):
             truncated=stdout_trunc or stderr_trunc,
         )
 
+# ── Internal router (no session auth, uses internal token) ──────────────────
+internal_router = APIRouter(prefix="/admin", tags=["internal"])
 
-@router.post("/endpoints/register", response_model=EndpointOut)
-def register_endpoint(req: EndpointRegister):
+
+@internal_router.post("/endpoints/register", response_model=EndpointOut)
+def register_endpoint(req: EndpointRegister, _: None = Depends(require_internal_token)):
     with SessionLocal() as db:
         existing = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == req.slurm_job_id)).scalars().first()
         if existing:
             existing.model = req.model
             existing.host = req.host
             existing.port = req.port
-            # Don't clobber READY back to STARTING on duplicate registration
             if existing.state not in ("READY",):
                 existing.state = "STARTING"
             db.commit()
@@ -686,7 +689,6 @@ def register_endpoint(req: EndpointRegister):
         lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
         if lease:
             lease.requested_port = req.port
-            # Only transition lease if it hasn't already progressed past STARTING
             if lease.state in ("SUBMITTED", "PLANNED"):
                 lease.state = "STARTING"
             db.commit()
@@ -698,3 +700,4 @@ def register_endpoint(req: EndpointRegister):
             last_health_at=e.last_health_at, last_error=e.last_error,
             created_at=e.created_at
         )
+

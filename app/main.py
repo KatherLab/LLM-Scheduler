@@ -3,7 +3,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import FileResponse
+from .auth import auth_router, require_auth, get_session
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -18,6 +19,7 @@ from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
 from .proxy import proxy_json_or_stream
 from .admin import _submit_to_slurm  # internal helper
+from .admin import internal_router
 from . import slurm
 
 # ── Supervised task wrapper ─────────────────────────────────────────────────
@@ -74,6 +76,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="vLLM Swapper Router", version="0.4.0", lifespan=lifespan)
 app.include_router(admin_router)
+app.include_router(auth_router)
+app.include_router(internal_router)
 
 # Initialize DB tables (uses shared engine from dependencies.py)
 init_db()
@@ -82,7 +86,10 @@ app.mount("/ui", StaticFiles(directory="app/ui", html=True), name="ui")
 
 
 @app.get("/")
-def root_ui():
+def root_ui(request: Request):
+    session = get_session(request)
+    if session is None:
+        return RedirectResponse(url="/login", status_code=302)
     return FileResponse("app/ui/index.html")
 
 

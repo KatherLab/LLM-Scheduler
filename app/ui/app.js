@@ -17,6 +17,17 @@ function updateThemeIcons() {
   if (isDark()) { iconSun.classList.remove('hidden'); iconMoon.classList.add('hidden'); }
   else { iconSun.classList.add('hidden'); iconMoon.classList.remove('hidden'); }
 }
+
+// ─── Logout ─────────────────────────────────────────────────────────────────
+$('#logoutBtn').addEventListener('click', async () => {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } catch (e) {
+    // ignore
+  }
+  window.location.href = '/login';
+});
+
 themeToggle.addEventListener('click', () => {
   document.documentElement.classList.toggle('dark');
   updateThemeIcons();
@@ -37,6 +48,11 @@ function toast(msg, type = 'success') {
 // ─── API Helper ─────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  if (res.status === 401) {
+    // Session expired or not authenticated — redirect to login
+    window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+    throw new Error('Session expired. Redirecting to login…');
+  }
   const txt = await res.text();
   const data = txt ? JSON.parse(txt) : {};
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);

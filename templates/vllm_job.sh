@@ -17,6 +17,7 @@ REGISTERED=0
 for i in $(seq 1 12); do
   if curl -fsS -X POST "${ROUTER_REGISTER_URL}" \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${API_KEY}" \
     -d "{\"slurm_job_id\":\"${SLURM_JOB_ID}\",\"model\":\"${SERVED_MODEL_NAME}\",\"host\":\"${SLURMD_NODENAME}\",\"port\":${PORT}}"; then
     REGISTERED=1
     echo "Registered with router on attempt ${i}"

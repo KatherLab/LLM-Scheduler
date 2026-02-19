@@ -113,3 +113,31 @@ async def async_extend_time(job_id: str, new_time_limit: str) -> None:
 async def async_submit_vllm_job(**kwargs) -> SlurmSubmitResult:
     """Non-blocking version of submit_vllm_job for async contexts."""
     return await asyncio.to_thread(lambda: submit_vllm_job(**kwargs))
+
+def squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
+    """
+    Query Slurm for multiple job states in a single squeue call.
+    Returns a dict of {job_id: state_or_None}.
+    """
+    if not job_ids:
+        return {}
+
+    result: dict[str, str | None] = {jid: None for jid in job_ids}
+    try:
+        job_list = ",".join(job_ids)
+        out = _run(["squeue", "-j", job_list, "-h", "-o", "%i %T"])
+        for line in out.strip().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                jid, state = parts[0], parts[1]
+                if jid in result:
+                    result[jid] = state
+    except subprocess.CalledProcessError:
+        # If the batch call fails (e.g., all jobs gone), individual results stay None
+        pass
+    return result
+
+
+async def async_squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
+    """Non-blocking version of squeue_job_states_batch."""
+    return await asyncio.to_thread(squeue_job_states_batch, job_ids)

@@ -116,6 +116,72 @@ def _submit_to_slurm(lease: Lease) -> str:
 
     return res.job_id
 
+def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
+    """
+    Submit a Slurm job using a plain-dict snapshot instead of an ORM object.
+    This avoids holding a DB session open during the subprocess call.
+    """
+    # Compute time limit from begin/end
+    begin = _ensure_aware(snapshot["begin_at"]) if snapshot["begin_at"] else _ensure_aware(snapshot["created_at"])
+    end = _ensure_aware(snapshot["end_at"])
+    seconds = int((end - begin).total_seconds())
+    seconds = max(60, seconds)
+    time_limit = _time_limit_from_duration(seconds)
+
+    env = {
+        "MODEL_PATH": snapshot["model_path"],
+        "SERVED_MODEL_NAME": snapshot["model"],
+        "TP_SIZE": str(snapshot["requested_tp"]),
+        "API_KEY": settings.vllm_api_key,
+        "GPU_MEM_UTIL": snapshot["gpu_memory_utilization"] or "0.95",
+        "EXTRA_ARGS": snapshot["extra_args"] or "",
+        "TOOL_ARGS": snapshot["tool_args"] or "",
+        "REASONING_PARSER": snapshot["reasoning_parser"] or "",
+        "ROUTER_REGISTER_URL": f"http://{settings.public_hostname}:{settings.router_port}/admin/endpoints/register",
+        "VLLM_HEALTH_TIMEOUT_SECONDS": str(settings.vllm_health_timeout_seconds),
+        "VLLM_MAX_RETRIES": str(settings.vllm_max_retries),
+        "VLLM_RETRY_DELAY_SECONDS": str(settings.vllm_retry_delay_seconds),
+    }
+    if snapshot.get("venv_activate"):
+        env["VENV_ACTIVATE"] = snapshot["venv_activate"]
+
+    res = slurm.submit_vllm_job(
+        template_path=settings.sbatch_template_path,
+        job_name=f"vllm-{snapshot['model']}",
+        gpus=snapshot["requested_gpus"],
+        time_limit=time_limit,
+        begin=None,
+        env=env,
+        partition=settings.slurm_partition,
+        account=settings.slurm_account,
+        qos=settings.slurm_qos,
+        nodelist=settings.slurm_nodelist,
+        cpus_per_task=settings.slurm_cpus_per_task,
+        log_dir=settings.vllm_log_dir,
+    )
+    return res.job_id
+
+
+def _snapshot_lease(lease: "Lease") -> dict:
+    """Create a plain-dict snapshot of a Lease for use outside a DB session."""
+    return {
+        "id": lease.id,
+        "model": lease.model,
+        "model_path": lease.model_path,
+        "requested_tp": lease.requested_tp,
+        "requested_gpus": lease.requested_gpus,
+        "gpu_memory_utilization": lease.gpu_memory_utilization,
+        "extra_args": lease.extra_args,
+        "tool_args": lease.tool_args,
+        "reasoning_parser": lease.reasoning_parser,
+        "venv_activate": lease.venv_activate,
+        "begin_at": lease.begin_at,
+        "end_at": lease.end_at,
+        "created_at": lease.created_at,
+        "slurm_job_id": lease.slurm_job_id,
+    }
+
+
 def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
     now = now_utc()
     horizon_start = now - timedelta(hours=1)
@@ -563,7 +629,9 @@ def register_endpoint(req: EndpointRegister):
             existing.model = req.model
             existing.host = req.host
             existing.port = req.port
-            existing.state = "STARTING"
+            # Don't clobber READY back to STARTING on duplicate registration
+            if existing.state not in ("READY",):
+                existing.state = "STARTING"
             db.commit()
             db.refresh(existing)
             e = existing
@@ -576,6 +644,7 @@ def register_endpoint(req: EndpointRegister):
         lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
         if lease:
             lease.requested_port = req.port
+            # Only transition lease if it hasn't already progressed past STARTING
             if lease.state in ("SUBMITTED", "PLANNED"):
                 lease.state = "STARTING"
             db.commit()

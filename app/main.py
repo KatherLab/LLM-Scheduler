@@ -351,6 +351,8 @@ async def health_worker():
 
 
 async def planned_submit_worker():
+    from .admin import _submit_to_slurm_from_snapshot, _snapshot_lease
+
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -378,22 +380,7 @@ async def planned_submit_worker():
                         continue
 
                     if _ensure_aware_dt(l.begin_at) <= now + lead:
-                        to_submit.append({
-                            "id": l.id,
-                            "model": l.model,
-                            # Snapshot everything _submit_to_slurm needs
-                            "model_path": l.model_path,
-                            "requested_tp": l.requested_tp,
-                            "requested_gpus": l.requested_gpus,
-                            "gpu_memory_utilization": l.gpu_memory_utilization,
-                            "extra_args": l.extra_args,
-                            "tool_args": l.tool_args,
-                            "reasoning_parser": l.reasoning_parser,
-                            "venv_activate": l.venv_activate,
-                            "begin_at": l.begin_at,
-                            "end_at": l.end_at,
-                            "created_at": l.created_at,
-                        })
+                        to_submit.append(_snapshot_lease(l))
 
                 # Mark expired leases immediately
                 for lid in to_expire:
@@ -406,21 +393,24 @@ async def planned_submit_worker():
                         )
                 db.commit()
 
-            # ── Phase 2: submit to Slurm (non-blocking) ────────────────
-            for info in to_submit:
+            # ── Phase 2: submit to Slurm (NO DB session held) ──────────
+            for snapshot in to_submit:
                 try:
-                    # We need a Lease-like object for _submit_to_slurm
-                    # Re-fetch from DB to get the actual ORM object
+                    # Submit to Slurm without any DB session open
+                    job_id = await asyncio.to_thread(
+                        _submit_to_slurm_from_snapshot, snapshot
+                    )
+
+                    # Phase 3: write result back to DB
                     with SessionLocal() as db:
-                        lease = db.get(Lease, info["id"])
+                        lease = db.get(Lease, snapshot["id"])
                         if not lease or lease.state != "PLANNED":
+                            print(
+                                f"planned_submit_worker: lease {snapshot['id']} "
+                                f"state changed during submit, skipping"
+                            )
                             continue
 
-                        # _submit_to_slurm is sync (uses subprocess),
-                        # so wrap it
-                        job_id = await asyncio.to_thread(
-                            _submit_to_slurm, lease
-                        )
                         lease.slurm_job_id = job_id
                         lease.state = "SUBMITTED"
                         print(
@@ -429,16 +419,17 @@ async def planned_submit_worker():
                             f"(job {job_id})"
                         )
                         db.commit()
+
                 except Exception as e:
                     with SessionLocal() as db:
-                        lease = db.get(Lease, info["id"])
+                        lease = db.get(Lease, snapshot["id"])
                         if lease and lease.state == "PLANNED":
                             lease.state = "FAILED"
                             lease.failed_at = now
                             db.commit()
                     print(
                         f"planned_submit_worker: failed to submit "
-                        f"lease {info['id']}: {e}"
+                        f"lease {snapshot['id']}: {e}"
                     )
 
         except Exception as e:
@@ -576,14 +567,14 @@ async def slurm_reconcile_worker():
                         "state": l.state,
                     })
 
-            # ── Phase 2: query Slurm (non-blocking, parallel) ───────────
-            if checks:
-                squeue_results = await asyncio.gather(*[
-                    slurm.async_squeue_job_state(c["slurm_job_id"])
-                    for c in checks
-                ])
+            # ── Phase 2: batch query Slurm (single subprocess call) ─────
+            job_ids_to_check = [c["slurm_job_id"] for c in checks]
+            if job_ids_to_check:
+                squeue_results = await slurm.async_squeue_job_states_batch(
+                    job_ids_to_check
+                )
             else:
-                squeue_results = []
+                squeue_results = {}
 
             # ── Phase 3: apply state changes ────────────────────────────
             with SessionLocal() as db:
@@ -603,7 +594,9 @@ async def slurm_reconcile_worker():
                             ep.state = "STOPPED"
 
                 # Handle active leases vs Slurm reality
-                for info, slurm_state in zip(checks, squeue_results):
+                for info in checks:
+                    slurm_state = squeue_results.get(info["slurm_job_id"])
+
                     if slurm_state is not None:
                         continue  # Job still in Slurm, nothing to do
 
@@ -658,17 +651,19 @@ async def slurm_reconcile_worker():
 # Cleans up old endpoint, resubmits to Slurm, resets lease to SUBMITTED.
 # =============================================================================
 async def retry_worker():
+    from .admin import _submit_to_slurm_from_snapshot, _snapshot_lease
+
     while True:
         try:
             now = datetime.now(timezone.utc)
 
-            # ── Phase 1: find eligible retries ──────────────────────────
+            # ── Phase 1: find eligible retries & snapshot them ──────────
+            candidates: list[dict] = []
             with SessionLocal() as db:
                 failed = db.execute(
                     select(Lease).where(Lease.state == "FAILED")
                 ).scalars().all()
 
-                candidates: list[dict] = []
                 for lease in failed:
                     if lease.end_at and _ensure_aware_dt(lease.end_at) < now:
                         continue
@@ -693,18 +688,16 @@ async def retry_worker():
                             )
                             continue
 
-                    candidates.append({
-                        "id": lease.id,
-                        "model": lease.model,
-                        "retry_count": lease.retry_count,
-                        "slurm_job_id": lease.slurm_job_id,
-                    })
+                    snapshot = _snapshot_lease(lease)
+                    snapshot["retry_count"] = lease.retry_count
+                    candidates.append(snapshot)
 
-            # ── Phase 2: attempt retries (non-blocking) ─────────────────
-            for info in candidates:
+            # ── Phase 2: attempt retries (NO DB session held) ───────────
+            for snapshot in candidates:
                 try:
+                    # Phase 2a: mark retry in progress (quick DB write)
                     with SessionLocal() as db:
-                        lease = db.get(Lease, info["id"])
+                        lease = db.get(Lease, snapshot["id"])
                         if not lease or lease.state != "FAILED":
                             continue
 
@@ -727,9 +720,18 @@ async def retry_worker():
                             if old_ep:
                                 old_ep.state = "STOPPED"
 
-                        new_job_id = await asyncio.to_thread(
-                            _submit_to_slurm, lease
-                        )
+                        db.commit()
+
+                    # Phase 2b: submit to Slurm (NO DB session open)
+                    new_job_id = await asyncio.to_thread(
+                        _submit_to_slurm_from_snapshot, snapshot
+                    )
+
+                    # Phase 2c: write result back to DB
+                    with SessionLocal() as db:
+                        lease = db.get(Lease, snapshot["id"])
+                        if not lease:
+                            continue
                         lease.slurm_job_id = new_job_id
                         lease.state = "SUBMITTED"
                         lease.failed_at = None
@@ -742,10 +744,10 @@ async def retry_worker():
                 except Exception as ex:
                     print(
                         f"retry_worker: failed to resubmit "
-                        f"lease {info['id']}: {ex}"
+                        f"lease {snapshot['id']}: {ex}"
                     )
                     with SessionLocal() as db:
-                        lease = db.get(Lease, info["id"])
+                        lease = db.get(Lease, snapshot["id"])
                         if lease:
                             lease.failed_at = now
                             db.commit()
@@ -760,6 +762,8 @@ def reconcile_on_startup():
     """
     On startup, cross-reference DB state with Slurm reality.
 
+    Uses batched squeue calls to avoid blocking startup with N subprocess calls.
+
     Handles:
     - Leases in SUBMITTED/STARTING/RUNNING whose Slurm jobs are gone → FAILED or ENDED
     - PLANNED leases whose end_at has already passed → ENDED
@@ -770,18 +774,26 @@ def reconcile_on_startup():
     changes = 0
 
     with SessionLocal() as db:
-        # 1. Check active leases against Slurm
+        # 1. Check active leases against Slurm (batched)
         active_leases = db.execute(
             select(Lease).where(
                 Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING"])
             )
         ).scalars().all()
 
+        # Collect all job IDs we need to check
+        lease_job_ids = [
+            l.slurm_job_id for l in active_leases if l.slurm_job_id
+        ]
+
+        # Single batched squeue call
+        job_states = slurm.squeue_job_states_batch(lease_job_ids) if lease_job_ids else {}
+
         for lease in active_leases:
             if not lease.slurm_job_id:
                 continue
 
-            state = slurm.squeue_job_state(lease.slurm_job_id)
+            state = job_states.get(lease.slurm_job_id)
 
             if state is None:
                 # Job is gone from Slurm
@@ -837,6 +849,8 @@ def reconcile_on_startup():
             )
         ).scalars().all()
 
+        orphan_job_ids = []
+        orphan_eps = []
         for ep in eps:
             lease = db.execute(
                 select(Lease).where(
@@ -847,15 +861,21 @@ def reconcile_on_startup():
                 )
             ).scalars().first()
             if not lease:
-                # Check if the Slurm job is still alive
-                state = slurm.squeue_job_state(ep.slurm_job_id)
-                if state is None:
-                    ep.state = "STOPPED"
-                    print(
-                        f"  reconcile: orphan endpoint {ep.model} "
-                        f"(job {ep.slurm_job_id}) → STOPPED"
-                    )
-                    changes += 1
+                orphan_job_ids.append(ep.slurm_job_id)
+                orphan_eps.append(ep)
+
+        # Batch check orphan endpoints
+        orphan_states = slurm.squeue_job_states_batch(orphan_job_ids) if orphan_job_ids else {}
+
+        for ep in orphan_eps:
+            state = orphan_states.get(ep.slurm_job_id)
+            if state is None:
+                ep.state = "STOPPED"
+                print(
+                    f"  reconcile: orphan endpoint {ep.model} "
+                    f"(job {ep.slurm_job_id}) → STOPPED"
+                )
+                changes += 1
 
         db.commit()
 

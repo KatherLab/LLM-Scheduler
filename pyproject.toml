@@ -1,7 +1,7 @@
 [project]
-name = "vllm-slurm-scheduler"
-version = "0.0.1"
-description = "Add your description here"
+name = "katherlab-llm-scheduler"
+version = "0.1.0"
+description = "KatherLab LLM Scheduler — a web-based GPU scheduling and model serving tool for shared HPC nodes"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

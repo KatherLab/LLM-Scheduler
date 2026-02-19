@@ -1,61 +1,183 @@
-# vLLM Swapper + Model Router (Slurm, single HGX node)
+# KatherLab LLM Scheduler
 
-This repo implements a **thin, fast OpenAI-compatible proxy** ("Model Router") plus a **Slurm-backed swapper/scheduler**
-to start/stop/extend vLLM instances on a single HGX server with limited GPUs.
+A web-based tool for scheduling and running large language models (LLMs) on a shared GPU server. Built for research teams that need to share limited GPU resources across multiple models and users.
 
-## What you get
-- Stable endpoints (no client-visible ports):
-  - `POST /v1/chat/completions`
-  - `POST /v1/messages`
-  - `GET /v1/models`
-- Admin endpoints for scheduling and lifecycle:
-  - `POST /admin/leases` (start now or schedule later)
-  - `POST /admin/leases/{id}/extend`
-  - `DELETE /admin/leases/{id}` (unload)
-  - `GET /admin/leases`
-  - `GET /admin/endpoints`
-- Slurm integration:
-  - vLLM runs as a Slurm job requesting `--gres=gpu:N`
-  - Time limits (`--time`) and begin time (`--begin`) supported
-  - Cancel / extend via `scancel` and `scontrol update`
-- Endpoint registry + readiness checks:
-  - vLLM jobs register back to the router with jobid/model/port
-  - router health-checks `/health` and routes only to READY endpoints
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-## Assumptions
-- One HGX server (Slurm node) that can run Slurm jobs locally.
-- vLLM exposes OpenAI-compatible endpoints and `/health`.
-- Router runs on the same node or reachable over the cluster network.
+---
 
-## Quick start (dev)
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+## What is this?
 
-# configure
-cp config/example.env .env
-# edit .env for your node, Slurm partitions, and paths
+If your lab has a powerful GPU server (e.g., an HGX node with 8 GPUs) and multiple people want to run different LLMs at different times, this tool helps you manage that.
 
-# run
-uvicorn app.main:app --host 0.0.0.0 --port 9000
+**Think of it like a shared calendar for your GPUs.**
+
+- **See what's running** — a visual timeline shows which models are loaded and which GPUs are in use.
+- **Book a model** — pick a model from the catalog, choose a time and duration, and the scheduler handles the rest.
+- **No port juggling** — users always connect to one stable address. The scheduler routes requests to the right model behind the scenes.
+- **Automatic lifecycle** — models start, run for the booked duration, and stop automatically. No need to SSH in and manage processes.
+
+---
+
+## Who is this for?
+
+- Research groups sharing a single GPU server
+- Labs running multiple LLMs (e.g., for experiments, evaluations, demos)
+- Anyone who wants a simple web UI instead of manually launching and killing vLLM processes via the terminal
+
+---
+
+## How it works (high level)
+
+```
+  You (browser)          KatherLab LLM Scheduler           GPU Server (Slurm)
+  ┌──────────┐           ┌─────────────────────┐           ┌──────────────────┐
+  │  Web UI  │──────────▶│  Scheduler + Router  │──────────▶│  vLLM instances   │
+  │          │◀──────────│                     │◀──────────│  (Slurm jobs)     │
+  └──────────┘           └─────────────────────┘           └──────────────────┘
 ```
 
-## Model catalog
-Edit `config/models.yaml` to define runnable models and defaults.
+1. **You open the web UI** and see a timeline of GPU usage and a catalog of available models.
+2. **You create a booking** — e.g., "Run Qwen3.5-397B from 10:00 to 18:00."
+3. **The scheduler submits a Slurm job** that starts vLLM with the right model and GPU allocation.
+4. **Once the model is ready**, the scheduler routes API requests (`/v1/chat/completions`) to it.
+5. **When the booking ends**, the model shuts down and the GPUs are freed for the next booking.
 
-## How LiteLLM fits
-Keep LiteLLM public-facing for auth/key management. Configure one backend for all "dynamic" models:
-- `api_base` points to this router, and users set `model` to one of the catalog names.
-This router will route to the currently-running vLLM instance for that model.
+---
 
-## Production notes
-- Run with systemd (sample unit in `deploy/systemd/vllm-router.service`)
-- Use Postgres if desired; default is SQLite for simplicity.
-- Put the router behind your internal network / reverse proxy (e.g., nginx) if needed.
+## Features
 
-## Web UI
-Open `http://<router-host>:9000/` for the timeline UI.
+- 📅 **Visual GPU timeline** — drag-and-drop booking, resize, extend, shorten
+- 🚀 **One-click model start** — pick from a catalog of pre-configured models
+- ⚡ **ASAP booking** — automatically finds the earliest free slot
+- 🔁 **Automatic retries** — if a model fails to start, the scheduler retries
+- 🔀 **OpenAI-compatible proxy** — apps like LiteLLM, Open WebUI, or custom scripts connect to one stable endpoint
+- 📋 **Live Slurm logs** — view stdout/stderr from the web UI
+- 🔒 **Simple authentication** — password-protected access
+- 🌙 **Dark mode** — because of course
 
-## Default model
-Set `DEFAULT_MODEL` (and optionally `DEFAULT_MODEL_GPUS`, `DEFAULT_MODEL_TP`) in `.env` to keep a default model running when no other model is READY.
-This does **not** implement request fallback chains; it only manages an idle default.
+---
+
+## Quick start
+
+### Prerequisites
+
+- A Linux server with **Slurm** installed and working (`sbatch`, `squeue`, `scancel`)
+- At least one GPU
+- **Python 3.13+**
+- [**uv**](https://docs.astral.sh/uv/) (fast Python package manager)
+
+### 1. Install uv (if you don't have it)
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### 2. Clone the repository
+
+```bash
+git clone https://github.com/KatherLab/LLM-Scheduler.git
+cd LLM-Scheduler
+```
+
+### 3. Set up the environment
+
+```bash
+uv sync
+```
+
+This creates a virtual environment and installs all dependencies automatically.
+
+### 4. Configure
+
+```bash
+cp config/example.env .env
+```
+
+Open `.env` in a text editor and adjust:
+
+| Setting | What it does |
+|---|---|
+| `AUTH_PASSWORD` | The password to log into the web UI |
+| `PUBLIC_HOSTNAME` | The hostname or IP your users will connect to |
+| `TOTAL_GPUS` | How many GPUs your server has |
+| `SLURM_PARTITION` | Your Slurm partition (leave empty for default) |
+| `VLLM_API_KEY` | API key that vLLM instances use (internal) |
+
+### 5. Configure your models
+
+Edit `config/models.yaml` to list the models you want to make available. Each entry specifies the model path, how many GPUs it needs, and any special vLLM arguments:
+
+```yaml
+models:
+  - name: My-Model
+    model_path: /path/to/model
+    gpus: 2
+    tensor_parallel_size: 2
+    cpus: 16
+    mem: "64G"
+    venv_activate: /path/to/vllm/.venv/bin/activate
+    notes: "Short description for the UI"
+```
+
+### 6. Run
+
+```bash
+uv run uvicorn app.main:app --host 0.0.0.0 --port 9000
+```
+
+Then open **http://your-server:9000** in your browser.
+
+---
+
+## Connecting your apps
+
+Once a model is running, you can send requests to the scheduler just like you would to OpenAI:
+
+```bash
+curl http://your-server:9000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "My-Model",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+This works with any OpenAI-compatible client, including:
+- [LiteLLM](https://github.com/BerriAI/litellm)
+- [Open WebUI](https://github.com/open-webui/open-webui)
+- Python's `openai` library
+
+Just point `api_base` to `http://your-server:9000` and set the `model` to one of your catalog names.
+
+---
+
+## Project structure
+
+```
+├── app/                  # Python backend (FastAPI)
+│   ├── main.py           # App entry point + background workers
+│   ├── admin.py          # Booking/lease management API
+│   ├── slurm.py          # Slurm integration (sbatch, scancel, etc.)
+│   ├── planner.py        # GPU allocation algorithm
+│   ├── proxy.py          # OpenAI-compatible request proxy
+│   └── ui/               # Web frontend (HTML + JS)
+├── config/
+│   ├── models.yaml       # Model catalog
+│   └── example.env       # Environment variable template
+├── templates/
+│   └── vllm_job.sh       # Slurm job script template
+└── pyproject.toml        # Python dependencies
+```
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue or pull request.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.

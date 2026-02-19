@@ -74,7 +74,7 @@ async def lifespan(app: FastAPI):
     print("lifespan: shutdown complete")
 
 
-app = FastAPI(title="vLLM Swapper Router", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="KatherLab LLM Scheduler", version="0.4.0", lifespan=lifespan)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(internal_router)

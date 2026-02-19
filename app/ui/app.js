@@ -158,7 +158,7 @@ async function refresh() {
   try {
     DASH = await api('/admin/dashboard');
     MODEL_MAP = new Map(DASH.models.map(m => [m.id, m]));
-    $('#subtitle').textContent = `Single node · ${DASH.total_gpus} GPUs · ${fmtTime(new Date(DASH.now))}`;
+    $('#subtitle').textContent = `${DASH.total_gpus} GPUs · ${fmtTime(new Date(DASH.now))}`;
     renderCatalog();
     renderTimeline();
     renderTable();

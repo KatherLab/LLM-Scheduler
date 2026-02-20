@@ -1,6 +1,6 @@
 models:
   - name: Qwen3.5-397B-A17B-FP8
-    model_path: /mnt/models/Qwen_Qwen3.5-397B-A17-FP8
+    model_path: /mnt/models/Qwen_Qwen3.5-397B-A17B-FP8
     gpus: 4
     tensor_parallel_size: 4
     cpus: 64
@@ -9,11 +9,11 @@ models:
     extra_args: >
       --mm-encoder-tp-mode data
       --mm-processor-cache-type shm
-      --speculative-config.method qwen3_next_mtp
+      --speculative-config.method mtp
       --speculative-config.num_speculative_tokens 2
     reasoning_parser: deepseek_r1
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
-    venv_activate: /root/vllm-nightly-16022026/.venv/bin/activate
+    venv_activate: /root/vllm-nightly-20022026/.venv/bin/activate
     notes: "Qwen3.5 FP8"
 
   - name: Qwen3.5-397B-A17B
@@ -26,11 +26,11 @@ models:
     extra_args: >
       --mm-encoder-tp-mode data
       --mm-processor-cache-type shm
-      --speculative-config.method qwen3_next_mtp
+      --speculative-config.method mtp
       --speculative-config.num_speculative_tokens 2
     reasoning_parser: deepseek_r1
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
-    venv_activate: /root/vllm-nightly-16022026/.venv/bin/activate
+    venv_activate: /root/vllm-nightly-20022026/.venv/bin/activate
     notes: "Qwen3.5 full precision"
 
   - name: Qwen3-VL-235B-A22B-Thinking-FP8
@@ -66,6 +66,26 @@ models:
     venv_activate: /root/vllm-0.15.1/.venv/bin/activate
     notes: "Qwen3-VL 235B Instruct FP8 (2 GPUs, no reasoning parser)"
 
+  - name: GLM-5-FP8
+    model_path: /mnt/models/zai-org_GLM-5-FP8
+    gpus: 8
+    tensor_parallel_size: 8
+    cpus: 64
+    mem: "800G"
+    gpu_memory_utilization: 0.95
+    extra_args: >
+      --trust-remote-code
+      --max-model-len 131072
+      --structured-outputs-config.backend xgrammar
+      --structured-outputs-config.disable_any_whitespace true
+      --max-num-batched-tokens 32768
+      --speculative-config.method mtp
+      --speculative-config.num_speculative_tokens 1
+    reasoning_parser: glm45
+    tool_args: "--enable-auto-tool-choice --tool-call-parser glm47"
+    venv_activate: /root/vllm-glm5/.venv/bin/activate
+    notes: "GLM-5-FP8 (8 GPUs, xgrammar structured outputs, MTP speculative config)"
+
   - name: GLM-4.7-FP8
     model_path: /mnt/models/zai-org_GLM-4.7-FP8
     gpus: 4
@@ -83,7 +103,7 @@ models:
       --speculative-config.num_speculative_tokens 1
     reasoning_parser: glm45
     tool_args: "--enable-auto-tool-choice --tool-call-parser glm47"
-    venv_activate: /root/vllm-0.15.0-transformers5/.venv/bin/activate
+    venv_activate: /root/vllm-0.15.1/.venv/bin/activate
     notes: "GLM‑4.7‑FP8 model entry (port & API‑key injected by scheduler proxy)"
 
   - name: GLM-4.6V-FP8
@@ -112,7 +132,7 @@ models:
       --structured-outputs-config.disable_any_whitespace true
     reasoning_parser: openai_gptoss
     tool_args: "--enable-auto-tool-choice --tool-call-parser openai"
-    venv_activate: /root/vllm-0.15.0-transformers5/.venv/bin/activate
+    venv_activate: /root/vllm-0.15.1/.venv/bin/activate
     env_vars:
       VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
       CUDA_LAUNCH_BLOCKING: "0"
@@ -148,7 +168,7 @@ models:
     gpu_memory_utilization: 0.03
     reasoning_parser: deepseek_r1
     extra_args: "--max-num-seqs 10 --enforce-eager --max-model-len 2048"
-    venv_activate: /root/vllm-nightly-16022026/.venv/bin/activate
+    venv_activate: /root/vllm-nightly-20022026/.venv/bin/activate
     notes: "small test model"
     env:
       VLLM_SOME_FLAG: "1"

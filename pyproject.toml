@@ -14,7 +14,7 @@ dependencies = [
     "SQLAlchemy==2.0.46"
 ]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "ruff>=0.15.1",
 ]

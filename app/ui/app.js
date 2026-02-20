@@ -64,6 +64,22 @@ let DASH = null;
 let MODEL_MAP = new Map();
 let REFRESH_INTERVAL = null;
 
+// ─── Scroll Tracking ────────────────────────────────────────────────────────
+let userHasScrolled = false;
+let scrollIdleTimeout = null;
+let _programmaticScroll = false;
+
+// ─── Custom Timeline Start Date ─────────────────────────────────────────────
+// When non-null, the timeline starts at this date instead of "now - 1h"
+let customStartDate = null;
+
+function programmaticScrollTo(container, scrollLeft) {
+  _programmaticScroll = true;
+  container.scrollLeft = scrollLeft;
+  // Reset the flag after a tick so the scroll event handler sees it
+  requestAnimationFrame(() => { _programmaticScroll = false; });
+}
+
 // Timeline geometry
 let TL = {
   leftPad: 70,
@@ -641,10 +657,90 @@ modalBackdrop.addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
+  // Don't trigger shortcuts when typing in inputs
+  const tag = e.target.tagName;
+  const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target.isContentEditable;
+
   if (e.key === 'Escape') {
     closeModal();
     closeLogModal();
     hideBlockPopover();
+    // Also close the zoom settings popover
+    $('#zoomSettingsPopover')?.classList.add('hidden');
+    return;
+  }
+
+  // Don't process other shortcuts when typing
+  if (isInput) return;
+
+  // T = snap to Today/Now
+  if (e.key === 't' || e.key === 'T') {
+    e.preventDefault();
+    customStartDate = null;
+    userHasScrolled = false;
+    if (DASH) {
+      const now = new Date(DASH.now);
+      const nowX = dateToX(now);
+      const container = $('#timelineContainer');
+      renderTimeline();
+      programmaticScrollTo(container, Math.max(0, nowX - 200));
+    }
+    return;
+  }
+
+  // N = new booking
+  if (e.key === 'n' || e.key === 'N') {
+    e.preventDefault();
+    openModal();
+    return;
+  }
+
+  // + / = = zoom in
+  if (e.key === '+' || e.key === '=') {
+    e.preventDefault();
+    stepZoom(true);
+    return;
+  }
+
+  // - = zoom out
+  if (e.key === '-' || e.key === '_') {
+    e.preventDefault();
+    stepZoom(false);
+    return;
+  }
+
+  // R = refresh
+  if (e.key === 'r' || e.key === 'R') {
+    e.preventDefault();
+    refresh();
+    return;
+  }
+
+  // ? = show shortcuts help
+  if (e.key === '?') {
+    e.preventDefault();
+    toast('Shortcuts: T=Today · N=New Booking · +/-=Zoom · R=Refresh · Esc=Close', 'info');
+    return;
+  }
+
+  // Left/Right arrow = pan timeline
+  if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    const shiftHours = Math.max(1, Math.floor(zoomState.hours / 4));
+    const currentStart = customStartDate || TL.start || new Date();
+    customStartDate = new Date(currentStart.getTime() - shiftHours * 3600000);
+    userHasScrolled = false;
+    if (DASH) renderTimeline();
+    return;
+  }
+  if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    const shiftHours = Math.max(1, Math.floor(zoomState.hours / 4));
+    const currentStart = customStartDate || TL.start || new Date();
+    customStartDate = new Date(currentStart.getTime() + shiftHours * 3600000);
+    userHasScrolled = false;
+    if (DASH) renderTimeline();
+    return;
   }
 });
 
@@ -1674,18 +1770,42 @@ function applyZoom(hours, pxPerHour, preserveScrollCenter = true) {
   $('#windowSelect').addEventListener('change', () => {
     const hours = parseInt($('#windowSelect').value, 10);
     const zoomVal = $('#zoomSelect').value;
+
+    // Auto-calculate a sensible pxPerHour for this window size
+    // Goal: timeline should be roughly 1.5–2.5 screen widths
+    const container = $('#timelineContainer');
+    const containerWidth = container.clientWidth || 1200;
+    const targetWidthMultiplier = 2.0; // 2x viewport width feels comfortable
+    const autoScale = Math.max(4, Math.min(200,
+      (containerWidth * targetWidthMultiplier - TL.leftPad) / hours
+    ));
+
     let pxPerHour;
     if (zoomVal === 'fit') {
-      const container = $('#timelineContainer');
-      const containerWidth = container.clientWidth || 1200;
       pxPerHour = Math.max(4, (containerWidth - TL.leftPad - 20) / hours);
     } else {
-      pxPerHour = parseInt(zoomVal, 10);
+      // Use auto-scale instead of the raw dropdown value
+      pxPerHour = autoScale;
     }
+
     zoomState.hours = hours;
     zoomState.pxPerHour = pxPerHour;
+
+    // Also update the zoom dropdown to reflect the new scale
+    // Find closest option
+    const zoomSelect = $('#zoomSelect');
+    const zoomOptions = [...zoomSelect.options].filter(o => o.value !== 'fit').map(o => parseInt(o.value, 10));
+    const closest = zoomOptions.reduce((prev, curr) =>
+      Math.abs(curr - pxPerHour) < Math.abs(prev - pxPerHour) ? curr : prev
+    );
+    zoomSelect.value = String(closest);
+
+    // Reset scroll to "now" when changing window
+    userHasScrolled = false;
+
     if (DASH) renderTimeline();
   });
+
 
   $('#zoomSelect').addEventListener('change', () => {
     const hours = zoomState.hours;
@@ -1735,9 +1855,13 @@ function renderTimeline() {
   TL.height = TL.headerH + gpuTotal * TL.laneH + 16;
 
   const now = new Date(DASH.now);
-  TL.start = new Date(now);
-  TL.start.setMinutes(0, 0, 0);
-  TL.start.setHours(TL.start.getHours() - 1);
+  if (customStartDate) {
+    TL.start = new Date(customStartDate);
+  } else {
+    TL.start = new Date(now);
+    TL.start.setMinutes(0, 0, 0);
+    TL.start.setHours(TL.start.getHours() - 1);
+  }
   TL.end = new Date(TL.start.getTime() + hours * 3600000);
 
   svg.setAttribute('width', TL.width);
@@ -1890,14 +2014,17 @@ function renderTimeline() {
     'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
   });
 
-  // ── Auto-scroll to now ──
+  // ── Auto-scroll to now (only on first load or if user hasn't scrolled recently) ──
   const scrollTarget = nowX - 200;
-  if (scrollTarget > 0 && !dragState.active && !catalogDragState.active) {
-    container.scrollLeft = scrollTarget;
+  if (scrollTarget > 0 && !dragState.active && !catalogDragState.active && !userHasScrolled) {
+    programmaticScrollTo(container, scrollTarget);
   }
 
   // ── Update zoom badge ──
   updateZoomBadge();
+
+  // ── Update date navigation label ──
+  updateDateNavLabel();
 
   // ── Render minimap ──
   renderMinimap(leases);
@@ -2586,13 +2713,132 @@ window.dismissFailedLease = async (id) => {
 
 // ─── Controls & Init ────────────────────────────────────────────────────────
 $('#refreshBtn').addEventListener('click', refresh);
-$('#timelineContainer').addEventListener('scroll', updateMinimapViewport);
+$('#snapToNowBtn').addEventListener('click', () => {
+  // Reset the user scroll flag so auto-scroll takes over
+  userHasScrolled = false;
+  if (scrollIdleTimeout) clearTimeout(scrollIdleTimeout);
 
-// The windowSelect and zoomSelect change handlers are now inside setupZoomBadgePopover()
-// (no duplicate listeners needed here)
+  // Scroll to now
+  if (DASH && TL.start) {
+    const now = new Date(DASH.now);
+    const nowX = dateToX(now);
+    const container = $('#timelineContainer');
+    programmaticScrollTo(container, Math.max(0, nowX - 200));
+    toast('Snapped to current time', 'info');
+  }
+});
+// ─── Zoom +/− Buttons ──────────────────────────────────────────────────────
+function stepZoom(zoomIn) {
+  const sorted = [...ZOOM_PRESETS].sort((a, b) => b.hours - a.hours);
+  const currentHours = zoomState.hours;
+  const currentPxPerHour = zoomState.pxPerHour;
+  const ZOOM_SPEED = 0.25; // 25% per click — bigger steps than scroll wheel
+
+  let newHours, newPxPerHour;
+
+  if (zoomIn) {
+    newHours = Math.max(6, currentHours * (1 - ZOOM_SPEED));
+    newPxPerHour = Math.min(200, currentPxPerHour * (1 + ZOOM_SPEED));
+    const nearestPreset = sorted.find(p => p.hours <= newHours);
+    if (nearestPreset && Math.abs(newHours - nearestPreset.hours) / nearestPreset.hours < 0.15) {
+      newHours = nearestPreset.hours;
+      newPxPerHour = nearestPreset.pxPerHour;
+    }
+  } else {
+    newHours = Math.min(336, currentHours * (1 + ZOOM_SPEED));
+    newPxPerHour = Math.max(4, currentPxPerHour * (1 - ZOOM_SPEED));
+    const nearestPreset = [...sorted].reverse().find(p => p.hours >= newHours);
+    if (nearestPreset && Math.abs(newHours - nearestPreset.hours) / nearestPreset.hours < 0.15) {
+      newHours = nearestPreset.hours;
+      newPxPerHour = nearestPreset.pxPerHour;
+    }
+  }
+
+  newHours = Math.round(newHours);
+
+  let label;
+  if (newHours < 24) label = `${newHours}h`;
+  else if (newHours < 48) label = `~1 day`;
+  else label = `~${Math.round(newHours / 24)} days`;
+  showZoomIndicator(`🔍 ${label} · ${Math.round(newPxPerHour)}px/h`);
+
+  applyZoom(newHours, newPxPerHour, true);
+}
+
+$('#zoomInBtn').addEventListener('click', () => stepZoom(true));
+$('#zoomOutBtn').addEventListener('click', () => stepZoom(false));
+$('#timelineContainer').addEventListener('scroll', () => {
+  updateMinimapViewport();
+
+  // Mark that the user has manually scrolled (unless we're programmatically scrolling)
+  if (!_programmaticScroll) {
+    userHasScrolled = true;
+
+    // Reset after 30 seconds of no scrolling — then auto-scroll resumes
+    if (scrollIdleTimeout) clearTimeout(scrollIdleTimeout);
+    scrollIdleTimeout = setTimeout(() => {
+      userHasScrolled = false;
+    }, 30000);
+  }
+});
+
 
 $('#searchInput').addEventListener('input', () => { if (DASH) renderCatalog(); });
 $('#filterSelect').addEventListener('change', () => { if (DASH) renderCatalog(); });
+
+// ─── Date Navigation ────────────────────────────────────────────────────────
+function updateDateNavLabel() {
+  const label = $('#dateNavLabel');
+  if (!TL.start || !TL.end) return;
+  const startStr = TL.start.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  const endStr = TL.end.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+  label.textContent = `${startStr} — ${endStr}`;
+
+  // Update the date picker to reflect current start
+  const picker = $('#dateNavPicker');
+  const pad = (n) => String(n).padStart(2, '0');
+  picker.value = `${TL.start.getFullYear()}-${pad(TL.start.getMonth() + 1)}-${pad(TL.start.getDate())}`;
+}
+
+$('#dateNavPrev').addEventListener('click', () => {
+  // Move window backward by half the window duration
+  const shiftHours = Math.max(1, Math.floor(zoomState.hours / 2));
+  const currentStart = customStartDate || TL.start || new Date();
+  customStartDate = new Date(currentStart.getTime() - shiftHours * 3600000);
+  userHasScrolled = false;
+  if (DASH) renderTimeline();
+});
+
+$('#dateNavNext').addEventListener('click', () => {
+  // Move window forward by half the window duration
+  const shiftHours = Math.max(1, Math.floor(zoomState.hours / 2));
+  const currentStart = customStartDate || TL.start || new Date();
+  customStartDate = new Date(currentStart.getTime() + shiftHours * 3600000);
+  userHasScrolled = false;
+  if (DASH) renderTimeline();
+});
+
+$('#dateNavToday').addEventListener('click', () => {
+  // Reset to default "now - 1h" behavior
+  customStartDate = null;
+  userHasScrolled = false;
+  if (DASH) renderTimeline();
+  toast('Jumped to today', 'info');
+});
+
+$('#dateNavPicker').addEventListener('change', () => {
+  const val = $('#dateNavPicker').value;
+  if (!val) return;
+  const parts = val.split('-');
+  const d = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+  d.setHours(0, 0, 0, 0);
+  customStartDate = d;
+  userHasScrolled = false;
+  if (DASH) renderTimeline();
+  toast(`Jumped to ${d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}`, 'info');
+});
+
+
 
 $('#newBookingBtn').addEventListener('click', () => {
   openModal();

@@ -125,7 +125,7 @@ models:
 ### 6. Run
 
 ```bash
-uv run uvicorn app.main:app --host 0.0.0.0 --port 9000
+uv run uvicorn app.main:app --host 0.0.0.0 --port 3000
 ```
 
 Then open **http://your-server:9000** in your browser.

@@ -16,9 +16,9 @@ class CatalogModel:
     reasoning_parser: str | None = None
     venv_activate: str | None = None
     notes: str = ""
-    cpus: int | None = None        # NEW: per-model CPU cores
-    mem: str | None = None          # NEW: per-model memory (e.g. "64G", "128000M")
-
+    cpus: int | None = None
+    mem: str | None = None
+    env: dict[str, str] | None = None
 
 def load_catalog(path: str) -> dict[str, CatalogModel]:
     p = Path(path)
@@ -38,6 +38,7 @@ def load_catalog(path: str) -> dict[str, CatalogModel]:
             notes=str(item.get("notes", "") or ""),
             cpus=int(item["cpus"]) if item.get("cpus") else None,
             mem=str(item["mem"]) if item.get("mem") else None,
+            env=dict(item["env"]) if item.get("env") else None,
         )
         out[m.name] = m
     return out

@@ -60,6 +60,7 @@ class Lease(Base):
     gpu_memory_utilization: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     venv_activate: Mapped[str | None] = mapped_column(Text, nullable=True)
+    env_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # User-facing notes (who booked it, why, hints)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)

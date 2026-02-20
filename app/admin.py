@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from .auth import require_auth, require_internal_token
@@ -85,6 +86,16 @@ def _build_job_env(lease: Lease) -> dict[str, str]:
 
     if lease.venv_activate:
         env["VENV_ACTIVATE"] = lease.venv_activate
+
+    if lease.env_json:
+        import json
+        try:
+            model_env = json.loads(lease.env_json)
+            if isinstance(model_env, dict):
+                env.update(model_env)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return env
 
 def _submit_to_slurm(lease: Lease) -> str:
@@ -148,6 +159,15 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     cpus = snapshot.get("requested_cpus") or settings.slurm_cpus_per_task
     mem = snapshot.get("requested_mem")  # None is fine
 
+    if snapshot.get("env_json"):
+        import json
+        try:
+            model_env = json.loads(snapshot["env_json"])
+            if isinstance(model_env, dict):
+                env.update(model_env)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     res = slurm.submit_vllm_job(
         template_path=settings.sbatch_template_path,
         job_name=f"vllm-{snapshot['model']}",
@@ -180,6 +200,7 @@ def _snapshot_lease(lease: "Lease") -> dict:
         "tool_args": lease.tool_args,
         "reasoning_parser": lease.reasoning_parser,
         "venv_activate": lease.venv_activate,
+        "env_json": lease.env_json,
         "begin_at": lease.begin_at,
         "end_at": lease.end_at,
         "created_at": lease.created_at,
@@ -461,6 +482,7 @@ async def create_lease(req: LeaseCreate):
                 req.gpu_memory_utilization if req.gpu_memory_utilization is not None else cat.gpu_memory_utilization
             ),
             venv_activate=cat.venv_activate,
+            env_json=json.dumps(cat.env) if cat.env else None,
             state="PLANNED" if planned else "SUBMITTED",
         )
 

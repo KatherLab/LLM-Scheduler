@@ -9,11 +9,9 @@ models:
     extra_args: >
       --mm-encoder-tp-mode data
       --mm-processor-cache-type shm
-      --speculative-config.method mtp
-      --speculative-config.num_speculative_tokens 2
-    reasoning_parser: deepseek_r1
+    reasoning_parser: qwen3
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
-    venv_activate: /root/vllm-nightly-20022026/.venv/bin/activate
+    venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
     notes: "Qwen3.5 FP8"
 
   - name: Qwen3.5-397B-A17B

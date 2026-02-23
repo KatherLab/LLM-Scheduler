@@ -33,14 +33,14 @@ async def _get_client(timeout_s: float = 600.0) -> httpx.AsyncClient:
         if _client is not None and not _client.is_closed:
             return _client
         _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_s, connect=10.0),
+            timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=10.0),
             limits=httpx.Limits(
-                max_connections=200,
+                max_connections=500,
                 max_keepalive_connections=80,
                 keepalive_expiry=30,
             ),
             follow_redirects=False,
-            http2=False,  # vLLM serves HTTP/1.1
+            http2=False,
         )
         return _client
 
@@ -62,6 +62,38 @@ def _filter_headers(headers: httpx.Headers) -> dict[str, str]:
     return out
 
 
+import json
+from typing import AsyncIterator, Optional
+
+import httpx
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+
+
+def _openai_error(
+    message: str,
+    *,
+    type_: str = "api_error",
+    code: Optional[str] = None,
+    param: Optional[str] = None,
+):
+    # Matches the general OpenAI error envelope shape
+    err = {"message": message, "type": type_, "param": param, "code": code}
+    return {"error": err}
+
+
+def _status_for_httpx_exc(exc: Exception) -> int:
+    # Choose status codes that are common/expected for proxies
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        return 504
+    if isinstance(exc, httpx.TimeoutException):
+        return 504
+    if isinstance(exc, httpx.RequestError):
+        # DNS failure, connection refused, network unreachable, etc.
+        return 502
+    return 500
+
+
 async def proxy_json_or_stream(
     request: Request,
     upstream_url: str,
@@ -71,16 +103,21 @@ async def proxy_json_or_stream(
     timeout_s: float = 600.0,
 ) -> Response:
     """
-    Proxy a request to upstream vLLM.
+    Proxy a request to an upstream OpenAI-compatible server (e.g., vLLM).
 
-    If `body` and `is_stream` are provided, we skip re-reading/re-parsing
-    the request (saves one full JSON parse + body read).
+    Goals:
+    - Pass through upstream responses verbatim when possible.
+    - Never leak internal stacktraces to logs via unhandled exceptions.
+    - Return OpenAI-style JSON errors for non-stream.
+    - For stream, emit SSE error frames + [DONE].
     """
     if body is None:
         body = await request.body()
+
     headers = dict(request.headers)
     headers.pop("host", None)
 
+    # Determine streaming mode (if not provided by caller)
     if is_stream is None:
         try:
             j = json.loads(body.decode("utf-8") or "{}")
@@ -92,28 +129,98 @@ async def proxy_json_or_stream(
 
     if is_stream:
         async def gen() -> AsyncIterator[bytes]:
+            resp: httpx.Response | None = None
             try:
                 req = client.build_request(
-                    "POST", upstream_url, content=body, headers=headers,
+                    "POST",
+                    upstream_url,
+                    content=body,
+                    headers=headers,
                 )
                 resp = await client.send(req, stream=True)
-                try:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-                finally:
-                    await resp.aclose()
+
+                # If upstream immediately returns an error status, you can either
+                # pass through bytes (may not be SSE) or convert to SSE error.
+                # Converting is usually friendlier for OpenAI-style streaming clients.
+                if resp.status_code >= 400:
+                    try:
+                        raw = await resp.aread()
+                        # Try to keep upstream error message if it is JSON
+                        msg = None
+                        try:
+                            parsed = json.loads(raw.decode("utf-8"))
+                            if isinstance(parsed, dict) and "error" in parsed:
+                                # upstream already OpenAI-like
+                                data = parsed
+                            else:
+                                data = _openai_error("Upstream error", type_="upstream_error")
+                        except Exception:
+                            data = _openai_error("Upstream error", type_="upstream_error")
+
+                        yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
+                    finally:
+                        yield b"data: [DONE]\n\n"
+                    return
+
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+
             except Exception as e:
-                error_data = json.dumps(
-                    {"error": {"message": str(e), "type": "proxy_error"}}
-                )
-                yield f"data: {error_data}\n\n".encode()
+                status = _status_for_httpx_exc(e)
+                # Keep message short; don’t dump internal reprs
+                if isinstance(e, httpx.TimeoutException):
+                    msg = "Upstream request timed out"
+                    code = "upstream_timeout"
+                    type_ = "timeout_error"
+                elif isinstance(e, httpx.RequestError):
+                    msg = "Upstream connection error"
+                    code = "upstream_connection_error"
+                    type_ = "api_error"
+                else:
+                    msg = "Internal proxy error"
+                    code = "proxy_internal_error"
+                    type_ = "api_error"
+
+                data = _openai_error(msg, type_=type_, code=code)
+                # Streaming clients expect SSE frames, not plain JSON
+                yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
+            finally:
+                if resp is not None:
+                    await resp.aclose()
 
         return StreamingResponse(gen(), media_type="text/event-stream")
-    else:
+
+    # ---- non-stream path ----
+    try:
         r = await client.post(upstream_url, content=body, headers=headers)
+        # Pass through upstream content and status
         return Response(
             content=r.content,
             status_code=r.status_code,
             headers=_filter_headers(r.headers),
         )
+
+    except Exception as e:
+        status = _status_for_httpx_exc(e)
+
+        if isinstance(e, httpx.TimeoutException):
+            payload = _openai_error(
+                "Upstream request timed out",
+                type_="timeout_error",
+                code="upstream_timeout",
+            )
+        elif isinstance(e, httpx.RequestError):
+            payload = _openai_error(
+                "Upstream connection error",
+                type_="api_error",
+                code="upstream_connection_error",
+            )
+        else:
+            payload = _openai_error(
+                "Internal proxy error",
+                type_="api_error",
+                code="proxy_internal_error",
+            )
+
+        return JSONResponse(status_code=status, content=payload)

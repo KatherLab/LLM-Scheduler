@@ -50,16 +50,36 @@ def choose_ready_endpoint(db: Session, model: str) -> Optional[Endpoint]:
     return eps[0] if eps else None
 
 
+import time
+import traceback
+
 async def health_check_endpoint(
-    host: str, port: int, timeout_s: float = 2.0
+    host: str, port: int, timeout_s: float = 60.0
 ) -> tuple[bool, str | None]:
     """Check vLLM /health endpoint. Uses shared connection pool."""
     url = f"http://{host}:{port}/health"
+
+    def dbg(msg: str) -> None:
+        print(f"[health_check] {msg}")
+
+    t0 = time.perf_counter()
+
     try:
         client = await _get_health_client()
-        r = await client.get(url)
+        r = await client.get(url, timeout=timeout_s)
+
         if r.status_code == 200:
             return True, None
+
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        dbg(
+            f"FAIL status={r.status_code} elapsed_ms={dt_ms:.1f} "
+            f"url={url} body={r.text!r}"
+        )
         return False, f"health status {r.status_code}"
+
     except Exception as e:
-        return False, str(e)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        dbg(f"EXCEPTION after {dt_ms:.1f}ms url={url}: {type(e).__name__}: {e!r}")
+        dbg("TRACEBACK:\n" + traceback.format_exc())
+        return False, f"{type(e).__name__}: {e}"

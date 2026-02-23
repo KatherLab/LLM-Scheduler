@@ -346,7 +346,7 @@ async def health_worker():
         except Exception as e:
             print(f"health_worker error: {e}")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(60)
 
 
 async def planned_submit_worker():
@@ -709,6 +709,8 @@ async def retry_worker():
 
                         lease.retry_count += 1
                         lease.state = "RETRYING"  # Intermediate state prevents other workers from touching it
+                        old_slurm_job_id = lease.slurm_job_id
+
                         print(
                             f"retry_worker: retrying lease {lease.id} "
                             f"({lease.model}), attempt "
@@ -728,6 +730,13 @@ async def retry_worker():
                                 old_ep.state = "STOPPED"
 
                         db.commit()
+
+                    if old_slurm_job_id:
+                        try:
+                            await slurm.async_cancel(old_slurm_job_id)
+                            print(f"retry_worker: scancel'd old job {old_slurm_job_id}")
+                        except Exception as ex:
+                            print(f"retry_worker: scancel failed for {old_slurm_job_id}: {ex}")
 
                     # Phase 2b: submit to Slurm (NO DB session open)
                     new_job_id = await asyncio.to_thread(

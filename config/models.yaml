@@ -30,7 +30,7 @@ models:
       --speculative-config.num_speculative_tokens 2
     reasoning_parser: deepseek_r1
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
-    venv_activate: /root/vllm-nightly-20022026/.venv/bin/activate
+    venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
     notes: "Qwen3.5 full precision"
 
   - name: Qwen3-VL-235B-A22B-Thinking-FP8
@@ -168,7 +168,7 @@ models:
     gpu_memory_utilization: 0.03
     reasoning_parser: deepseek_r1
     extra_args: "--max-num-seqs 10 --enforce-eager --max-model-len 2048"
-    venv_activate: /root/vllm-nightly-20022026/.venv/bin/activate
+    venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
     notes: "small test model"
     env:
       VLLM_SOME_FLAG: "1"

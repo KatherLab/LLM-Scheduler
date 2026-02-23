@@ -123,10 +123,11 @@ def _submit_to_slurm(lease: Lease) -> str:
         cpus_per_task=cpus,
         mem=mem,
         log_dir=settings.vllm_log_dir,
+        mail_user=settings.slurm_mail_user,
+        mail_type=settings.slurm_mail_type,
     )
 
     return res.job_id
-
 
 def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     """
@@ -182,6 +183,8 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
         cpus_per_task=cpus,
         mem=mem,
         log_dir=settings.vllm_log_dir,
+        mail_user=settings.slurm_mail_user,
+        mail_type=settings.slurm_mail_type,
     )
     return res.job_id
 

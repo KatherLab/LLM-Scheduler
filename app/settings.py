@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     vllm_max_retries: int = Field(default=1, alias="VLLM_MAX_RETRIES")
     vllm_retry_delay_seconds: int = Field(default=10, alias="VLLM_RETRY_DELAY_SECONDS")
 
+    # Slurm email notifications (optional)
+    # Set SLURM_MAIL_USER to an email address to receive job notifications.
+    # SLURM_MAIL_TYPE controls which events trigger emails.
+    # Valid values: NONE, BEGIN, END, FAIL, REQUEUE, ALL, TIME_LIMIT, TIME_LIMIT_90, etc.
+    # Multiple values can be comma-separated, e.g. "BEGIN,END,FAIL"
+    slurm_mail_user: str | None = Field(default=None, alias="SLURM_MAIL_USER")
+    slurm_mail_type: str = Field(default="FAIL,END,TIME_LIMIT", alias="SLURM_MAIL_TYPE")
+
+
 
 
 settings = Settings()

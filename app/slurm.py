@@ -39,8 +39,10 @@ def submit_vllm_job(
     qos: str | None = None,
     nodelist: str | None = None,
     cpus_per_task: int = 32,
-    mem: str | None = None,          # NEW
+    mem: str | None = None,
     log_dir: str = "./logs",
+    mail_user: str | None = None,
+    mail_type: str | None = None,
 ) -> SlurmSubmitResult:
     # Make logs deterministic and independent of router working directory:
     # Slurm expands %x=%jobname, %j=%jobid
@@ -63,6 +65,10 @@ def submit_vllm_job(
 
     if mem:
         cmd.append(f"--mem={mem}")
+
+    if mail_user:
+        cmd.append(f"--mail-user={mail_user}")
+        cmd.append(f"--mail-type={mail_type or 'FAIL,END,TIME_LIMIT'}")
 
     if begin is not None:
         cmd.append(f"--begin={begin.strftime('%Y-%m-%dT%H:%M:%S')}")

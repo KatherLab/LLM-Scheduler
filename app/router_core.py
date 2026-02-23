@@ -5,6 +5,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 import httpx
+import time
 
 from .models import Endpoint
 
@@ -50,36 +51,39 @@ def choose_ready_endpoint(db: Session, model: str) -> Optional[Endpoint]:
     return eps[0] if eps else None
 
 
-import time
-import traceback
-
 async def health_check_endpoint(
-    host: str, port: int, timeout_s: float = 60.0
+    host: str, port: int, timeout_s: float = 30.0
 ) -> tuple[bool, str | None]:
-    """Check vLLM /health endpoint. Uses shared connection pool."""
+    """Check vLLM /health endpoint. Uses shared connection pool.
+
+    Returns (ok, error_string_or_None).
+    The error string now includes the type of failure (timeout, status code, etc.)
+    so lifecycle logs can distinguish root causes.
+    """
     url = f"http://{host}:{port}/health"
-
-    def dbg(msg: str) -> None:
-        print(f"[health_check] {msg}")
-
     t0 = time.perf_counter()
 
     try:
         client = await _get_health_client()
+        # IMPORTANT: pass timeout_s as a per-request override so it actually
+        # takes effect instead of being silently ignored by the client-level 3s default.
         r = await client.get(url, timeout=timeout_s)
+
+        dt_ms = (time.perf_counter() - t0) * 1000.0
 
         if r.status_code == 200:
             return True, None
 
+        return False, f"health status {r.status_code} (elapsed {dt_ms:.0f}ms, body={r.text[:200]!r})"
+
+    except httpx.TimeoutException as e:
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        dbg(
-            f"FAIL status={r.status_code} elapsed_ms={dt_ms:.1f} "
-            f"url={url} body={r.text!r}"
-        )
-        return False, f"health status {r.status_code}"
+        return False, f"TimeoutException after {dt_ms:.0f}ms: {type(e).__name__}: {e}"
+
+    except httpx.RequestError as e:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        return False, f"RequestError after {dt_ms:.0f}ms: {type(e).__name__}: {e}"
 
     except Exception as e:
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        dbg(f"EXCEPTION after {dt_ms:.1f}ms url={url}: {type(e).__name__}: {e!r}")
-        dbg("TRACEBACK:\n" + traceback.format_exc())
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"UnexpectedError after {dt_ms:.0f}ms: {type(e).__name__}: {e}"

@@ -9,6 +9,8 @@ models:
     extra_args: >
       --mm-encoder-tp-mode data
       --mm-processor-cache-type shm
+      --enable-prefix-caching
+      --max-num-batched-tokens 16384
     reasoning_parser: qwen3
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
     venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate

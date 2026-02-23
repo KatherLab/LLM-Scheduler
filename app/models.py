@@ -89,5 +89,8 @@ class Endpoint(Base):
 
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utc_now)
 
+    health_fail_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
 
 Index("ix_endpoints_model_state", Endpoint.model, Endpoint.state)

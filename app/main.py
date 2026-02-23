@@ -21,6 +21,7 @@ from .proxy import proxy_json_or_stream
 from .admin import internal_router
 from . import slurm
 from .utils import ensure_utc
+from .lifecycle_logger import log_health_check, log_state_transition, log_slurm_action
 
 # ── Supervised task wrapper ─────────────────────────────────────────────────
 async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
@@ -183,15 +184,18 @@ async def messages(request: Request):
 # =============================================================================
 # HEALTH WORKER — unified, adaptive polling
 #
-# - STARTING endpoints: polled every cycle (3s) for fast readiness detection
+# - STARTING endpoints: polled every cycle for fast readiness detection
 # - READY endpoints: polled every ~15s for liveness monitoring
 # - Handles ALL state transitions:
 #     STARTING → READY  (lease → RUNNING)
-#     READY → FAILED    (lease → FAILED)
+#     READY → FAILED    (lease → FAILED) — after READY_FAIL_THRESHOLD consecutive failures
 #     STARTING timeout → FAILED (lease → FAILED)
 # - Fallback: any READY endpoint whose lease is still STARTING/SUBMITTED
 #   gets its lease promoted to RUNNING (catches missed transitions)
 # =============================================================================
+
+READY_FAIL_THRESHOLD = 3  # consecutive health-check failures before marking READY → FAILED
+
 async def health_worker():
     """
     Unified health poller.
@@ -234,28 +238,41 @@ async def health_worker():
 
             # ── Phase 2: parallel health checks (no DB session held) ────
             if checks:
-                results = await asyncio.gather(*[
-                    health_check_endpoint(c["host"], c["port"])
+                import time as _time
+                t0_all = _time.perf_counter()
+                results_raw = await asyncio.gather(*[
+                    _timed_health_check(c["host"], c["port"])
                     for c in checks
                 ])
+                # results_raw is list of (ok, err, elapsed_ms)
             else:
-                results = []
+                results_raw = []
 
             # ── Phase 3: apply state transitions ────────────────────────
             with SessionLocal() as db:
-                for check_info, (ok, err) in zip(checks, results):
+                for check_info, (ok, err, elapsed_ms) in zip(checks, results_raw):
                     ep = db.get(Endpoint, check_info["id"])
                     if not ep or ep.state not in ("STARTING", "READY"):
                         continue  # state changed between phases
 
                     if ok:
+                        # ── Success ─────────────────────────────────────
                         if ep.state == "STARTING":
+                            old_state = ep.state
                             ep.state = "READY"
                             ep.last_error = None
-                            print(
-                                f"health_worker: endpoint {ep.model} "
-                                f"(job {ep.slurm_job_id}) is now READY"
+                            ep.health_fail_count = 0
+
+                            log_state_transition(
+                                entity="endpoint",
+                                entity_id=ep.id,
+                                model=ep.model,
+                                old_state=old_state,
+                                new_state="READY",
+                                slurm_job_id=ep.slurm_job_id,
+                                reason="health check passed",
                             )
+
                             lease = db.execute(
                                 select(Lease).where(
                                     Lease.slurm_job_id == ep.slurm_job_id
@@ -264,50 +281,109 @@ async def health_worker():
                             if lease and lease.state in (
                                 "SUBMITTED", "STARTING"
                             ):
+                                old_ls = lease.state
                                 lease.state = "RUNNING"
-                                print(
-                                    f"health_worker: lease {lease.id} "
-                                    f"({lease.model}) → RUNNING"
+                                log_state_transition(
+                                    entity="lease",
+                                    entity_id=lease.id,
+                                    model=lease.model,
+                                    old_state=old_ls,
+                                    new_state="RUNNING",
+                                    slurm_job_id=ep.slurm_job_id,
                                 )
+
                         elif ep.state == "READY":
                             ep.last_error = None
+                            ep.health_fail_count = 0
+
+                        log_health_check(
+                            model=check_info["model"],
+                            slurm_job_id=check_info["slurm_job_id"],
+                            endpoint_state=check_info["state"],
+                            success=True,
+                            elapsed_ms=elapsed_ms,
+                            fail_count=0,
+                        )
 
                     else:
+                        # ── Failure ─────────────────────────────────────
                         if ep.state == "READY":
-                            ep.state = "FAILED"
+                            ep.health_fail_count = (ep.health_fail_count or 0) + 1
                             ep.last_error = err
-                            print(
-                                f"health_worker: endpoint {ep.model} "
-                                f"(job {ep.slurm_job_id}) FAILED: {err}"
+
+                            log_health_check(
+                                model=check_info["model"],
+                                slurm_job_id=check_info["slurm_job_id"],
+                                endpoint_state="READY",
+                                success=False,
+                                error=err,
+                                elapsed_ms=elapsed_ms,
+                                fail_count=ep.health_fail_count,
                             )
-                            lease = db.execute(
-                                select(Lease).where(
-                                    Lease.slurm_job_id == ep.slurm_job_id
+
+                            if ep.health_fail_count >= READY_FAIL_THRESHOLD:
+                                ep.state = "FAILED"
+
+                                log_state_transition(
+                                    entity="endpoint",
+                                    entity_id=ep.id,
+                                    model=ep.model,
+                                    old_state="READY",
+                                    new_state="FAILED",
+                                    slurm_job_id=ep.slurm_job_id,
+                                    reason=f"{ep.health_fail_count} consecutive failures: {err}",
                                 )
-                            ).scalars().first()
-                            if lease and lease.state == "RUNNING":
-                                lease.state = "FAILED"
-                                lease.failed_at = now
-                                print(
-                                    f"health_worker: lease {lease.id} "
-                                    f"({lease.model}) → FAILED"
-                                )
+
+                                lease = db.execute(
+                                    select(Lease).where(
+                                        Lease.slurm_job_id == ep.slurm_job_id
+                                    )
+                                ).scalars().first()
+                                if lease and lease.state == "RUNNING":
+                                    old_ls = lease.state
+                                    lease.state = "FAILED"
+                                    lease.failed_at = now
+                                    log_state_transition(
+                                        entity="lease",
+                                        entity_id=lease.id,
+                                        model=lease.model,
+                                        old_state=old_ls,
+                                        new_state="FAILED",
+                                        slurm_job_id=ep.slurm_job_id,
+                                        reason=f"endpoint failed after {ep.health_fail_count} consecutive health check failures",
+                                    )
 
                         elif ep.state == "STARTING":
                             age = (
                                 now
                                 - ensure_utc(check_info["created_at"])
                             ).total_seconds()
+
+                            log_health_check(
+                                model=check_info["model"],
+                                slurm_job_id=check_info["slurm_job_id"],
+                                endpoint_state="STARTING",
+                                success=False,
+                                error=err,
+                                elapsed_ms=elapsed_ms,
+                            )
+
                             if age > settings.vllm_health_timeout_seconds:
                                 ep.state = "FAILED"
                                 ep.last_error = (
                                     f"Timed out after {age:.0f}s: {err}"
                                 )
-                                print(
-                                    f"health_worker: endpoint {ep.model} "
-                                    f"(job {ep.slurm_job_id}) timed out "
-                                    f"after {age:.0f}s"
+
+                                log_state_transition(
+                                    entity="endpoint",
+                                    entity_id=ep.id,
+                                    model=ep.model,
+                                    old_state="STARTING",
+                                    new_state="FAILED",
+                                    slurm_job_id=ep.slurm_job_id,
+                                    reason=f"startup timeout after {age:.0f}s",
                                 )
+
                                 lease = db.execute(
                                     select(Lease).where(
                                         Lease.slurm_job_id
@@ -317,8 +393,18 @@ async def health_worker():
                                 if lease and lease.state in (
                                     "SUBMITTED", "STARTING"
                                 ):
+                                    old_ls = lease.state
                                     lease.state = "FAILED"
                                     lease.failed_at = now
+                                    log_state_transition(
+                                        entity="lease",
+                                        entity_id=lease.id,
+                                        model=lease.model,
+                                        old_state=old_ls,
+                                        new_state="FAILED",
+                                        slurm_job_id=ep.slurm_job_id,
+                                        reason=f"endpoint startup timeout after {age:.0f}s",
+                                    )
                             else:
                                 ep.last_error = err
 
@@ -335,10 +421,16 @@ async def health_worker():
                         )
                     ).scalars().first()
                     if lease and lease.state in ("SUBMITTED", "STARTING"):
+                        old_ls = lease.state
                         lease.state = "RUNNING"
-                        print(
-                            f"health_worker (fallback): lease {lease.id} "
-                            f"({lease.model}) → RUNNING"
+                        log_state_transition(
+                            entity="lease",
+                            entity_id=lease.id,
+                            model=lease.model,
+                            old_state=old_ls,
+                            new_state="RUNNING",
+                            slurm_job_id=e.slurm_job_id,
+                            reason="fallback reconciliation (endpoint already READY)",
                         )
 
                 db.commit()
@@ -347,6 +439,15 @@ async def health_worker():
             print(f"health_worker error: {e}")
 
         await asyncio.sleep(60)
+
+
+async def _timed_health_check(host: str, port: int) -> tuple[bool, str | None, float]:
+    """Wrapper that returns (ok, error, elapsed_ms)."""
+    import time as _time
+    t0 = _time.perf_counter()
+    ok, err = await health_check_endpoint(host, port)
+    elapsed_ms = (_time.perf_counter() - t0) * 1000.0
+    return ok, err, elapsed_ms
 
 
 async def planned_submit_worker():
@@ -410,14 +511,26 @@ async def planned_submit_worker():
                             )
                             continue
 
+                        old_state = lease.state
                         lease.slurm_job_id = job_id
                         lease.state = "SUBMITTED"
-                        print(
-                            f"planned_submit_worker: lease {lease.id} "
-                            f"({lease.model}) → SUBMITTED "
-                            f"(job {job_id})"
+                        log_slurm_action(
+                            action="submit",
+                            model=lease.model,
+                            slurm_job_id=job_id,
+                            lease_id=lease.id,
+                            detail=f"planned submission",
+                        )
+                        log_state_transition(
+                            entity="lease",
+                            entity_id=lease.id,
+                            model=lease.model,
+                            old_state=old_state,
+                            new_state="SUBMITTED",
+                            slurm_job_id=job_id,
                         )
                         db.commit()
+
 
                 except Exception as e:
                     with SessionLocal() as db:
@@ -480,9 +593,12 @@ async def endpoint_cleanup_worker():
                 if act["slurm_job_id"]:
                     try:
                         await slurm.async_cancel(act["slurm_job_id"])
-                        print(
-                            f"endpoint_cleanup: scancel'd {act['action']} job "
-                            f"{act['slurm_job_id']}"
+                        log_slurm_action(
+                            action="cancel",
+                            model="(cleanup)",
+                            slurm_job_id=act["slurm_job_id"],
+                            lease_id=act["lease_id"],
+                            detail=f"reason={act['action']}",
                         )
                     except Exception as ex:
                         # Job might already be gone — that's fine
@@ -490,6 +606,7 @@ async def endpoint_cleanup_worker():
                             f"endpoint_cleanup: scancel failed for "
                             f"{act['slurm_job_id']}: {ex}"
                         )
+
 
 
             # ── Phase 3: update DB state ────────────────────────────────
@@ -507,11 +624,18 @@ async def endpoint_cleanup_worker():
 
                         if act["action"] == "expired":
                             if lease.state == "RUNNING":
+                                old_ls = lease.state
                                 lease.state = "ENDED"
-                                print(
-                                    f"endpoint_cleanup: lease {lease.id} "
-                                    f"({lease.model}) → ENDED (expired)"
+                                log_state_transition(
+                                    entity="lease",
+                                    entity_id=lease.id,
+                                    model=lease.model,
+                                    old_state=old_ls,
+                                    new_state="ENDED",
+                                    slurm_job_id=act["slurm_job_id"],
+                                    reason="lease expired",
                                 )
+
                             # Leave FAILED leases as FAILED
                         # For lease_done action, endpoint just gets STOPPED
 
@@ -619,25 +743,36 @@ async def slurm_reconcile_worker():
                     ).scalars().first()
 
                     if ep is None or ep.state in ("FAILED", "STARTING"):
+                        old_ls = l.state
                         l.state = "FAILED"
                         l.failed_at = now
                         if ep:
                             ep.state = "FAILED"
-                        print(
-                            f"slurm_reconcile: lease {l.id} "
-                            f"({l.model}) → FAILED "
-                            f"(job {info['slurm_job_id']} gone from squeue)"
+                        log_state_transition(
+                            entity="lease",
+                            entity_id=l.id,
+                            model=l.model,
+                            old_state=old_ls,
+                            new_state="FAILED",
+                            slurm_job_id=info["slurm_job_id"],
+                            reason=f"job gone from squeue, endpoint was {ep.state if ep else 'missing'}",
                         )
                     else:
+                        old_ls = l.state
                         if l.state not in ("CANCELED",):
                             l.state = "ENDED"
                         if ep:
                             ep.state = "STOPPED"
-                        print(
-                            f"slurm_reconcile: lease {l.id} "
-                            f"({l.model}) → ENDED "
-                            f"(job {info['slurm_job_id']} gone from squeue)"
+                        log_state_transition(
+                            entity="lease",
+                            entity_id=l.id,
+                            model=l.model,
+                            old_state=old_ls,
+                            new_state="ENDED",
+                            slurm_job_id=info["slurm_job_id"],
+                            reason="job gone from squeue (was running normally)",
                         )
+
 
                 db.commit()
         except Exception as e:
@@ -711,12 +846,23 @@ async def retry_worker():
                         lease.state = "RETRYING"  # Intermediate state prevents other workers from touching it
                         old_slurm_job_id = lease.slurm_job_id
 
-                        print(
-                            f"retry_worker: retrying lease {lease.id} "
-                            f"({lease.model}), attempt "
-                            f"{lease.retry_count}/"
-                            f"{settings.vllm_max_retries}"
+                        log_slurm_action(
+                            action="retry",
+                            model=lease.model,
+                            slurm_job_id=old_slurm_job_id,
+                            lease_id=lease.id,
+                            detail=f"attempt {lease.retry_count}/{settings.vllm_max_retries}",
                         )
+                        log_state_transition(
+                            entity="lease",
+                            entity_id=lease.id,
+                            model=lease.model,
+                            old_state="FAILED",
+                            new_state="RETRYING",
+                            slurm_job_id=old_slurm_job_id,
+                            reason=f"retry attempt {lease.retry_count}",
+                        )
+
 
                         # Clean up old endpoint
                         if lease.slurm_job_id:
@@ -751,11 +897,23 @@ async def retry_worker():
                         lease.slurm_job_id = new_job_id
                         lease.state = "SUBMITTED"
                         lease.failed_at = None
-                        print(
-                            f"retry_worker: lease {lease.id} resubmitted "
-                            f"as Slurm job {new_job_id}"
+                        log_slurm_action(
+                            action="submit",
+                            model=lease.model,
+                            slurm_job_id=new_job_id,
+                            lease_id=lease.id,
+                            detail="resubmitted after retry",
+                        )
+                        log_state_transition(
+                            entity="lease",
+                            entity_id=lease.id,
+                            model=lease.model,
+                            old_state="RETRYING",
+                            new_state="SUBMITTED",
+                            slurm_job_id=new_job_id,
                         )
                         db.commit()
+
 
                 except Exception as ex:
                     print(

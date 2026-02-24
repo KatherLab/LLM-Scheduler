@@ -181,6 +181,50 @@ async def messages(request: Request):
         is_stream=is_stream,
     )
 
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    body = await request.body()
+    try:
+        j = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    model = j.get("model")
+    if not model:
+        raise HTTPException(status_code=400, detail="Missing 'model' in request body")
+    is_stream = bool(j.get("stream", False))
+
+    with SessionLocal() as db:
+        upstream = _resolve_upstream(db, model)
+    return await proxy_json_or_stream(
+        request,
+        upstream_url=f"{upstream}/v1/responses",
+        body=body,
+        is_stream=is_stream,
+    )
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def cancel_response(response_id: str, request: Request):
+    body = await request.body()
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    model = j.get("model")
+    if not model:
+        raise HTTPException(status_code=400, detail="Missing 'model' in request body")
+
+    with SessionLocal() as db:
+        upstream = _resolve_upstream(db, model)
+    return await proxy_json_or_stream(
+        request,
+        upstream_url=f"{upstream}/v1/responses/{response_id}/cancel",
+        body=body,
+        is_stream=False,
+    )
+
+
 # =============================================================================
 # HEALTH WORKER — unified, adaptive polling
 #

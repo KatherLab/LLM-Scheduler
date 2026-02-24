@@ -4,11 +4,12 @@ models:
     gpus: 4
     tensor_parallel_size: 4
     cpus: 64
-    mem: "600G"
+    mem: "1000G"
     gpu_memory_utilization: 0.95
     extra_args: >
       --mm-encoder-tp-mode data
       --mm-processor-cache-type shm
+      --mm-processor-cache-gb 10
       --enable-prefix-caching
       --max-num-batched-tokens 16384
     reasoning_parser: qwen3

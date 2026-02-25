@@ -7,15 +7,13 @@ models:
     mem: "1000G"
     gpu_memory_utilization: 0.95
     extra_args: >
-      --mm-encoder-tp-mode data
-      --mm-processor-cache-type shm
-      --mm-processor-cache-gb 10
-      --enable-prefix-caching
+      --mm-processor-cache-gb 0
+      --no-async-scheduling
       --max-num-batched-tokens 16384
     reasoning_parser: qwen3
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
     venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
-    notes: "Qwen3.5 FP8"
+    notes: "Qwen3.5 397B FP8, native multimodality"
 
   - name: Qwen3.5-397B-A17B
     model_path: /mnt/models/Qwen_Qwen3.5-397B-A17B
@@ -25,11 +23,11 @@ models:
     mem: "1000G"
     gpu_memory_utilization: 0.95
     extra_args: >
-      --mm-encoder-tp-mode data
       --mm-processor-cache-type shm
-      --speculative-config.method mtp
-      --speculative-config.num_speculative_tokens 2
-    reasoning_parser: deepseek_r1
+      --mm-processor-cache-gb 0
+      --no-async-scheduling
+      --max-num-batched-tokens 16384
+    reasoning_parser: qwen3
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
     venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
     notes: "Qwen3.5 full precision"

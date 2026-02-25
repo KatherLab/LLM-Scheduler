@@ -168,3 +168,35 @@ def squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
 async def async_squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
     """Non-blocking version of squeue_job_states_batch."""
     return await asyncio.to_thread(squeue_job_states_batch, job_ids)
+
+
+def sacct_job_exit_info_batch(job_ids: list[str]) -> dict[str, dict | None]:
+    """
+    Query sacct for completed jobs' exit states.
+    Returns {job_id: {"state": "OUT_OF_MEMORY", "exit_code": "0:125"} or None}.
+    """
+    if not job_ids:
+        return {}
+    result: dict[str, dict | None] = {jid: None for jid in job_ids}
+    try:
+        job_list = ",".join(job_ids)
+        out = _run([
+            "sacct", "-j", job_list,
+            "--format=JobID,State,ExitCode",
+            "--noheader", "--parsable2",
+            "--allocations",
+        ])
+        for line in out.strip().splitlines():
+            parts = line.strip().split("|")
+            if len(parts) >= 3:
+                jid = parts[0].split(".")[0]  # strip .batch suffix
+                if jid in result:
+                    result[jid] = {"state": parts[1], "exit_code": parts[2]}
+    except subprocess.CalledProcessError:
+        pass
+    return result
+
+
+async def async_sacct_job_exit_info_batch(job_ids: list[str]) -> dict[str, dict | None]:
+    """Non-blocking version of sacct_job_exit_info_batch."""
+    return await asyncio.to_thread(sacct_job_exit_info_batch, job_ids)

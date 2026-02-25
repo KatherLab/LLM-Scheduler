@@ -693,11 +693,16 @@ async def endpoint_cleanup_worker():
 # =============================================================================
 # SLURM RECONCILE WORKER
 #
-# Reconcile leases/endpoints with Slurm reality (squeue).
-# - If Slurm job is gone from squeue → mark lease ENDED or FAILED
+# Reconcile leases/endpoints with Slurm reality (squeue + sacct).
+# - If Slurm job is gone from squeue → check sacct for exit reason
+# - OOM / NODE_FAIL / PREEMPTED / etc. → FAILED (eligible for retry)
+# - Normal completion → ENDED
 # - FAILED leases past their end_at → ENDED
-# - Sets failed_at timestamp so retry_worker can pick it up
 # =============================================================================
+ABNORMAL_SLURM_STATES = {
+    "OUT_OF_MEMORY", "FAILED", "NODE_FAIL", "PREEMPTED", "TIMEOUT",
+}
+
 async def slurm_reconcile_worker():
     while True:
         try:
@@ -749,6 +754,15 @@ async def slurm_reconcile_worker():
             else:
                 squeue_results = {}
 
+            # ── Phase 2b: sacct for jobs that disappeared from squeue ───
+            gone_job_ids = [
+                c["slurm_job_id"] for c in checks
+                if squeue_results.get(c["slurm_job_id"]) is None
+            ]
+            if gone_job_ids:
+                sacct_results = await slurm.async_sacct_job_exit_info_batch(gone_job_ids)
+            else:
+                sacct_results = {}
 
             # ── Phase 3: apply state changes ────────────────────────────
             with SessionLocal() as db:
@@ -786,12 +800,25 @@ async def slurm_reconcile_worker():
                         )
                     ).scalars().first()
 
-                    if ep is None or ep.state in ("FAILED", "STARTING"):
+                    # Check sacct for abnormal exit reason
+                    exit_info = sacct_results.get(info["slurm_job_id"])
+                    sacct_state = exit_info["state"] if exit_info else None
+                    abnormal_exit = sacct_state in ABNORMAL_SLURM_STATES
+
+                    if ep is None or ep.state in ("FAILED", "STARTING") or abnormal_exit:
+                        # ── Abnormal termination → FAILED (eligible for retry) ──
                         old_ls = l.state
                         l.state = "FAILED"
                         l.failed_at = now
                         if ep:
                             ep.state = "FAILED"
+
+                        reason = (
+                            f"job gone from squeue, "
+                            f"sacct_state={sacct_state}, "
+                            f"exit_code={exit_info['exit_code'] if exit_info else '?'}, "
+                            f"endpoint was {ep.state if ep else 'missing'}"
+                        )
                         log_state_transition(
                             entity="lease",
                             entity_id=l.id,
@@ -799,9 +826,10 @@ async def slurm_reconcile_worker():
                             old_state=old_ls,
                             new_state="FAILED",
                             slurm_job_id=info["slurm_job_id"],
-                            reason=f"job gone from squeue, endpoint was {ep.state if ep else 'missing'}",
+                            reason=reason,
                         )
                     else:
+                        # ── Normal termination → ENDED ──
                         old_ls = l.state
                         if l.state not in ("CANCELED",):
                             l.state = "ENDED"
@@ -814,9 +842,8 @@ async def slurm_reconcile_worker():
                             old_state=old_ls,
                             new_state="ENDED",
                             slurm_job_id=info["slurm_job_id"],
-                            reason="job gone from squeue (was running normally)",
+                            reason=f"job gone from squeue, sacct_state={sacct_state} (normal completion)",
                         )
-
 
                 db.commit()
         except Exception as e:
@@ -980,12 +1007,13 @@ async def retry_worker():
 
 def reconcile_on_startup():
     """
-    On startup, cross-reference DB state with Slurm reality.
+    On startup, cross-reference DB state with Slurm reality (squeue + sacct).
 
-    Uses batched squeue calls to avoid blocking startup with N subprocess calls.
+    Uses batched squeue + sacct calls to avoid blocking startup with N subprocess calls.
 
     Handles:
     - Leases in SUBMITTED/STARTING/RUNNING whose Slurm jobs are gone → FAILED or ENDED
+      (uses sacct to distinguish OOM/crash from normal completion)
     - PLANNED leases whose end_at has already passed → ENDED
     - Endpoints in STARTING/READY whose Slurm jobs are gone → STOPPED
     """
@@ -1000,7 +1028,6 @@ def reconcile_on_startup():
                 Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING", "RETRYING"])
             )
         ).scalars().all()
-
 
         # Collect all job IDs we need to check
         lease_job_ids = [
@@ -1018,6 +1045,13 @@ def reconcile_on_startup():
             # Skip lease reconciliation but still handle PLANNED expiry below
             pass
         else:
+            # sacct for jobs that disappeared from squeue
+            gone_ids = [
+                l.slurm_job_id for l in active_leases
+                if l.slurm_job_id and job_states.get(l.slurm_job_id) is None
+            ]
+            sacct_info = slurm.sacct_job_exit_info_batch(gone_ids) if gone_ids else {}
+
             for lease in active_leases:
                 if not lease.slurm_job_id:
                     continue
@@ -1025,30 +1059,37 @@ def reconcile_on_startup():
                 state = job_states.get(lease.slurm_job_id)
 
                 if state is None:
-                    # Job is gone from Slurm
+                    # Job is gone from Slurm — check sacct for exit reason
                     ep = db.execute(
                         select(Endpoint).where(
                             Endpoint.slurm_job_id == lease.slurm_job_id
                         )
                     ).scalars().first()
 
-                    if ep and ep.state == "READY":
-                        # Was running fine, job ended (time limit, etc.)
+                    exit_info = sacct_info.get(lease.slurm_job_id)
+                    sacct_state = exit_info["state"] if exit_info else None
+                    abnormal_exit = sacct_state in ABNORMAL_SLURM_STATES
+
+                    if ep and ep.state == "READY" and not abnormal_exit:
+                        # Was running fine, job ended normally (time limit, etc.)
                         lease.state = "ENDED"
                         ep.state = "STOPPED"
                         print(
                             f"  reconcile: lease {lease.id} ({lease.model}) "
-                            f"→ ENDED (job {lease.slurm_job_id} gone, was READY)"
+                            f"→ ENDED (job {lease.slurm_job_id} gone, "
+                            f"sacct_state={sacct_state}, was READY)"
                         )
                     else:
-                        # Never became READY or was in STARTING
+                        # OOM, crash, never became READY, or was in STARTING
                         lease.state = "FAILED"
                         lease.failed_at = now
                         if ep:
                             ep.state = "FAILED"
                         print(
                             f"  reconcile: lease {lease.id} ({lease.model}) "
-                            f"→ FAILED (job {lease.slurm_job_id} gone from squeue)"
+                            f"→ FAILED (job {lease.slurm_job_id} gone, "
+                            f"sacct_state={sacct_state}, "
+                            f"endpoint was {ep.state if ep else 'missing'})"
                         )
                     changes += 1
                 else:

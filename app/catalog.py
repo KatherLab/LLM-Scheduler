@@ -19,6 +19,7 @@ class CatalogModel:
     cpus: int | None = None
     mem: str | None = None
     env: dict[str, str] | None = None
+    tags: list[str] | None = None
 
 def load_catalog(path: str) -> dict[str, CatalogModel]:
     p = Path(path)
@@ -39,6 +40,7 @@ def load_catalog(path: str) -> dict[str, CatalogModel]:
             cpus=int(item["cpus"]) if item.get("cpus") else None,
             mem=str(item["mem"]) if item.get("mem") else None,
             env=dict(item["env"]) if item.get("env") else None,
+            tags=list(item["tags"]) if item.get("tags") else None,
         )
         out[m.name] = m
     return out

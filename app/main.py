@@ -112,6 +112,7 @@ def v1_models():
             "owned_by": "local-slurm",
             "ready": name in ready,
             "meta": {"gpus": m.gpus, "tensor_parallel_size": m.tensor_parallel_size, "notes": m.notes},
+            "tags": m.tags or [],
         })
     return OpenAIModelsResponse(data=data)
 

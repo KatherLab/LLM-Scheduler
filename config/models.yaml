@@ -11,9 +11,9 @@ models:
       --no-async-scheduling
       --max-num-batched-tokens 16384
     reasoning_parser: qwen3
+    tags: [vision,reasoning]
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
     venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
-    notes: "Qwen3.5 397B FP8, native multimodality"
 
   - name: Qwen3.5-397B-A17B
     model_path: /mnt/models/Qwen_Qwen3.5-397B-A17B
@@ -30,7 +30,6 @@ models:
     reasoning_parser: qwen3
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
     venv_activate: /root/vllm-nightly-23022026/.venv/bin/activate
-    notes: "Qwen3.5 full precision"
 
   - name: Qwen3-VL-235B-A22B-Thinking-FP8
     model_path: /mnt/models/Qwen_Qwen3-VL-235B-A22B-Thinking-FP8
@@ -48,7 +47,6 @@ models:
     reasoning_parser: deepseek_r1
     tool_args: "--enable-auto-tool-choice --tool-call-parser hermes"
     venv_activate: /root/vllm-0.15.1/.venv/bin/activate
-    notes: "Qwen3-VL 235B Thinking FP8 (2 GPUs, FLASHINFER attention)"
 
   - name: Qwen3-VL-235B-A22B-Instruct-FP8
     model_path: /mnt/models/Qwen_Qwen3-VL-235B-A22B-Instruct-FP8
@@ -63,7 +61,6 @@ models:
       --max-model-len 100000
     tool_args: "--enable-auto-tool-choice --tool-call-parser hermes"
     venv_activate: /root/vllm-0.15.1/.venv/bin/activate
-    notes: "Qwen3-VL 235B Instruct FP8 (2 GPUs, no reasoning parser)"
 
   - name: GLM-5-FP8
     model_path: /mnt/models/zai-org_GLM-5-FP8
@@ -83,7 +80,6 @@ models:
     reasoning_parser: glm45
     tool_args: "--enable-auto-tool-choice --tool-call-parser glm47"
     venv_activate: /root/vllm-glm5/.venv/bin/activate
-    notes: "GLM-5-FP8 (8 GPUs, xgrammar structured outputs, MTP speculative config)"
 
   - name: GLM-4.7-FP8
     model_path: /mnt/models/zai-org_GLM-4.7-FP8
@@ -103,7 +99,6 @@ models:
     reasoning_parser: glm45
     tool_args: "--enable-auto-tool-choice --tool-call-parser glm47"
     venv_activate: /root/vllm-0.15.1/.venv/bin/activate
-    notes: "GLM‑4.7‑FP8 model entry (port & API‑key injected by scheduler proxy)"
 
   - name: GLM-4.6V-FP8
     model_path: /mnt/models/zai-org_GLM-4.6V-FP8
@@ -116,7 +111,6 @@ models:
     reasoning_parser: glm45
     tool_args: "--enable-auto-tool-choice --tool-call-parser glm45"
     venv_activate: /root/vllm-0.15.0-transformers5/.venv/bin/activate
-    notes: "Vision model with xgrammar and FLASHINFER attention"
 
   - name: GPT-OSS-120B
     model_path: /mnt/models/openai_gpt-oss-120b
@@ -136,7 +130,6 @@ models:
       VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
       CUDA_LAUNCH_BLOCKING: "0"
       TRITON_PTXAS_PATH: "/usr/local/cuda/bin/ptxas"
-    notes: "GPT-OSS 120B (FLASHINFER MoE MXFP4/MXFP8, xgrammar structured outputs)"
 
   - name: Kimi-K2.5
     model_path: /mnt/models/moonshotai_Kimi-K2.5
@@ -156,7 +149,6 @@ models:
     reasoning_parser: kimi_k2
     tool_args: "--enable-auto-tool-choice --tool-call-parser kimi_k2"
     venv_activate: /root/vllm-0.15.0-transformers5/.venv/bin/activate
-    notes: "Kimi-K2.5 (8 GPUs, xgrammar structured outputs, multimodal support)"
 
   - name: Qwen3-0.6B-FP8
     model_path: Qwen/Qwen3-0.6B-FP8

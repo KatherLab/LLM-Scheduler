@@ -62,6 +62,7 @@ async function api(path, opts = {}) {
 // ─── Global State ───────────────────────────────────────────────────────────
 let DASH = null;
 let MODEL_MAP = new Map();
+let selectedTags = new Set();
 let REFRESH_INTERVAL = null;
 
 // ─── Scroll Tracking ────────────────────────────────────────────────────────
@@ -208,6 +209,7 @@ async function refresh() {
     MODEL_MAP = new Map(DASH.models.map(m => [m.id, m]));
     $('#subtitle').textContent = `${DASH.total_gpus} GPUs · ${fmtTime(new Date(DASH.now))}`;
     renderCatalog();
+    renderTagFilters();
     renderTimeline();
     renderTable();
     renderStatusIndicators();
@@ -256,6 +258,52 @@ function renderStatusIndicators() {
   container.innerHTML = html;
 }
 
+
+// ─── Tag Filter Chips ───────────────────────────────────────────────────────
+function renderTagFilters() {
+  const container = $('#tagFilters');
+  if (!DASH) { container.innerHTML = ''; return; }
+
+  // Collect all unique tags across all models
+  const allTags = new Set();
+  for (const m of DASH.models) {
+    const tags = m.meta?.tags || [];
+    tags.forEach(t => allTags.add(t));
+  }
+
+  // Sort alphabetically
+  const sorted = [...allTags].sort();
+
+  if (sorted.length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+
+  container.innerHTML = sorted.map(tag => {
+    const isActive = selectedTags.has(tag);
+    const activeClass = isActive
+      ? 'bg-brand-600/30 border-brand-500/70 text-brand-300'
+      : 'bg-slate-100 dark:bg-slate-800 border-gray-300 dark:border-slate-600 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700';
+    return `<button class="tag-chip px-2 py-0.5 text-xs rounded-full border transition cursor-pointer ${activeClass}"
+              data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`;
+  }).join('');
+
+  // Click handlers
+  container.querySelectorAll('.tag-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const tag = chip.dataset.tag;
+      if (selectedTags.has(tag)) {
+        selectedTags.delete(tag);
+      } else {
+        selectedTags.add(tag);
+      }
+      renderTagFilters();  // re-render chips (active state)
+      renderCatalog();     // re-filter model list
+    });
+  });
+}
+
+
 // ─── Catalog Rendering (with drag support) ──────────────────────────────────
 function renderCatalog() {
   const q = $('#searchInput').value.trim().toLowerCase();
@@ -266,6 +314,14 @@ function renderCatalog() {
       if (q && !m.id.toLowerCase().includes(q)) return false;
       if (filter === 'ready' && !m.ready) return false;
       if (filter === 'stopped' && m.ready) return false;
+
+      if (selectedTags.size > 0) {
+        const modelTags = new Set(m.meta?.tags || []);
+        for (const t of selectedTags) {
+          if (!modelTags.has(t)) return false;
+        }
+      }
+
       return true;
     })
     .sort((a, b) => a.id.localeCompare(b.id));
@@ -304,8 +360,13 @@ function renderCatalog() {
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
             <div class="font-semibold text-sm break-all">${escapeHtml(m.id)}</div>
-            <div class="mt-1 text-xs text-slate-500 font-mono">${g} GPUs · TP ${tp}</div>
+            <div class="mt-1 text-xs text-slate-500 font-mono">${g} GPUs</div>
             ${notes ? `<div class="mt-1 text-xs text-slate-500 italic">${escapeHtml(notes)}</div>` : ''}
+            ${(meta.tags && meta.tags.length > 0)
+              ? `<div class="mt-1.5 flex flex-wrap gap-1">${meta.tags.map(t =>
+                  `<span class="inline-block px-1.5 py-0.5 text-[10px] rounded-full bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-slate-600">${escapeHtml(t)}</span>`
+                ).join('')}</div>`
+              : ''}
             ${statsHtml}
           </div>
           <div class="shrink-0">${badge}</div>
@@ -495,6 +556,8 @@ function openLogModal(leaseId) {
   logModalBackdrop.classList.remove('hidden');
   logModalBackdrop.setAttribute('aria-hidden', 'false');
 
+  document.body.style.overflow = 'hidden';
+
   fetchLogs(leaseId);
 }
 
@@ -503,6 +566,8 @@ function closeLogModal() {
   logModalBackdrop.setAttribute('aria-hidden', 'true');
   logState.leaseId = null;
   logState.data = null;
+
+  document.body.style.overflow = '';
 }
 
 $('#logModalClose').addEventListener('click', closeLogModal);
@@ -643,11 +708,15 @@ function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = 
 
   modalBackdrop.classList.remove('hidden');
   modalBackdrop.setAttribute('aria-hidden', 'false');
+
+  document.body.style.overflow = 'hidden';
 }
 
 function closeModal() {
   modalBackdrop.classList.add('hidden');
   modalBackdrop.setAttribute('aria-hidden', 'true');
+
+  document.body.style.overflow = '';
 }
 
 $('#modalClose').addEventListener('click', closeModal);

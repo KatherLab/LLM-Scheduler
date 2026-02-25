@@ -1226,8 +1226,11 @@ function onPointerDown(e) {
       startDrag(e, 'resize-right', lease, pt);
     } else if (lease.state === 'PLANNED' && !handleType) {
       startDrag(e, 'move', lease, pt);
+    } else if (!handleType) {
+      // Non-PLANNED block body click: start a 'select' pseudo-drag
+      // so that onPointerUp can detect the lease and show the popover
+      startDrag(e, 'select', lease, pt);
     }
-    // For non-PLANNED, clicking body opens popover (handled in pointerUp)
     return;
   }
 

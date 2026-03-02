@@ -52,6 +52,4 @@ class Settings(BaseSettings):
     slurm_mail_type: str = Field(default="FAIL,END,TIME_LIMIT", alias="SLURM_MAIL_TYPE")
 
 
-
-
 settings = Settings()

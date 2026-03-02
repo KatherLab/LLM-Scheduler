@@ -1,0 +1,14 @@
+  - name: Qwen3-0.6B-FP8
+    model_path: Qwen/Qwen3-0.6B-FP8
+    tags: []
+    gpus: 1
+    tensor_parallel_size: 1
+    cpus: 4
+    mem: "16G"
+    gpu_memory_utilization: 0.03
+    reasoning_parser: deepseek_r1
+    extra_args: "--max-num-seqs 10 --enforce-eager --max-model-len 2048"
+    venv_activate: /root/vllm-env/.venv/bin/activate
+    notes: "small test model"
+    env:
+      VLLM_SOME_FLAG: "1"

@@ -1,15 +1,32 @@
 models:
   - name: Qwen3-0.6B-FP8
     model_path: Qwen/Qwen3-0.6B-FP8
-    tags: []
+    tags: [reasoning]
     gpus: 1
     tensor_parallel_size: 1
     cpus: 4
     mem: "16G"
-    gpu_memory_utilization: 0.03
+    gpu_memory_utilization: 0.1
     reasoning_parser: deepseek_r1
     extra_args: "--max-num-seqs 10 --enforce-eager --max-model-len 2048"
-    venv_activate: /root/vllm-env/.venv/bin/activate
+    venv_activate: /path/to/.venv/bin/activate
     notes: "small test model"
     env:
       VLLM_SOME_FLAG: "1"
+
+  # Example for 4x H200
+  - name: Qwen3.5-397B-A17B-FP8
+    model_path: Qwen/Qwen3.5-397B-A17B-FP8
+    gpus: 4
+    tensor_parallel_size: 4
+    cpus: 32
+    mem: "500G"
+    gpu_memory_utilization: 0.95
+    extra_args: >
+      --mm-processor-cache-gb 10
+      --enable-prefix-caching
+      --max-num-batched-tokens 16384
+    reasoning_parser: qwen3
+    tags: [vision,reasoning]
+    tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
+    venv_activate: /path/to/vllm-nightly/.venv/bin/activate

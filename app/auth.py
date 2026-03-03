@@ -143,6 +143,39 @@ def require_internal_token(request: Request) -> None:
     raise HTTPException(status_code=403, detail="Invalid internal token")
 
 
+def require_schedule_key(request: Request) -> None:
+    """
+    Verify that the request carries the read-only schedule API key.
+    Used for external dashboards / status pages that need read-only access
+    to the schedule and model catalog.
+
+    Accepts:
+      - Authorization: Bearer <SCHEDULE_API_KEY>
+      - ?token=<SCHEDULE_API_KEY>
+
+    Returns 403 if the key is missing/wrong, or if SCHEDULE_API_KEY is not configured.
+    """
+    expected = settings.schedule_api_key
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="Schedule API is not configured (SCHEDULE_API_KEY is empty)",
+        )
+
+    auth_header = request.headers.get("authorization", "")
+    token = request.query_params.get("token", "")
+
+    if auth_header.startswith("Bearer "):
+        provided = auth_header[7:].strip()
+        if hmac.compare_digest(provided, expected):
+            return
+
+    if token and hmac.compare_digest(token, expected):
+        return
+
+    raise HTTPException(status_code=403, detail="Invalid schedule API key")
+
+
 # ── Auth router (login/logout pages + API) ───────────────────────────────────
 
 auth_router = APIRouter(tags=["auth"])

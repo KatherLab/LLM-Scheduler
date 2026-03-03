@@ -102,3 +102,32 @@ class LogResponse(BaseModel):
     log_stdout: str
     log_stderr: str
     truncated: bool = False
+
+class PublicModelInfo(BaseModel):
+    """Model from the catalog, with availability status."""
+    name: str
+    gpus: int
+    tensor_parallel_size: int
+    tags: list[str] = []
+    notes: str = ""
+    ready: bool = False  # True if currently running and healthy
+
+class PublicLeaseInfo(BaseModel):
+    """A scheduled booking (read-only view)."""
+    id: int
+    model: str
+    state: str
+    requested_gpus: int
+    begin_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    notes: Optional[str] = None
+    lane_start: Optional[int] = None
+    lane_count: Optional[int] = None
+    conflict: bool = False
+
+class PublicScheduleResponse(BaseModel):
+    """Full read-only schedule snapshot."""
+    now: datetime
+    total_gpus: int
+    models: list[PublicModelInfo]
+    leases: list[PublicLeaseInfo]

@@ -396,12 +396,18 @@
           <div id="modalModelMeta" class="mt-1.5 text-xs text-slate-500"></div>
         </div>
 
-        <!-- Notes -->
+        <!-- Notes (required — name + optional reason) -->
         <div>
-          <label class="block text-sm font-medium mb-1">Notes <span class="text-slate-500 font-normal">(optional)</span></label>
-          <textarea id="modalNotes" rows="2" placeholder="Who booked it, why, hints for others…"
-            class="w-full px-3 py-2.5 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 resize-y"></textarea>
+          <label class="block text-sm font-medium mb-1">Who & Why <span class="text-red-400">*</span></label>
+          <textarea id="modalNotes" rows="2"
+            placeholder="Your name + short reason, e.g. 'Alice — benchmarking radiology model'"
+            class="w-full px-3 py-2.5 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 resize-y"
+            required></textarea>
+          <div class="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            Please enter your name so others know who booked this slot. Optional: Provide brief reason to help with scheduling coordination.
+          </div>
         </div>
+
 
         <!-- GPU display (read-only from catalog) -->
         <div class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">

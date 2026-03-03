@@ -681,7 +681,7 @@ function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = 
 
   // Populate notes from existing lease if editing
   const existingLease = leaseId ? DASH?.leases?.find(l => l.id === leaseId) : null;
-  $('#modalNotes').value = existingLease?.notes || '';
+  $('#modalNotes').value = existingLease?.notes || '';')'
 
   populateModalModels(model);
 
@@ -922,6 +922,8 @@ $('#modalSave').addEventListener('click', async () => {
     $('#modalError').classList.add('hidden');
     const model = $('#modalModel').value;
     if (!model) { showModalError("Please choose a model."); return; }
+
+    if (!$('#modalNotes').value.trim()) { showModalError("Please enter your name so others know who booked this."); return; }
 
     const durationHours = modalState.durationHours;
     if (durationHours < 1) { showModalError("Duration must be at least 1 hour."); return; }

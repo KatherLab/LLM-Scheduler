@@ -108,6 +108,10 @@ Open `.env` in a text editor and adjust:
 
 ### 5. Configure your models
 
+```bash
+cp config/models.example.yaml config/models.yaml
+```
+
 Edit `config/models.yaml` to list the models you want to make available. Each entry specifies the model path, how many GPUs it needs, and any special vLLM arguments:
 
 ```yaml

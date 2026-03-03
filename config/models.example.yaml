@@ -1,3 +1,4 @@
+models:
   - name: Qwen3-0.6B-FP8
     model_path: Qwen/Qwen3-0.6B-FP8
     tags: []

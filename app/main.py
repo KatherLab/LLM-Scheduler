@@ -11,13 +11,13 @@ from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 
 from .settings import settings
-from .dependencies import SessionLocal, init_db  # <-- shared engine
+from .dependencies import SessionLocal, init_db
 from .models import Endpoint, Lease
 from .catalog import get_catalog
 from .schemas import OpenAIModelsResponse
 from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
-from .proxy import proxy_json_or_stream
+from .proxy import proxy_json_or_stream, proxy_multipart
 from .admin import internal_router
 from . import slurm
 from .utils import ensure_utc
@@ -140,6 +140,14 @@ async def _get_model_from_body(request: Request) -> str:
     return model
 
 
+async def _get_model_from_multipart(request: Request) -> str:
+    form = await request.form()
+    model = form.get("model")
+    if not model:
+        raise HTTPException(status_code=400, detail="Missing 'model' in multipart form data")
+    return str(model)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.body()
@@ -223,6 +231,29 @@ async def cancel_response(response_id: str, request: Request):
         upstream_url=f"{upstream}/v1/responses/{response_id}/cancel",
         body=body,
         is_stream=False,
+    )
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(request: Request):
+    model = await _get_model_from_multipart(request)
+    with SessionLocal() as db:
+        upstream = _resolve_upstream(db, model)
+
+    return await proxy_multipart(
+        request,
+        upstream_url=f"{upstream}/v1/audio/transcriptions",
+    )
+
+
+@app.post("/v1/audio/translations")
+async def audio_translations(request: Request):
+    model = await _get_model_from_multipart(request)
+    with SessionLocal() as db:
+        upstream = _resolve_upstream(db, model)
+
+    return await proxy_multipart(
+        request,
+        upstream_url=f"{upstream}/v1/audio/translations",
     )
 
 

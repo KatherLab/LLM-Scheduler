@@ -5,7 +5,7 @@ import json
 from typing import AsyncIterator
 import httpx
 from fastapi import Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -223,4 +223,67 @@ async def proxy_json_or_stream(
                 code="proxy_internal_error",
             )
 
+        return JSONResponse(status_code=status, content=payload)
+
+
+async def proxy_multipart(
+    request: Request,
+    upstream_url: str,
+    *,
+    timeout_s: float = 600.0,
+) -> Response:
+    """
+    Proxy multipart/form-data requests (e.g. OpenAI audio transcription).
+    Reads the form, forwards fields + files to upstream.
+    """
+    client = await _get_client(timeout_s)
+
+    # Copy headers, but let httpx rebuild Content-Type for multipart boundary
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    headers.pop("content-length", None)
+    headers.pop("content-type", None)
+
+    try:
+        form = await request.form()
+
+        data: dict[str, str] = {}
+        files: list[tuple[str, tuple[str, bytes, str]]] = []
+
+        # form.multi_items() preserves repeated keys (e.g. timestamp_granularities[])
+        for key, value in form.multi_items():
+            # Starlette UploadFile has .filename and .content_type
+            if hasattr(value, "filename"):
+                upload = value
+                content = await upload.read()
+                files.append(
+                    (
+                        key,
+                        (
+                            upload.filename or "upload",
+                            content,
+                            upload.content_type or "application/octet-stream",
+                        ),
+                    )
+                )
+            else:
+                data[key] = str(value)
+
+        r = await client.post(upstream_url, data=data, files=files, headers=headers)
+
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            headers=_filter_headers(r.headers),
+        )
+
+    except Exception as e:
+        status = _status_for_httpx_exc(e)
+        payload = _openai_error(
+            "Upstream request timed out" if status == 504 else
+            ("Upstream connection error" if status == 502 else "Internal proxy error"),
+            type_="api_error",
+            code="upstream_timeout" if status == 504 else
+                 ("upstream_connection_error" if status == 502 else "proxy_internal_error"),
+        )
         return JSONResponse(status_code=status, content=payload)

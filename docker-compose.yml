@@ -1,0 +1,65 @@
+services:
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-scheduler
+    restart: unless-stopped
+
+    # ── Port mapping ────────────────────────────────────────────────
+    # Left side = host port (what users + Slurm jobs connect to)
+    # Right side = container port (always 9000)
+    #
+    # IMPORTANT: ROUTER_PORT in .env MUST match the left side!
+    # e.g., if you map 8080:9000, set ROUTER_PORT=8080 in .env
+    ports:
+      - "${ROUTER_PORT:-9000}:9000"
+
+    env_file:
+      - .env
+
+    environment:
+      - DATABASE_URL=sqlite:////app/data/router.db
+      - VLLM_LOG_DIR=/app/logs
+      - SBATCH_TEMPLATE_PATH=/app/templates/vllm_job.sh
+
+    # ── Extra hosts ─────────────────────────────────────────────────
+    # Allow the container to reach the host via "host.docker.internal"
+    # (useful if PUBLIC_HOSTNAME is set to the machine's real IP/hostname,
+    # this isn't strictly needed — but helps for local testing)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # ── Persistent data ──────────────────────────────────────────
+      - scheduler-data:/app/data
+
+      # ── Model catalog ────────────────────────────────────────────
+      - ./config/models.yaml:/app/config/models.yaml:ro
+
+      # ── Slurm logs (shared with host) ────────────────────────────
+      # Slurm jobs write stdout/stderr here on the HOST.
+      # The scheduler reads them via /admin/leases/{id}/logs.
+      # These MUST be the same physical directory.
+      - ${VLLM_LOG_DIR:-./logs}:/app/logs
+
+      # ── Slurm binaries (custom build at /usr/bin) ────────────────
+      - /usr/bin/sbatch:/usr/bin/sbatch:ro
+      - /usr/bin/scancel:/usr/bin/scancel:ro
+      - /usr/bin/scontrol:/usr/bin/scontrol:ro
+      - /usr/bin/squeue:/usr/bin/squeue:ro
+      - /usr/bin/sacct:/usr/bin/sacct:ro
+
+      # ── Slurm shared library ─────────────────────────────────────
+      - /usr/lib/x86_64-linux-gnu/slurm:/usr/lib/x86_64-linux-gnu/slurm:ro
+
+      # ── Slurm config + Munge auth ───────────────────────────────
+      - /etc/slurm:/etc/slurm:ro
+      - /etc/munge:/etc/munge:ro
+      - /var/run/munge:/var/run/munge
+
+    # Run as the same UID/GID that has Slurm submit permissions
+    user: "${UID:-0}:${GID:-0}"
+
+volumes:
+  scheduler-data:

@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+.env
+router.db
+logs/
+data/
+.venv/
+.ruff_cache/
+*.egg-info/

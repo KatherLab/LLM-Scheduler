@@ -31,14 +31,34 @@ if [ "${REGISTERED}" -eq 0 ]; then
   echo "Warning: failed to register endpoint after 12 attempts — continuing anyway"
 fi
 
+# Build argv safely
+CMD=(
+  vllm serve "${MODEL_PATH}"
+  --served-model-name "${SERVED_MODEL_NAME}"
+  --tensor-parallel-size "${TP_SIZE}"
+  --host 0.0.0.0
+  --port "${PORT}"
+  --api-key "${API_KEY}"
+  --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}"
+)
+
+if [[ -n "${REASONING_PARSER:-}" ]]; then
+  CMD+=(--reasoning-parser "${REASONING_PARSER}")
+fi
+
+# Parse string-style extra args/tool args with shell quoting preserved.
+# These values must come from trusted config only.
+if [[ -n "${TOOL_ARGS:-}" ]]; then
+  eval "CMD+=( ${TOOL_ARGS} )"
+fi
+
+if [[ -n "${EXTRA_ARGS:-}" ]]; then
+  eval "CMD+=( ${EXTRA_ARGS} )"
+fi
+
+echo "Launching command:"
+printf '  %q' "${CMD[@]}"
+echo
+
 # Start vLLM — job lifetime == vLLM lifetime
-exec vllm serve "${MODEL_PATH}" \
-  --served-model-name "${SERVED_MODEL_NAME}" \
-  --tensor-parallel-size "${TP_SIZE}" \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
-  --api-key "${API_KEY}" \
-  --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}" \
-  ${REASONING_PARSER:+--reasoning-parser "${REASONING_PARSER}"} \
-  ${TOOL_ARGS:-} \
-  ${EXTRA_ARGS:-}
+exec "${CMD[@]}"

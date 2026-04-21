@@ -834,50 +834,33 @@ async def slurm_reconcile_worker():
                         )
                     ).scalars().first()
 
-                    # Check sacct for abnormal exit reason
+                    # Check sacct for exit info (always restart, even on clean exit)
                     exit_info = sacct_results.get(info["slurm_job_id"])
                     sacct_state = exit_info["state"] if exit_info else None
-                    abnormal_exit = sacct_state in ABNORMAL_SLURM_STATES
 
-                    if ep is None or ep.state in ("FAILED", "STARTING") or abnormal_exit:
-                        # ── Abnormal termination → FAILED (eligible for retry) ──
-                        old_ls = l.state
-                        l.state = "FAILED"
-                        l.failed_at = now
-                        if ep:
-                            ep.state = "FAILED"
+                    # ── Job disappeared from squeue → always restart (even on clean exit) ──
+                    # Some vLLM crashes exit cleanly with code 0, so we can't rely on exit code alone.
+                    # The scheduler should always restart the model when the Slurm job is gone.
+                    old_ls = l.state
+                    l.state = "FAILED"
+                    l.failed_at = now
+                    if ep:
+                        ep.state = "FAILED"
 
-                        reason = (
-                            f"job gone from squeue, "
-                            f"sacct_state={sacct_state}, "
-                            f"exit_code={exit_info['exit_code'] if exit_info else '?'}, "
-                            f"endpoint was {ep.state if ep else 'missing'}"
-                        )
-                        log_state_transition(
-                            entity="lease",
-                            entity_id=l.id,
-                            model=l.model,
-                            old_state=old_ls,
-                            new_state="FAILED",
-                            slurm_job_id=info["slurm_job_id"],
-                            reason=reason,
-                        )
-                    else:
-                        # ── Normal termination → ENDED ──
-                        old_ls = l.state
-                        if l.state not in ("CANCELED",):
-                            l.state = "ENDED"
-                        if ep:
-                            ep.state = "STOPPED"
-                        log_state_transition(
-                            entity="lease",
-                            entity_id=l.id,
-                            model=l.model,
-                            old_state=old_ls,
-                            new_state="ENDED",
-                            slurm_job_id=info["slurm_job_id"],
-                            reason=f"job gone from squeue, sacct_state={sacct_state} (normal completion)",
-                        )
+                    reason = (
+                        f"job gone from squeue, "
+                        f"sacct_state={sacct_state}, "
+                        f"exit_code={exit_info['exit_code'] if exit_info else '?'}"
+                    )
+                    log_state_transition(
+                        entity="lease",
+                        entity_id=l.id,
+                        model=l.model,
+                        old_state=old_ls,
+                        new_state="FAILED",
+                        slurm_job_id=info["slurm_job_id"],
+                        reason=reason,
+                    )
 
                 db.commit()
         except Exception as e:
@@ -1102,29 +1085,18 @@ def reconcile_on_startup():
 
                     exit_info = sacct_info.get(lease.slurm_job_id)
                     sacct_state = exit_info["state"] if exit_info else None
-                    abnormal_exit = sacct_state in ABNORMAL_SLURM_STATES
 
-                    if ep and ep.state == "READY" and not abnormal_exit:
-                        # Was running fine, job ended normally (time limit, etc.)
-                        lease.state = "ENDED"
-                        ep.state = "STOPPED"
-                        print(
-                            f"  reconcile: lease {lease.id} ({lease.model}) "
-                            f"→ ENDED (job {lease.slurm_job_id} gone, "
-                            f"sacct_state={sacct_state}, was READY)"
-                        )
-                    else:
-                        # OOM, crash, never became READY, or was in STARTING
-                        lease.state = "FAILED"
-                        lease.failed_at = now
-                        if ep:
-                            ep.state = "FAILED"
-                        print(
-                            f"  reconcile: lease {lease.id} ({lease.model}) "
-                            f"→ FAILED (job {lease.slurm_job_id} gone, "
-                            f"sacct_state={sacct_state}, "
-                            f"endpoint was {ep.state if ep else 'missing'})"
-                        )
+                    # Job disappeared from squeue → always restart (even on clean exit).
+                    # Some vLLM crashes exit cleanly with code 0, so we can't rely on exit code alone.
+                    lease.state = "FAILED"
+                    lease.failed_at = now
+                    if ep:
+                        ep.state = "FAILED"
+                    print(
+                        f"  reconcile: lease {lease.id} ({lease.model}) "
+                        f"→ FAILED (job {lease.slurm_job_id} gone, "
+                        f"sacct_state={sacct_state})"
+                    )
                     changes += 1
                 else:
                     print(

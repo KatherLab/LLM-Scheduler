@@ -484,6 +484,30 @@ async def proxy_json_or_stream(
     )
 
 
+async def proxy_get(
+    request: Request,
+    upstream_url: str,
+    *,
+    timeout_s: float = 30.0,
+):
+    """
+    Proxy a GET request to upstream and return the buffered response.
+
+    Used for endpoints like /metrics that don't need streaming or JSON
+    request bodies.
+    """
+    client = await _get_client()
+    headers = dict(request.headers)
+    headers.pop("host", None)
+
+    resp = await client.get(upstream_url, headers=headers, timeout=timeout_s)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=_filter_headers(resp.headers),
+    )
+
+
 async def proxy_multipart(
     request: Request,
     upstream_url: str,

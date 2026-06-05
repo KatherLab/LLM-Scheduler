@@ -17,7 +17,7 @@ from .catalog import get_catalog
 from .schemas import OpenAIModelsResponse
 from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
-from .proxy import proxy_json_or_stream, proxy_multipart
+from .proxy import proxy_get, proxy_json_or_stream, proxy_multipart
 from .admin import internal_router
 from .public_api import router as public_api_router
 from . import slurm
@@ -257,6 +257,14 @@ async def audio_translations(request: Request):
         request,
         upstream_url=f"{upstream}/v1/audio/translations",
     )
+
+
+@app.get("/metrics")
+async def metrics(request: Request, model: str):
+    """Proxy the vLLM Prometheus metrics endpoint for a given model."""
+    with SessionLocal() as db:
+        upstream = _resolve_upstream(db, model)
+    return await proxy_get(request, upstream_url=f"{upstream}/metrics")
 
 
 # =============================================================================

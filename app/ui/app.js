@@ -549,7 +549,6 @@ function renderCatalog() {
       const uptime = ep.uptime_seconds ? formatDuration(Math.floor(ep.uptime_seconds)) : '—';
       statsHtml = `<div class="mt-1.5 text-xs text-slate-500 flex items-center gap-3">
         <span>⏱ Uptime: ${uptime}</span>
-        <span>📡 ${ep.host}:${ep.port}</span>
         ${ep.vllm_version ? `<span>⚡ vLLM ${ep.vllm_version}</span>` : ''}
       </div>`;
     }

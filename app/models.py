@@ -93,4 +93,6 @@ class Endpoint(Base):
         Integer, default=0, server_default="0"
     )
 
+    vllm_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
 Index("ix_endpoints_model_state", Endpoint.model, Endpoint.state)

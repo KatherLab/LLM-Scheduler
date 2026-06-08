@@ -370,6 +370,7 @@ def dashboard():
                 slurm_job_id=e.slurm_job_id,
                 last_health_at=e.last_health_at,
                 uptime_seconds=uptime,
+                vllm_version=e.vllm_version,
             ))
 
         return DashboardResponse(
@@ -399,7 +400,8 @@ def list_endpoints():
         eps = db.execute(select(Endpoint).order_by(Endpoint.id.desc())).scalars().all()
         return [EndpointOut(
             id=e.id, model=e.model, host=e.host, port=e.port, slurm_job_id=e.slurm_job_id, state=e.state,
-            last_health_at=e.last_health_at, last_error=e.last_error, created_at=e.created_at
+            last_health_at=e.last_health_at, last_error=e.last_error, created_at=e.created_at,
+            vllm_version=e.vllm_version,
         ) for e in eps]
 
 @router.post("/leases", response_model=LeaseOut)
@@ -728,13 +730,15 @@ def register_endpoint(req: EndpointRegister, _: None = Depends(require_internal_
             existing.model = req.model
             existing.host = req.host
             existing.port = req.port
+            if req.vllm_version:
+                existing.vllm_version = req.vllm_version
             if existing.state not in ("READY",):
                 existing.state = "STARTING"
             db.commit()
             db.refresh(existing)
             e = existing
         else:
-            e = Endpoint(model=req.model, host=req.host, port=req.port, slurm_job_id=req.slurm_job_id, state="STARTING")
+            e = Endpoint(model=req.model, host=req.host, port=req.port, slurm_job_id=req.slurm_job_id, vllm_version=req.vllm_version, state="STARTING")
             db.add(e)
             db.commit()
             db.refresh(e)
@@ -751,6 +755,6 @@ def register_endpoint(req: EndpointRegister, _: None = Depends(require_internal_
             id=e.id, model=e.model, host=e.host, port=e.port,
             slurm_job_id=e.slurm_job_id, state=e.state,
             last_health_at=e.last_health_at, last_error=e.last_error,
-            created_at=e.created_at
+            created_at=e.created_at, vllm_version=e.vllm_version,
         )
 

@@ -8,6 +8,10 @@ if [[ -n "${VENV_ACTIVATE:-}" ]]; then
   source "${VENV_ACTIVATE}"
 fi
 
+# Capture vLLM version before launching
+VLLM_VERSION="$(vllm --version 2>&1 | head -1 | tr -d '"' || true)"
+echo "vLLM version: ${VLLM_VERSION}"
+
 # Get a free port
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')"
 echo "Assigned Port: ${PORT}"
@@ -18,7 +22,7 @@ for i in $(seq 1 12); do
   if curl -fsS -X POST "${ROUTER_REGISTER_URL}" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${API_KEY}" \
-    -d "{\"slurm_job_id\":\"${SLURM_JOB_ID}\",\"model\":\"${SERVED_MODEL_NAME}\",\"host\":\"${SLURMD_NODENAME}\",\"port\":${PORT}}"; then
+    -d "{\"slurm_job_id\":\"${SLURM_JOB_ID}\",\"model\":\"${SERVED_MODEL_NAME}\",\"host\":\"${SLURMD_NODENAME}\",\"port\":${PORT},\"vllm_version\":\"${VLLM_VERSION}\"}"; then
     REGISTERED=1
     echo "Registered with router on attempt ${i}"
     break

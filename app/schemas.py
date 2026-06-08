@@ -56,6 +56,7 @@ class EndpointRegister(BaseModel):
     model: str
     host: str
     port: int
+    vllm_version: Optional[str] = None
 
 class EndpointOut(BaseModel):
     id: int
@@ -67,6 +68,7 @@ class EndpointOut(BaseModel):
     last_health_at: Optional[datetime]
     last_error: Optional[str]
     created_at: datetime
+    vllm_version: Optional[str] = None
 
 class OpenAIModelsResponse(BaseModel):
     object: str = "list"
@@ -89,6 +91,7 @@ class EndpointStats(BaseModel):
     pending_requests: Optional[int] = None
     gpu_cache_usage: Optional[float] = None
     uptime_seconds: Optional[float] = None
+    vllm_version: Optional[str] = None
 
 class DashboardResponse(BaseModel):
     now: datetime

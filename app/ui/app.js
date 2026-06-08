@@ -527,6 +527,7 @@ function renderCatalog() {
       statsHtml = `<div class="mt-1.5 text-xs text-slate-500 flex items-center gap-3">
         <span>⏱ Uptime: ${uptime}</span>
         <span>📡 ${ep.host}:${ep.port}</span>
+        ${ep.vllm_version ? `<span>⚡ ${ep.vllm_version}</span>` : ''}
       </div>`;
     }
 
@@ -1179,6 +1180,7 @@ function showBlockPopover(lease, anchorX, anchorY) {
       <div class="flex items-center gap-3 text-xs text-slate-400">
         <span>⏱ ${uptime}</span>
         <span>📡 ${epStats.host}:${epStats.port}</span>
+        ${epStats.vllm_version ? `<span>⚡ ${epStats.vllm_version}</span>` : ''}
       </div>
     `;
   } else {

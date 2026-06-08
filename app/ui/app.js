@@ -396,7 +396,7 @@ function renderMetricsPopover() {
         html += `<span><span class="text-amber-300 font-medium">${ep.pending_requests}</span> waiting</span>`;
       }
       if (ep.throughput_tps != null && ep.throughput_tps > 0) {
-        html += `<span title="Generation tokens per second (counter delta since last poll)"><span class="text-slate-300 font-medium">${ep.throughput_tps.toFixed(1)}</span> tok/s</span>`;
+        html += `<span title="Generation tokens per second"><span class="text-slate-300 font-medium">${ep.throughput_tps.toFixed(1)}</span> tok/s</span>`;
       }
       html += `<span>⏱ ${uptime}</span>`;
       if (ep.vllm_version) {

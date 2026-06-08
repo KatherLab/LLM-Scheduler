@@ -311,24 +311,28 @@ function renderMetricsPopover() {
   }
 
   const m = METRICS_DATA;
-  const requests = m.requests || {};
   const active = m.active_requests || {};
-  const errors = m.errors || {};
   const latency = m.latency || {};
   const health = m.upstream_health || {};
   const disconnects = m.downstream_disconnects || 0;
+  const requests = m.requests || {};
 
-  const endpoints = Object.keys(requests.by_endpoint || {}).sort();
   const healthyCount = Object.values(health).filter(Boolean).length;
   const totalModels = Object.keys(health).length;
+  const activeTotal = active.total || 0;
+  const totalRequests = requests.total || 0;
+
+  // Per-model stats from the dashboard endpoint_stats
+  const modelStats = (DASH?.endpoint_stats || []).filter(s => s.state === 'READY');
+  // Also include STARTING instances
+  const startingStats = (DASH?.endpoint_stats || []).filter(s => s.state === 'STARTING');
 
   let html = '';
 
   // ── Header ──
-  html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3">Proxy Metrics</div>`;
+  html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3">Proxy Overview</div>`;
 
-  // ── Active Requests gauge ──
-  const activeTotal = active.total || 0;
+  // ── Active Requests gauge + quick summary ──
   html += `<div class="mb-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">`;
   html += `<div class="flex items-center justify-between mb-1">`;
   html += `<span class="font-medium text-slate-700 dark:text-slate-300">Active Requests</span>`;
@@ -342,54 +346,54 @@ function renderMetricsPopover() {
       html += `<div class="h-full rounded-full" style="width:${pct}%;background:hsl(${(idx * 60) % 360 + 200}, 60%, 50%)" title="${escapeHtml(ep)}: ${count}"></div>`;
     });
     html += `</div>`;
-    html += `<div class="flex flex-wrap gap-x-3 gap-y-0.5 mt-1.5">`;
-    for (const [ep, count] of endpoints_active) {
-      html += `<span class="text-[10px] text-slate-500">${escapeHtml(ep)}: ${count}</span>`;
+  }
+  html += `<div class="flex items-center justify-between mt-2 pt-2 border-t border-gray-200 dark:border-slate-700 text-xs text-slate-500">`;
+  html += `<span>${totalRequests} total requests</span>`;
+  html += `<span>⬇ ${disconnects} disconnects</span>`;
+  if (totalModels > 0) {
+    html += `<span>${healthyCount}/${totalModels} healthy</span>`;
+  }
+  html += `</div></div>`;
+
+  // ── Per-Model Stats ──
+  const allModelStats = [...modelStats, ...startingStats];
+  if (allModelStats.length > 0) {
+    html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Instances</div>`;
+    for (const ep of allModelStats) {
+      const uptime = ep.uptime_seconds ? formatDuration(Math.floor(ep.uptime_seconds)) : '—';
+      const gpuCache = ep.gpu_cache_usage != null ? `${Math.round(ep.gpu_cache_usage * 100)}%` : null;
+      const isHealthy = health[ep.model] !== false;
+      const stateColor = ep.state === 'READY' ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' : 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+      const stateDot = ep.state === 'READY' ? 'bg-emerald-400' : 'bg-amber-400';
+
+      html += `<div class="mb-2 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">`;
+      html += `<div class="flex items-center justify-between">`;
+      html += `<span class="font-medium text-sm text-slate-700 dark:text-slate-200">${escapeHtml(ep.model)}</span>`;
+      html += `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] ${stateColor}"><span class="w-1.5 h-1.5 rounded-full ${stateDot} mr-1"></span>${ep.state}</span>`;
+      html += `</div>`;
+
+      // Stats row
+      html += `<div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">`;
+      if (ep.active_requests != null) {
+        html += `<span><span class="text-slate-300 font-medium">${ep.active_requests}</span> active req</span>`;
+      }
+      if (gpuCache) {
+        html += `<span>GPU cache: ${gpuCache}</span>`;
+      }
+      html += `<span>⏱ ${uptime}</span>`;
+      if (ep.vllm_version) {
+        html += `<span>⚡ vLLM ${ep.vllm_version}</span>`;
+      }
+      html += `</div>`;
+      html += `</div>`;
     }
-    html += `</div>`;
   }
-  html += `</div>`;
-
-  // ── Request & Error summary table ──
-  html += `<div class="mb-3 overflow-x-auto">`;
-  html += `<table class="w-full text-[11px]">`;
-  html += `<thead><tr class="text-slate-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">`;
-  html += `<th class="text-left py-1 pr-2 font-medium">Endpoint</th>`;
-  html += `<th class="text-right px-2 py-1 font-medium">2xx</th>`;
-  html += `<th class="text-right px-2 py-1 font-medium">4xx</th>`;
-  html += `<th class="text-right px-2 py-1 font-medium">5xx</th>`;
-  html += `<th class="text-right px-2 py-1 font-medium">Errors</th>`;
-  html += `<th class="text-right pl-2 py-1 font-medium">Total</th>`;
-  html += `</tr></thead><tbody>`;
-  for (const ep of endpoints) {
-    const epReq = requests.by_endpoint[ep] || {};
-    const byStatus = epReq.by_status || {};
-    const req2xx = Object.entries(byStatus).filter(([s]) => s.startsWith('2')).reduce((a, [, v]) => a + v, 0);
-    const req4xx = Object.entries(byStatus).filter(([s]) => s.startsWith('4')).reduce((a, [, v]) => a + v, 0);
-    const req5xx = Object.entries(byStatus).filter(([s]) => s.startsWith('5')).reduce((a, [, v]) => a + v, 0);
-    const total = epReq.total || 0;
-    const epErrors = (errors.by_endpoint || {})[ep] || {};
-    const errTotal = epErrors.total || 0;
-
-    html += `<tr class="border-b border-gray-100 dark:border-slate-800">`;
-    html += `<td class="py-1.5 pr-2 text-slate-700 dark:text-slate-300 font-medium">${escapeHtml(ep)}</td>`;
-    html += `<td class="text-right px-2 py-1.5 text-emerald-500">${req2xx}</td>`;
-    html += `<td class="text-right px-2 py-1.5 text-amber-400">${req4xx}</td>`;
-    html += `<td class="text-right px-2 py-1.5 text-red-400">${req5xx}</td>`;
-    html += `<td class="text-right px-2 py-1.5 text-red-400">${errTotal > 0 ? errTotal : '—'}</td>`;
-    html += `<td class="text-right pl-2 py-1.5 text-slate-500">${total}</td>`;
-    html += `</tr>`;
-  }
-  if (endpoints.length === 0) {
-    html += `<tr><td colspan="6" class="py-3 text-center text-slate-500">No requests yet</td></tr>`;
-  }
-  html += `</tbody></table>`;
-  html += `</div>`;
 
   // ── Latency table ──
   const latencyEndpoints = Object.keys(latency).sort();
   if (latencyEndpoints.length > 0) {
-    html += `<div class="mb-3 overflow-x-auto">`;
+    html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2 mt-1">Latency</div>`;
+    html += `<div class="mb-1 overflow-x-auto">`;
     html += `<table class="w-full text-[11px]">`;
     html += `<thead><tr class="text-slate-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">`;
     html += `<th class="text-left py-1 pr-2 font-medium">Endpoint</th>`;
@@ -417,33 +421,6 @@ function renderMetricsPopover() {
     html += `</tbody></table>`;
     html += `</div>`;
   }
-
-  // ── Error detail (if any type breakdowns) ──
-  const errorEndpoints = Object.entries(errors.by_endpoint || {}).filter(([, v]) => v.total > 0);
-  if (errorEndpoints.length > 0) {
-    html += `<div class="mb-3 p-3 rounded-lg bg-red-500/5 border border-red-500/20">`;
-    html += `<div class="font-medium text-red-400 mb-1.5">Upstream Errors</div>`;
-    for (const [ep, epData] of errorEndpoints) {
-      const byType = epData.by_type || {};
-      const typeEntries = Object.entries(byType).sort((a, b) => b[1] - a[1]);
-      html += `<div class="mb-1">`;
-      html += `<span class="text-slate-600 dark:text-slate-400">${escapeHtml(ep)}</span>`;
-      html += `<div class="flex flex-wrap gap-1.5 mt-0.5">`;
-      for (const [type, count] of typeEntries) {
-        html += `<span class="inline-flex items-center px-1.5 py-0.5 rounded bg-red-500/10 text-red-300 text-[10px]">${escapeHtml(type)}: ${count}</span>`;
-      }
-      html += `</div></div>`;
-    }
-    html += `</div>`;
-  }
-
-  // ── Footer stats ──
-  html += `<div class="flex items-center justify-between pt-2 border-t border-gray-200 dark:border-slate-700 text-slate-500">`;
-  html += `<span>⬇ disconnects: ${disconnects}</span>`;
-  if (totalModels > 0) {
-    html += `<span>${healthyCount}/${totalModels} models healthy</span>`;
-  }
-  html += `</div>`;
 
   container.innerHTML = html;
 }

@@ -87,3 +87,65 @@ async def health_check_endpoint(
     except Exception as e:
         dt_ms = (time.perf_counter() - t0) * 1000.0
         return False, f"UnexpectedError after {dt_ms:.0f}ms: {type(e).__name__}: {e}"
+
+
+# ── vLLM /metrics scraper ────────────────────────────────────────────────────
+
+import re
+
+_VLLM_METRIC_KEYS = {
+    "vllm:kv_cache_usage_perc": "gpu_cache_usage",
+    "vllm:num_requests_running": "active_requests",
+    "vllm:num_requests_waiting": "pending_requests",
+}
+
+def _parse_vllm_metrics(text: str) -> dict[str, float | int | None]:
+    """Extract key gauges from vLLM Prometheus /metrics output.
+
+    Returns a dict with keys ``gpu_cache_usage``, ``active_requests``,
+    ``pending_requests`` (or ``None`` if the metric was missing).
+    """
+    result: dict[str, float | int | None] = {
+        "gpu_cache_usage": None,
+        "active_requests": None,
+        "pending_requests": None,
+    }
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#") or not line:
+            continue
+        # Extract metric name (before any { or whitespace)
+        # Format: vllm:name{labels} value  or  vllm:name value
+        name_part = line.split("{")[0].split()[0]
+        mapped = _VLLM_METRIC_KEYS.get(name_part)
+        if mapped is None:
+            continue
+        # Value is the last whitespace-separated token
+        try:
+            raw = float(line.rsplit(None, 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if mapped in ("active_requests", "pending_requests"):
+            result[mapped] = int(raw)
+        else:
+            result[mapped] = raw
+    return result
+
+
+async def fetch_vllm_metrics(
+    host: str, port: int, timeout_s: float = 2.0
+) -> dict[str, float | int | None]:
+    """Fetch /metrics from a vLLM instance and extract key gauges.
+
+    Returns the same dict shape as ``_parse_vllm_metrics`` (all values
+    may be ``None`` if the fetch fails or the metric is absent).
+    """
+    url = f"http://{host}:{port}/metrics"
+    try:
+        client = await _get_health_client()
+        r = await client.get(url, timeout=timeout_s)
+        if r.status_code == 200:
+            return _parse_vllm_metrics(r.text)
+    except Exception:
+        pass
+    return {"gpu_cache_usage": None, "active_requests": None, "pending_requests": None}

@@ -373,17 +373,33 @@ function renderMetricsPopover() {
       html += `</div>`;
 
       // Stats row
-      html += `<div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">`;
-      if (ep.active_requests != null) {
-        html += `<span><span class="text-slate-300 font-medium">${ep.active_requests}</span> active req</span>`;
+      html += `<div class="mt-2 space-y-1.5">`;
+
+      // KV cache usage bar
+      if (ep.gpu_cache_usage != null) {
+        const cachePct = Math.round(ep.gpu_cache_usage * 100);
+        const barColor = cachePct > 80 ? 'bg-rose-500' : cachePct > 50 ? 'bg-amber-500' : 'bg-emerald-500';
+        html += `<div class="flex items-center gap-2">`;
+        html += `<div class="flex-1 h-2 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">`;
+        html += `<div class="h-full rounded-full ${barColor} transition-all" style="width:${cachePct}%"></div>`;
+        html += `</div>`;
+        html += `<span class="text-[10px] font-medium text-slate-500 dark:text-slate-400 w-8 text-right">${cachePct}%</span>`;
+        html += `</div>`;
       }
-      if (gpuCache) {
-        html += `<span>GPU cache: ${gpuCache}</span>`;
+
+      // Stats line
+      html += `<div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">`;
+      if (ep.active_requests != null) {
+        html += `<span><span class="text-slate-300 font-medium">${ep.active_requests}</span> running</span>`;
+      }
+      if (ep.pending_requests != null && ep.pending_requests > 0) {
+        html += `<span><span class="text-amber-300 font-medium">${ep.pending_requests}</span> waiting</span>`;
       }
       html += `<span>⏱ ${uptime}</span>`;
       if (ep.vllm_version) {
         html += `<span>⚡ vLLM ${ep.vllm_version}</span>`;
       }
+      html += `</div>`;
       html += `</div>`;
       html += `</div>`;
     }

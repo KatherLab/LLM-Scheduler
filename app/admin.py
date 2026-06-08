@@ -21,6 +21,7 @@ from .schemas import (
 )
 from .catalog import get_catalog
 from .planner import compute_placements, find_earliest_slot
+from .router_core import fetch_vllm_metrics
 from . import slurm
 from .dependencies import SessionLocal, init_db
 from .utils import ensure_utc
@@ -327,7 +328,7 @@ def _find_log_files(slurm_job_id: str) -> tuple[str, str]:
 # ---------- endpoints ------------------------------------------------------------
 
 @router.get("/dashboard", response_model=DashboardResponse)
-def dashboard():
+async def dashboard():
     now = now_utc()
     horizon_start = now - timedelta(hours=1)
     horizon_end = now + timedelta(hours=48)
@@ -376,16 +377,16 @@ def dashboard():
                 }
             ))
 
-        # Endpoint stats
+        # Endpoint stats (DB portion)
         eps = db.execute(
             select(Endpoint).where(Endpoint.state.in_(["READY", "STARTING"]))
         ).scalars().all()
-        stats: list[EndpointStats] = []
+        stats_data: list[dict] = []
         for e in eps:
             uptime = None
             if e.created_at:
                 uptime = (now - ensure_utc(e.created_at)).total_seconds()
-            stats.append(EndpointStats(
+            stats_data.append(dict(
                 model=e.model,
                 host=e.host,
                 port=e.port,
@@ -396,13 +397,25 @@ def dashboard():
                 vllm_version=e.vllm_version,
             ))
 
-        return DashboardResponse(
-            now=now,
-            total_gpus=settings.total_gpus,
-            models=models,
-            leases=out_leases,
-            endpoint_stats=stats,
-        )
+    # Fetch vLLM /metrics for all endpoints in parallel (no DB session held)
+    async def _enrich(s: dict) -> None:
+        vm = await fetch_vllm_metrics(s["host"], s["port"])
+        s["gpu_cache_usage"] = vm["gpu_cache_usage"]
+        s["active_requests"] = vm["active_requests"]
+        s["pending_requests"] = vm["pending_requests"]
+
+    if stats_data:
+        await asyncio.gather(*[_enrich(s) for s in stats_data])
+
+    stats = [EndpointStats(**s) for s in stats_data]
+
+    return DashboardResponse(
+        now=now,
+        total_gpus=settings.total_gpus,
+        models=models,
+        leases=out_leases,
+        endpoint_stats=stats,
+    )
 
 
 @router.get("/metrics/summary")

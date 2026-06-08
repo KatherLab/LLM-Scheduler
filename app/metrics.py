@@ -11,26 +11,26 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest, REGIST
 PROXY_REQUESTS_TOTAL = Counter(
     "llm_proxy_requests_total",
     "Total proxied requests to upstream vLLM instances",
-    ["endpoint", "status"],
+    ["model", "endpoint", "status"],
 )
 
 PROXY_REQUEST_DURATION = Histogram(
     "llm_proxy_request_duration_seconds",
     "Proxied request latency in seconds",
-    ["endpoint"],
+    ["model", "endpoint"],
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, float("inf")),
 )
 
 PROXY_UPSTREAM_ERRORS = Counter(
     "llm_proxy_upstream_errors_total",
     "Upstream connection / timeout errors by type",
-    ["endpoint", "error_type"],
+    ["model", "endpoint", "error_type"],
 )
 
 PROXY_ACTIVE = Gauge(
     "llm_proxy_active",
     "Currently in-flight proxied requests",
-    ["endpoint"],
+    ["model", "endpoint"],
 )
 
 PROXY_DOWNSTREAM_DISCONNECTS = Counter(
@@ -65,37 +65,37 @@ def endpoint_label(url_path: str) -> str:
 
 
 @asynccontextmanager
-async def track_proxy(upstream_url: str) -> AsyncIterator[dict]:
+async def track_proxy(upstream_url: str, model: str = "") -> AsyncIterator[dict]:
     """Context manager that records timing and status for a single proxy call.
 
     Usage inside ``_ProxyResponse.__call__``::
 
-        async with track_proxy(self._upstream_url) as ctx:
+        async with track_proxy(self._upstream_url, model="gpt-4") as ctx:
             …               # on success:   ctx["status"] = resp.status_code
             …               # on exception: ctx["error"] = type(exc).__name__
     """
     t0 = time.perf_counter()
     ep = endpoint_label(upstream_url)
-    PROXY_ACTIVE.labels(endpoint=ep).inc()
+    model_label = model or ""
+    PROXY_ACTIVE.labels(model=model_label, endpoint=ep).inc()
 
     ctx: dict = {}
     try:
         yield ctx
     finally:
         duration = time.perf_counter() - t0
-        PROXY_ACTIVE.labels(endpoint=ep).dec()
+        PROXY_ACTIVE.labels(model=model_label, endpoint=ep).dec()
 
         status = ctx.get("status", "502")
         error_type = ctx.get("error")
 
         if error_type:
-            PROXY_UPSTREAM_ERRORS.labels(endpoint=ep, error_type=error_type).inc()
-            # Use the status from error, defaulting to "502"
-            PROXY_REQUESTS_TOTAL.labels(endpoint=ep, status=status).inc()
+            PROXY_UPSTREAM_ERRORS.labels(model=model_label, endpoint=ep, error_type=error_type).inc()
+            PROXY_REQUESTS_TOTAL.labels(model=model_label, endpoint=ep, status=status).inc()
         else:
-            PROXY_REQUESTS_TOTAL.labels(endpoint=ep, status=str(status)).inc()
+            PROXY_REQUESTS_TOTAL.labels(model=model_label, endpoint=ep, status=str(status)).inc()
 
-        PROXY_REQUEST_DURATION.labels(endpoint=ep).observe(duration)
+        PROXY_REQUEST_DURATION.labels(model=model_label, endpoint=ep).observe(duration)
 
 
 # ── Metrics summary (JSON-friendly) ───────────────────────────────────
@@ -162,49 +162,70 @@ def get_metrics_summary() -> dict:
     latency_buckets: dict[str, list[tuple[float, float]]] = {}
     latency_counts: dict[str, float] = {}
     latency_sums: dict[str, float] = {}
+    # Also collect by model
+    latency_model_buckets: dict[str, list[tuple[float, float]]] = {}
+    latency_model_counts: dict[str, float] = {}
+    latency_model_sums: dict[str, float] = {}
     for name in samples:
         if not name.startswith("llm_proxy_request_duration_seconds"):
             continue
         for labels, value in samples[name]:
             ep = labels.get("endpoint", "?")
+            model_label = labels.get("model", "") or ""
             if name.endswith("_bucket"):
                 le_str = labels.get("le", "+Inf")
                 le = float("inf") if le_str in ("+Inf", "+inf", "inf") else float(le_str)
                 latency_buckets.setdefault(ep, []).append((le, value))
+                latency_model_buckets.setdefault(model_label, []).append((le, value))
             elif name.endswith("_count"):
                 latency_counts[ep] = value
+                latency_model_counts[model_label] = latency_model_counts.get(model_label, 0) + value
             elif name.endswith("_sum"):
                 latency_sums[ep] = value
+                latency_model_sums[model_label] = latency_model_sums.get(model_label, 0) + value
 
-    latency: dict[str, dict] = {}
-    for ep in latency_counts:
-        entry: dict = {
-            "count": latency_counts.get(ep, 0),
-            "sum": latency_sums.get(ep, 0),
-        }
-        if entry["count"]:
-            entry["avg"] = round(entry["sum"] / entry["count"], 3)
-        else:
-            entry["avg"] = 0.0
-
-        # Compute percentiles from histogram buckets
-        buckets = latency_buckets.get(ep, [])
-        buckets.sort(key=lambda x: x[0])
-        total = entry["count"]
-        if total > 0 and buckets:
-            percentile_targets = {
-                "p50": total * 0.50,
-                "p95": total * 0.95,
-                "p99": total * 0.99,
+    def _build_latency_dict(
+        keys: list[str],
+        buckets: dict[str, list],
+        counts: dict[str, float],
+        sums: dict[str, float],
+    ) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        for key in keys:
+            entry: dict = {
+                "count": counts.get(key, 0),
+                "sum": sums.get(key, 0),
             }
-            for pct_key, target in percentile_targets.items():
-                pct_value = _histogram_quantile(target, buckets)
-                entry[pct_key] = round(pct_value, 3) if pct_value is not None else None
-        else:
-            for k in ("p50", "p95", "p99"):
-                entry[k] = None
+            if entry["count"]:
+                entry["avg"] = round(entry["sum"] / entry["count"], 3)
+            else:
+                entry["avg"] = 0.0
 
-        latency[ep] = entry
+            b = buckets.get(key, [])
+            b.sort(key=lambda x: x[0])
+            total = entry["count"]
+            if total > 0 and b:
+                percentile_targets = {
+                    "p50": total * 0.50,
+                    "p95": total * 0.95,
+                    "p99": total * 0.99,
+                }
+                for pct_key, target in percentile_targets.items():
+                    pct_value = _histogram_quantile(target, b)
+                    entry[pct_key] = round(pct_value, 3) if pct_value is not None else None
+            else:
+                for k in ("p50", "p95", "p99"):
+                    entry[k] = None
+
+            result[key] = entry
+        return result
+
+    latency = _build_latency_dict(
+        list(latency_counts.keys()), latency_buckets, latency_counts, latency_sums
+    )
+    latency_by_model = _build_latency_dict(
+        list(latency_model_counts.keys()), latency_model_buckets, latency_model_counts, latency_model_sums
+    )
 
     # --- Downstream disconnects ---
     disconnects = 0
@@ -230,6 +251,7 @@ def get_metrics_summary() -> dict:
             "total": errors_total,
             "by_endpoint": errors_by_endpoint,
         },
+        "latency_by_model": latency_by_model,
         "latency": latency,
         "downstream_disconnects": disconnects,
         "upstream_health": upstream_health,

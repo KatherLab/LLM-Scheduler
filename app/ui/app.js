@@ -389,24 +389,25 @@ function renderMetricsPopover() {
     }
   }
 
-  // ── Latency table ──
-  const latencyEndpoints = Object.keys(latency).sort();
-  if (latencyEndpoints.length > 0) {
+  // ── Latency table (by model) ──
+  const latencyByModel = m.latency_by_model || {};
+  const latencyModels = Object.keys(latencyByModel).filter(k => k).sort();
+  if (latencyModels.length > 0) {
     html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2 mt-1">Latency</div>`;
     html += `<div class="mb-1 overflow-x-auto">`;
     html += `<table class="w-full text-[11px]">`;
     html += `<thead><tr class="text-slate-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">`;
-    html += `<th class="text-left py-1 pr-2 font-medium">Endpoint</th>`;
+    html += `<th class="text-left py-1 pr-2 font-medium">Model</th>`;
     html += `<th class="text-right px-2 py-1 font-medium">Avg</th>`;
     html += `<th class="text-right px-2 py-1 font-medium">p50</th>`;
     html += `<th class="text-right px-2 py-1 font-medium">p95</th>`;
     html += `<th class="text-right px-2 py-1 font-medium">p99</th>`;
     html += `<th class="text-right pl-2 py-1 font-medium">Count</th>`;
     html += `</tr></thead><tbody>`;
-    for (const ep of latencyEndpoints) {
-      const l = latency[ep];
+    for (const modelName of latencyModels) {
+      const l = latencyByModel[modelName];
       html += `<tr class="border-b border-gray-100 dark:border-slate-800">`;
-      html += `<td class="py-1.5 pr-2 text-slate-700 dark:text-slate-300 font-medium">${escapeHtml(ep)}</td>`;
+      html += `<td class="py-1.5 pr-2 text-slate-700 dark:text-slate-300 font-medium">${escapeHtml(modelName)}</td>`;
       const avg = l.avg != null ? fmtLatency(l.avg) : '—';
       const p50 = l.p50 != null ? fmtLatency(l.p50) : '—';
       const p95 = l.p95 != null ? fmtLatency(l.p95) : '—';

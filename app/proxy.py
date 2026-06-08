@@ -221,6 +221,7 @@ class _ProxyResponse(Response):
         files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
         is_stream: bool = False,
         timeout_s: float = 600.0,
+        model: str = "",
     ) -> None:
         super().__init__(content=b"", status_code=200)
         self._request = request
@@ -231,6 +232,7 @@ class _ProxyResponse(Response):
         self._files = files
         self._is_stream = is_stream
         self._timeout_s = timeout_s
+        self._model = model
 
     async def _send_error_response(self, scope, receive, send, exc: Exception) -> None:
         status = _status_for_httpx_exc(exc)
@@ -357,7 +359,7 @@ class _ProxyResponse(Response):
         resp: httpx.Response | None = None
         self._response_started = False  # ← NEW: track ASGI response lifecycle
 
-        async with track_proxy(self._upstream_url) as _ctx:
+        async with track_proxy(self._upstream_url, model=self._model) as _ctx:
             try:
                 req = client.build_request(
                     "POST",
@@ -462,6 +464,7 @@ async def proxy_json_or_stream(
     body: bytes | None = None,
     is_stream: bool | None = None,
     timeout_s: float = 600.0,
+    model: str = "",
 ):
     """
     Return an ASGI response object that proxies to an upstream OpenAI-compatible server.
@@ -491,6 +494,7 @@ async def proxy_json_or_stream(
         body=body,
         is_stream=is_stream,
         timeout_s=timeout_s,
+        model=model,
     )
 
 
@@ -499,6 +503,7 @@ async def proxy_get(
     upstream_url: str,
     *,
     timeout_s: float = 30.0,
+    model: str = "",
 ):
     """
     Proxy a GET request to upstream and return the buffered response.
@@ -510,7 +515,7 @@ async def proxy_get(
     headers = dict(request.headers)
     headers.pop("host", None)
 
-    async with track_proxy(upstream_url) as _ctx:
+    async with track_proxy(upstream_url, model=model) as _ctx:
         try:
             resp = await client.get(upstream_url, headers=headers, timeout=timeout_s)
             _ctx["status"] = resp.status_code
@@ -530,6 +535,7 @@ async def proxy_multipart(
     upstream_url: str,
     *,
     timeout_s: float = 600.0,
+    model: str = "",
 ):
     """
     Proxy multipart/form-data requests (e.g. OpenAI audio transcription).
@@ -572,4 +578,5 @@ async def proxy_multipart(
         files=files,
         is_stream=False,
         timeout_s=timeout_s,
+        model=model,
     )

@@ -171,6 +171,7 @@ async def chat_completions(request: Request):
         upstream_url=f"{upstream}/v1/chat/completions",
         body=body,
         is_stream=is_stream,
+        model=model,
     )
 
 @app.post("/v1/messages")
@@ -192,6 +193,7 @@ async def messages(request: Request):
         upstream_url=f"{upstream}/v1/messages",
         body=body,
         is_stream=is_stream,
+        model=model,
     )
 
 
@@ -214,6 +216,7 @@ async def responses(request: Request):
         upstream_url=f"{upstream}/v1/responses",
         body=body,
         is_stream=is_stream,
+        model=model,
     )
 
 
@@ -235,6 +238,7 @@ async def cancel_response(response_id: str, request: Request):
         upstream_url=f"{upstream}/v1/responses/{response_id}/cancel",
         body=body,
         is_stream=False,
+        model=model,
     )
 
 @app.post("/v1/audio/transcriptions")
@@ -246,6 +250,7 @@ async def audio_transcriptions(request: Request):
     return await proxy_multipart(
         request,
         upstream_url=f"{upstream}/v1/audio/transcriptions",
+        model=model,
     )
 
 
@@ -258,6 +263,7 @@ async def audio_translations(request: Request):
     return await proxy_multipart(
         request,
         upstream_url=f"{upstream}/v1/audio/translations",
+        model=model,
     )
 
 
@@ -273,7 +279,7 @@ async def metrics(request: Request, model: Optional[str] = None):
         return PlainTextResponse(generate_latest().decode("utf-8"), media_type="text/plain")
     with SessionLocal() as db:
         upstream = _resolve_upstream(db, model)
-    return await proxy_get(request, upstream_url=f"{upstream}/metrics")
+    return await proxy_get(request, upstream_url=f"{upstream}/metrics", model=model)
 
 
 # =============================================================================

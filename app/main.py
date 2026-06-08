@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from .auth import auth_router, require_auth, get_session
@@ -26,6 +27,8 @@ from .utils import ensure_utc
 from .lifecycle_logger import log_health_check, log_state_transition, log_slurm_action
 from .metrics import generate_latest, UPSTREAM_HEALTHY
 
+logger = logging.getLogger(__name__)
+
 # ── Supervised task wrapper ─────────────────────────────────────────────────
 async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
     """
@@ -36,10 +39,10 @@ async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
         try:
             await coro_fn()
         except asyncio.CancelledError:
-            print(f"{name}: cancelled, shutting down")
+            logger.info("%s: cancelled, shutting down", name)
             return
         except Exception as e:
-            print(f"{name}: crashed ({e}), restarting in {restart_delay}s")
+            logger.error("%s: crashed (%s), restarting in %ss", name, e, restart_delay)
             await asyncio.sleep(restart_delay)
 
 
@@ -64,7 +67,7 @@ async def lifespan(app: FastAPI):
     yield  # ← app is running and serving requests
 
     # ── Shutdown ──
-    print("lifespan: shutting down background workers...")
+    logger.info("lifespan: shutting down background workers...")
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -75,7 +78,7 @@ async def lifespan(app: FastAPI):
     await close_client()
     await close_health_client()
 
-    print("lifespan: shutdown complete")
+    logger.info("lifespan: shutdown complete")
 
 
 app = FastAPI(title="KatherLab LLM Scheduler", version="0.4.0", lifespan=lifespan)
@@ -546,7 +549,7 @@ async def health_worker():
                 db.commit()
 
         except Exception as e:
-            print(f"health_worker error: {e}")
+            logger.error("health_worker error: %s", e)
 
         await asyncio.sleep(60)
 
@@ -597,9 +600,9 @@ async def planned_submit_worker():
                     lease = db.get(Lease, lid)
                     if lease and lease.state == "PLANNED":
                         lease.state = "ENDED"
-                        print(
-                            f"planned_submit_worker: lease {lid} "
-                            f"({lease.model}) → ENDED (end_at already passed)"
+                        logger.info(
+                            "planned_submit_worker: lease %d (%s) → ENDED (end_at already passed)",
+                            lid, lease.model,
                         )
                 db.commit()
 
@@ -615,9 +618,9 @@ async def planned_submit_worker():
                     with SessionLocal() as db:
                         lease = db.get(Lease, snapshot["id"])
                         if not lease or lease.state != "PLANNED":
-                            print(
-                                f"planned_submit_worker: lease {snapshot['id']} "
-                                f"state changed during submit, skipping"
+                            logger.warning(
+                                "planned_submit_worker: lease %d state changed during submit, skipping",
+                                snapshot['id'],
                             )
                             continue
 
@@ -649,13 +652,13 @@ async def planned_submit_worker():
                             lease.state = "FAILED"
                             lease.failed_at = now
                             db.commit()
-                    print(
-                        f"planned_submit_worker: failed to submit "
-                        f"lease {snapshot['id']}: {e}"
+                    logger.error(
+                        "planned_submit_worker: failed to submit lease %d: %s",
+                        snapshot['id'], e,
                     )
 
         except Exception as e:
-            print(f"planned_submit_worker error: {e}")
+            logger.error("planned_submit_worker error: %s", e)
 
         await asyncio.sleep(5)
 
@@ -712,9 +715,9 @@ async def endpoint_cleanup_worker():
                         )
                     except Exception as ex:
                         # Job might already be gone — that's fine
-                        print(
-                            f"endpoint_cleanup: scancel failed for "
-                            f"{act['slurm_job_id']}: {ex}"
+                        logger.warning(
+                            "endpoint_cleanup: scancel failed for %s: %s",
+                            act["slurm_job_id"], ex,
                         )
 
 
@@ -733,7 +736,7 @@ async def endpoint_cleanup_worker():
                             continue
 
                         if act["action"] == "expired":
-                            if lease.state == "RUNNING":
+                            if lease.state in ("RUNNING", "FAILED"):
                                 old_ls = lease.state
                                 lease.state = "ENDED"
                                 log_state_transition(
@@ -745,14 +748,12 @@ async def endpoint_cleanup_worker():
                                     slurm_job_id=act["slurm_job_id"],
                                     reason="lease expired",
                                 )
-
-                            # Leave FAILED leases as FAILED
                         # For lease_done action, endpoint just gets STOPPED
 
                     db.commit()
 
         except Exception as e:
-            print(f"endpoint_cleanup_worker error: {e}")
+            logger.error("endpoint_cleanup_worker error: %s", e)
         await asyncio.sleep(15)
 
 
@@ -814,7 +815,7 @@ async def slurm_reconcile_worker():
                         job_ids_to_check
                     )
                 except slurm.SlurmUnavailableError as e:
-                    print(f"slurm_reconcile: Slurm controller unavailable ({e}), skipping this cycle")
+                    logger.warning("slurm_reconcile: Slurm controller unavailable (%s), skipping this cycle", e)
                     await asyncio.sleep(5)
                     continue
             else:
@@ -896,7 +897,7 @@ async def slurm_reconcile_worker():
 
                 db.commit()
         except Exception as e:
-            print(f"slurm_reconcile_worker error: {e}")
+            logger.error("slurm_reconcile_worker error: %s", e)
         await asyncio.sleep(5)
 
 
@@ -942,10 +943,9 @@ async def retry_worker():
                             ensure_utc(lease.end_at) - now
                         ).total_seconds()
                         if remaining < 120:
-                            print(
-                                f"retry_worker: lease {lease.id} "
-                                f"({lease.model}) has only "
-                                f"{remaining:.0f}s left, skipping"
+                            logger.info(
+                                "retry_worker: lease %d (%s) has only %.0fs left, skipping",
+                                lease.id, lease.model, remaining,
                             )
                             continue
 
@@ -1000,9 +1000,9 @@ async def retry_worker():
                     if old_slurm_job_id:
                         try:
                             await slurm.async_cancel(old_slurm_job_id)
-                            print(f"retry_worker: scancel'd old job {old_slurm_job_id}")
+                            logger.info("retry_worker: scancel'd old job %s", old_slurm_job_id)
                         except Exception as ex:
-                            print(f"retry_worker: scancel failed for {old_slurm_job_id}: {ex}")
+                            logger.warning("retry_worker: scancel failed for %s: %s", old_slurm_job_id, ex)
 
                     # Phase 2b: submit to Slurm (NO DB session open)
                     new_job_id = await asyncio.to_thread(
@@ -1036,9 +1036,9 @@ async def retry_worker():
 
 
                 except Exception as ex:
-                    print(
-                        f"retry_worker: failed to resubmit "
-                        f"lease {snapshot['id']}: {ex}"
+                    logger.error(
+                        "retry_worker: failed to resubmit lease %d: %s",
+                        snapshot["id"], ex,
                     )
                     # Revert to FAILED so it can be retried again later
                     with SessionLocal() as db:
@@ -1049,7 +1049,7 @@ async def retry_worker():
                             db.commit()
 
         except Exception as e:
-            print(f"retry_worker error: {e}")
+            logger.error("retry_worker error: %s", e)
 
         await asyncio.sleep(10)
 
@@ -1066,7 +1066,7 @@ def reconcile_on_startup():
     - PLANNED leases whose end_at has already passed → ENDED
     - Endpoints in STARTING/READY whose Slurm jobs are gone → STOPPED
     """
-    print("startup: reconciling DB state with Slurm...")
+    logger.info("startup: reconciling DB state with Slurm...")
     now = datetime.now(timezone.utc)
     changes = 0
 
@@ -1087,7 +1087,7 @@ def reconcile_on_startup():
         try:
             job_states = slurm.squeue_job_states_batch(lease_job_ids) if lease_job_ids else {}
         except slurm.SlurmUnavailableError as e:
-            print(f"  reconcile: Slurm controller unavailable ({e}), skipping lease reconciliation")
+            logger.warning("  reconcile: Slurm controller unavailable (%s), skipping lease reconciliation", e)
             job_states = None
 
         if job_states is None:
@@ -1124,16 +1124,15 @@ def reconcile_on_startup():
                     lease.failed_at = now
                     if ep:
                         ep.state = "FAILED"
-                    print(
-                        f"  reconcile: lease {lease.id} ({lease.model}) "
-                        f"→ FAILED (job {lease.slurm_job_id} gone, "
-                        f"sacct_state={sacct_state})"
+                    logger.info(
+                        "  reconcile: lease %d (%s) → FAILED (job %s gone, sacct_state=%s)",
+                        lease.id, lease.model, lease.slurm_job_id, sacct_state,
                     )
                     changes += 1
                 else:
-                    print(
-                        f"  reconcile: lease {lease.id} ({lease.model}) "
-                        f"— Slurm job {lease.slurm_job_id} still {state}"
+                    logger.info(
+                        "  reconcile: lease %d (%s) — Slurm job %s still %s",
+                        lease.id, lease.model, lease.slurm_job_id, state,
                     )
 
         # 2. PLANNED leases whose end_at has passed
@@ -1144,9 +1143,9 @@ def reconcile_on_startup():
         for lease in planned:
             if lease.end_at and ensure_utc(lease.end_at) < now:
                 lease.state = "ENDED"
-                print(
-                    f"  reconcile: planned lease {lease.id} ({lease.model}) "
-                    f"→ ENDED (end_at {lease.end_at} already passed)"
+                logger.info(
+                    "  reconcile: planned lease %d (%s) → ENDED (end_at %s already passed)",
+                    lease.id, lease.model, lease.end_at,
                 )
                 changes += 1
 
@@ -1158,9 +1157,9 @@ def reconcile_on_startup():
         for lease in retrying:
             lease.state = "FAILED"
             lease.failed_at = now
-            print(
-                f"  reconcile: lease {lease.id} ({lease.model}) "
-                f"RETRYING → FAILED (crash recovery)"
+            logger.warning(
+                "  reconcile: lease %d (%s) RETRYING → FAILED (crash recovery)",
+                lease.id, lease.model,
             )
             changes += 1
 
@@ -1197,12 +1196,12 @@ def reconcile_on_startup():
                 state = orphan_states.get(ep.slurm_job_id)
                 if state is None:
                     ep.state = "STOPPED"
-                    print(
-                        f"  reconcile: orphan endpoint {ep.model} "
-                        f"(job {ep.slurm_job_id}) → STOPPED"
+                    logger.info(
+                        "  reconcile: orphan endpoint %s (job %s) → STOPPED",
+                        ep.model, ep.slurm_job_id,
                     )
                     changes += 1
 
         db.commit()
 
-    print(f"startup: reconciliation complete ({changes} changes)")
+    logger.info("startup: reconciliation complete (%d changes)", changes)

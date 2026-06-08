@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, REGISTRY
 
@@ -50,18 +51,23 @@ UPSTREAM_HEALTHY = Gauge(
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-def endpoint_label(url_path: str) -> str:
+def endpoint_label(url_or_path: str) -> str:
     """Derive a concise label from an upstream URL path.
+
+    Handles both full URLs (``http://host:port/v1/chat/completions``) and bare
+    paths (``/v1/chat/completions``).
 
     ``/v1/chat/completions`` → ``chat.completions``
     ``/v1/messages``        → ``messages``
     ``/metrics``            → ``metrics``
     """
-    parts = url_path.strip("/").split("/")
+    # Strip scheme + host if a full URL was passed.
+    path = urlparse(url_or_path).path
+    parts = path.strip("/").split("/")
     # Drop the version prefix (v1, v2, …) if present.
     if parts and parts[0].startswith("v"):
         parts = parts[1:]
-    return ".".join(parts) if parts else url_path
+    return ".".join(parts) if parts else url_or_path
 
 
 @asynccontextmanager

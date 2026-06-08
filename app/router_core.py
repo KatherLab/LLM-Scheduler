@@ -1,6 +1,7 @@
 # app/router_core.py
 from __future__ import annotations
 import asyncio
+import logging
 import threading
 import time
 from typing import Optional
@@ -92,7 +93,7 @@ async def health_check_endpoint(
 
 # ── vLLM /metrics scraper ────────────────────────────────────────────────────
 
-import re
+logger = logging.getLogger(__name__)
 
 _VLLM_METRIC_KEYS = {
     "vllm:kv_cache_usage_perc": "gpu_cache_usage",
@@ -181,6 +182,6 @@ async def fetch_vllm_metrics(
                             _vllm_counter_cache[key] = (now, gen_total)
                             return result
                     _vllm_counter_cache[key] = (now, gen_total)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("fetch_vllm_metrics: failed to fetch %s: %s", url, exc)
     return result

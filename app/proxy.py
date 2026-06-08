@@ -207,6 +207,65 @@ async def _read_all_or_disconnect(
     return bytes(chunks)
 
 
+async def _send_upstream_or_abort(
+    client: httpx.AsyncClient,
+    req: httpx.Request,
+    disconnect_task: asyncio.Task,
+    deadline: float,
+) -> httpx.Response:
+    """
+    Send the upstream request, aborting if downstream disconnects.
+
+    This handles the race where the downstream disconnects before
+    ``client.send()`` has returned a response object.  After
+    ``client.send()`` returns, the normal ``finally`` block in
+    ``_ProxyResponse.__call__`` already closes ``resp``.  Before that,
+    we briefly wait for ``resp`` and close it if it appears, so the
+    upstream vLLM connection is explicitly closed.
+    """
+    send_task = asyncio.create_task(client.send(req, stream=True))
+
+    done, _ = await asyncio.wait(
+        {send_task, disconnect_task},
+        timeout=_time_left(deadline),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    if not done:
+        send_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await send_task
+        raise asyncio.TimeoutError()
+
+    if disconnect_task in done:
+        # Downstream disconnected while send was still in-flight.
+        # The request may already have been sent to vLLM, which is now
+        # processing it.  Grab the response (up to 3 s) and close it so
+        # the underlying TCP connection is torn down and vLLM detects it.
+        # If send_task later raises an httpx error, treat it as a
+        # downstream disconnect (the client is already gone).
+        try:
+            resp = await asyncio.wait_for(send_task, timeout=3.0)
+        except asyncio.TimeoutError:
+            send_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await send_task
+        except Exception:
+            # Upstream failed while downstream was already gone.
+            # Treat this as downstream disconnect, not proxy failure.
+            pass
+        else:
+            with contextlib.suppress(Exception):
+                await resp.aclose()
+
+        exc = disconnect_task.exception()
+        if exc is None:
+            raise DownstreamDisconnected()
+        raise exc
+
+    return send_task.result()
+
+
 class _ProxyResponse(Response):
     media_type = None
 
@@ -370,8 +429,9 @@ class _ProxyResponse(Response):
                     headers=self._headers,
                 )
 
-                resp = await _await_or_disconnect(
-                    client.send(req, stream=True),
+                resp = await _send_upstream_or_abort(
+                    client,
+                    req,
                     disconnect_task,
                     deadline,
                 )

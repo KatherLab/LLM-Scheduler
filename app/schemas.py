@@ -92,6 +92,7 @@ class EndpointStats(BaseModel):
     gpu_cache_usage: Optional[float] = None
     uptime_seconds: Optional[float] = None
     vllm_version: Optional[str] = None
+    throughput_tps: Optional[float] = None
 
 class DashboardResponse(BaseModel):
     now: datetime

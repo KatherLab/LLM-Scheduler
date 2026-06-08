@@ -395,6 +395,9 @@ function renderMetricsPopover() {
       if (ep.pending_requests != null && ep.pending_requests > 0) {
         html += `<span><span class="text-amber-300 font-medium">${ep.pending_requests}</span> waiting</span>`;
       }
+      if (ep.throughput_tps != null && ep.throughput_tps > 0) {
+        html += `<span><span class="text-slate-300 font-medium">${ep.throughput_tps.toFixed(1)}</span> tok/s</span>`;
+      }
       html += `<span>⏱ ${uptime}</span>`;
       if (ep.vllm_version) {
         html += `<span>⚡ vLLM ${ep.vllm_version}</span>`;

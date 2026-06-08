@@ -403,6 +403,7 @@ async def dashboard():
         s["gpu_cache_usage"] = vm["gpu_cache_usage"]
         s["active_requests"] = vm["active_requests"]
         s["pending_requests"] = vm["pending_requests"]
+        s["throughput_tps"] = vm["throughput_tps"]
 
     if stats_data:
         await asyncio.gather(*[_enrich(s) for s in stats_data])

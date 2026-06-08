@@ -1,11 +1,12 @@
 # app/router_core.py
 from __future__ import annotations
 import asyncio
+import threading
+import time
 from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 import httpx
-import time
 
 from .models import Endpoint
 
@@ -97,18 +98,25 @@ _VLLM_METRIC_KEYS = {
     "vllm:kv_cache_usage_perc": "gpu_cache_usage",
     "vllm:num_requests_running": "active_requests",
     "vllm:num_requests_waiting": "pending_requests",
+    "vllm:generation_tokens_total": "gen_tokens_total",
 }
+
+# Counter delta cache for throughput rate computation.
+# {host:port: (timestamp, gen_tokens_total)}
+_vllm_counter_cache: dict[str, tuple[float, float]] = {}
+_vllm_cache_lock = threading.Lock()
 
 def _parse_vllm_metrics(text: str) -> dict[str, float | int | None]:
     """Extract key gauges from vLLM Prometheus /metrics output.
 
     Returns a dict with keys ``gpu_cache_usage``, ``active_requests``,
-    ``pending_requests`` (or ``None`` if the metric was missing).
+    ``pending_requests``, ``gen_tokens_total`` (or ``None`` if missing).
     """
     result: dict[str, float | int | None] = {
         "gpu_cache_usage": None,
         "active_requests": None,
         "pending_requests": None,
+        "gen_tokens_total": None,
     }
     for line in text.splitlines():
         line = line.strip()
@@ -135,17 +143,44 @@ def _parse_vllm_metrics(text: str) -> dict[str, float | int | None]:
 async def fetch_vllm_metrics(
     host: str, port: int, timeout_s: float = 2.0
 ) -> dict[str, float | int | None]:
-    """Fetch /metrics from a vLLM instance and extract key gauges.
+    """Fetch /metrics from a vLLM instance and extract key gauges + throughput.
 
-    Returns the same dict shape as ``_parse_vllm_metrics`` (all values
-    may be ``None`` if the fetch fails or the metric is absent).
+    Returns a dict with keys ``gpu_cache_usage``, ``active_requests``,
+    ``pending_requests``, ``throughput_tps`` (tokens/s, computed from counter
+    deltas). Values may be ``None`` if the fetch fails or the metric is absent.
     """
+    result: dict[str, float | int | None] = {
+        "gpu_cache_usage": None,
+        "active_requests": None,
+        "pending_requests": None,
+        "throughput_tps": None,
+    }
     url = f"http://{host}:{port}/metrics"
     try:
         client = await _get_health_client()
         r = await client.get(url, timeout=timeout_s)
         if r.status_code == 200:
-            return _parse_vllm_metrics(r.text)
+            parsed = _parse_vllm_metrics(r.text)
+            result.update(parsed)
+
+            # Compute generation throughput from counter deltas
+            gen_total = parsed.get("gen_tokens_total")
+            if gen_total is not None:
+                now = time.time()
+                key = f"{host}:{port}"
+                with _vllm_cache_lock:
+                    prev = _vllm_counter_cache.get(key)
+                    if prev is not None:
+                        prev_time, prev_gen = prev
+                        dt = now - prev_time
+                        dg = gen_total - prev_gen
+                        if dt >= 1.0 and dg >= 0:
+                            result["throughput_tps"] = round(dg / dt, 1)
+                        elif dg < 0:
+                            # Counter reset (vLLM restart) — reset cache
+                            _vllm_counter_cache[key] = (now, gen_total)
+                            return result
+                    _vllm_counter_cache[key] = (now, gen_total)
     except Exception:
         pass
-    return {"gpu_cache_usage": None, "active_requests": None, "pending_requests": None}
+    return result

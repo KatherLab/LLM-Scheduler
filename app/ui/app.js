@@ -332,10 +332,10 @@ function renderMetricsPopover() {
   if (activeTotal > 0) {
     html += `<div class="flex gap-1 h-2 rounded-full overflow-hidden bg-slate-200 dark:bg-slate-700">`;
     const endpoints_active = Object.entries(active.by_endpoint || {}).sort((a, b) => b[1] - a[1]);
-    for (const [ep, count] of endpoints_active) {
+    endpoints_active.forEach(([ep, count], idx) => {
       const pct = (count / activeTotal) * 100;
-      html += `<div class="h-full rounded-full" style="width:${pct}%;background:hsl(${(endpoints_active.indexOf([ep,count]) * 60) % 360 + 200}, 60%, 50%)" title="${escapeHtml(ep)}: ${count}"></div>`;
-    }
+      html += `<div class="h-full rounded-full" style="width:${pct}%;background:hsl(${(idx * 60) % 360 + 200}, 60%, 50%)" title="${escapeHtml(ep)}: ${count}"></div>`;
+    });
     html += `</div>`;
     html += `<div class="flex flex-wrap gap-x-3 gap-y-0.5 mt-1.5">`;
     for (const [ep, count] of endpoints_active) {

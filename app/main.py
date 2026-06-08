@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from .auth import auth_router, require_auth, get_session
 from fastapi.responses import FileResponse, RedirectResponse
@@ -23,6 +24,7 @@ from .public_api import router as public_api_router
 from . import slurm
 from .utils import ensure_utc
 from .lifecycle_logger import log_health_check, log_state_transition, log_slurm_action
+from .metrics import generate_latest, UPSTREAM_HEALTHY
 
 # ── Supervised task wrapper ─────────────────────────────────────────────────
 async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
@@ -260,8 +262,15 @@ async def audio_translations(request: Request):
 
 
 @app.get("/metrics")
-async def metrics(request: Request, model: str):
-    """Proxy the vLLM Prometheus metrics endpoint for a given model."""
+async def metrics(request: Request, model: Optional[str] = None):
+    """Proxy-level Prometheus metrics, or forward to a vLLM instance.
+
+    - ``GET /metrics``               — proxy's own Prometheus metrics
+    - ``GET /metrics?model=xxx``     — vLLM instance metrics for that model
+    """
+    if model is None:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(generate_latest().decode("utf-8"), media_type="text/plain")
     with SessionLocal() as db:
         upstream = _resolve_upstream(db, model)
     return await proxy_get(request, upstream_url=f"{upstream}/metrics")
@@ -296,6 +305,15 @@ async def health_worker():
 
             # ── Phase 1: snapshot endpoints we need to check ────────────
             with SessionLocal() as db:
+                # Update UPSTREAM_HEALTHY gauge: 1 for READY models, 0 otherwise
+                all_model_rows = db.execute(select(Endpoint.model)).scalars().all()
+                ready_model_rows = db.execute(
+                    select(Endpoint.model).where(Endpoint.state == "READY")
+                ).scalars().all()
+                ready_set = set(ready_model_rows)
+                for m in set(all_model_rows):
+                    UPSTREAM_HEALTHY.labels(model=m).set(1 if m in ready_set else 0)
+
                 eps = db.execute(
                     select(Endpoint).where(
                         Endpoint.state.in_(["STARTING", "READY"])

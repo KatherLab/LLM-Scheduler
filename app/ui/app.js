@@ -64,6 +64,7 @@ let DASH = null;
 let MODEL_MAP = new Map();
 let selectedTags = new Set();
 let REFRESH_INTERVAL = null;
+let METRICS_DATA = null;
 
 // ─── Scroll Tracking ────────────────────────────────────────────────────────
 let userHasScrolled = false;
@@ -152,6 +153,13 @@ function formatDuration(seconds) {
   return `${m}m`;
 }
 
+function fmtLatency(seconds) {
+  if (seconds == null) return '—';
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${Math.round(seconds)}s`;
+}
+
 function svgPoint(svg, clientX, clientY) {
   const pt = svg.createSVGPoint();
   pt.x = clientX; pt.y = clientY;
@@ -214,6 +222,14 @@ async function refresh() {
     renderTable();
     renderStatusIndicators();
 
+    // Refresh metrics in the background (non-blocking, fire-and-forget within the try)
+    refreshMetrics().then(() => {
+      const popover = $('#metricsPopover');
+      if (popover && !popover.classList.contains('hidden')) {
+        renderMetricsPopover();
+      }
+    });
+
     // Only repopulate modal models if the modal is NOT currently open,
     // or preserve the current selection if it is.
     const modalOpen = !modalBackdrop.classList.contains('hidden');
@@ -258,8 +274,174 @@ function renderStatusIndicators() {
   container.innerHTML = html;
 }
 
+// ─── Metrics Popover ────────────────────────────────────────────────────────
+async function refreshMetrics() {
+  try {
+    METRICS_DATA = await api('/admin/metrics/summary');
+  } catch (e) {
+    // Silently ignore — metrics are non-critical
+    METRICS_DATA = null;
+  }
+  renderMetricsBadgeCount();
+}
 
-// ─── Tag Filter Chips ───────────────────────────────────────────────────────
+function renderMetricsBadgeCount() {
+  const badge = $('#metricsBadgeCount');
+  if (!badge) return;
+  if (METRICS_DATA && METRICS_DATA.active_requests?.total > 0) {
+    badge.textContent = METRICS_DATA.active_requests.total;
+    badge.className = 'inline-flex items-center justify-center w-4 h-4 rounded-full bg-brand-500/20 text-brand-400 text-[10px] font-bold';
+  } else {
+    badge.textContent = '';
+    badge.className = '';
+  }
+}
+
+function renderMetricsPopover() {
+  const container = $('#metricsPopoverContent');
+  if (!container) return;
+  if (!METRICS_DATA) {
+    container.innerHTML = '<div class="text-center text-slate-500 py-4">No metrics available</div>';
+    return;
+  }
+
+  const m = METRICS_DATA;
+  const requests = m.requests || {};
+  const active = m.active_requests || {};
+  const errors = m.errors || {};
+  const latency = m.latency || {};
+  const health = m.upstream_health || {};
+  const disconnects = m.downstream_disconnects || 0;
+
+  const endpoints = Object.keys(requests.by_endpoint || {}).sort();
+  const healthyCount = Object.values(health).filter(Boolean).length;
+  const totalModels = Object.keys(health).length;
+
+  let html = '';
+
+  // ── Header ──
+  html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3">Proxy Metrics</div>`;
+
+  // ── Active Requests gauge ──
+  const activeTotal = active.total || 0;
+  html += `<div class="mb-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">`;
+  html += `<div class="flex items-center justify-between mb-1">`;
+  html += `<span class="font-medium text-slate-700 dark:text-slate-300">Active Requests</span>`;
+  html += `<span class="text-lg font-bold text-brand-400">${activeTotal}</span>`;
+  html += `</div>`;
+  if (activeTotal > 0) {
+    html += `<div class="flex gap-1 h-2 rounded-full overflow-hidden bg-slate-200 dark:bg-slate-700">`;
+    const endpoints_active = Object.entries(active.by_endpoint || {}).sort((a, b) => b[1] - a[1]);
+    for (const [ep, count] of endpoints_active) {
+      const pct = (count / activeTotal) * 100;
+      html += `<div class="h-full rounded-full" style="width:${pct}%;background:hsl(${(endpoints_active.indexOf([ep,count]) * 60) % 360 + 200}, 60%, 50%)" title="${escapeHtml(ep)}: ${count}"></div>`;
+    }
+    html += `</div>`;
+    html += `<div class="flex flex-wrap gap-x-3 gap-y-0.5 mt-1.5">`;
+    for (const [ep, count] of endpoints_active) {
+      html += `<span class="text-[10px] text-slate-500">${escapeHtml(ep)}: ${count}</span>`;
+    }
+    html += `</div>`;
+  }
+  html += `</div>`;
+
+  // ── Request & Error summary table ──
+  html += `<div class="mb-3 overflow-x-auto">`;
+  html += `<table class="w-full text-[11px]">`;
+  html += `<thead><tr class="text-slate-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">`;
+  html += `<th class="text-left py-1 pr-2 font-medium">Endpoint</th>`;
+  html += `<th class="text-right px-2 py-1 font-medium">2xx</th>`;
+  html += `<th class="text-right px-2 py-1 font-medium">4xx</th>`;
+  html += `<th class="text-right px-2 py-1 font-medium">5xx</th>`;
+  html += `<th class="text-right px-2 py-1 font-medium">Errors</th>`;
+  html += `<th class="text-right pl-2 py-1 font-medium">Total</th>`;
+  html += `</tr></thead><tbody>`;
+  for (const ep of endpoints) {
+    const epReq = requests.by_endpoint[ep] || {};
+    const byStatus = epReq.by_status || {};
+    const req2xx = Object.entries(byStatus).filter(([s]) => s.startsWith('2')).reduce((a, [, v]) => a + v, 0);
+    const req4xx = Object.entries(byStatus).filter(([s]) => s.startsWith('4')).reduce((a, [, v]) => a + v, 0);
+    const req5xx = Object.entries(byStatus).filter(([s]) => s.startsWith('5')).reduce((a, [, v]) => a + v, 0);
+    const total = epReq.total || 0;
+    const epErrors = (errors.by_endpoint || {})[ep] || {};
+    const errTotal = epErrors.total || 0;
+
+    html += `<tr class="border-b border-gray-100 dark:border-slate-800">`;
+    html += `<td class="py-1.5 pr-2 text-slate-700 dark:text-slate-300 font-medium">${escapeHtml(ep)}</td>`;
+    html += `<td class="text-right px-2 py-1.5 text-emerald-500">${req2xx}</td>`;
+    html += `<td class="text-right px-2 py-1.5 text-amber-400">${req4xx}</td>`;
+    html += `<td class="text-right px-2 py-1.5 text-red-400">${req5xx}</td>`;
+    html += `<td class="text-right px-2 py-1.5 text-red-400">${errTotal > 0 ? errTotal : '—'}</td>`;
+    html += `<td class="text-right pl-2 py-1.5 text-slate-500">${total}</td>`;
+    html += `</tr>`;
+  }
+  if (endpoints.length === 0) {
+    html += `<tr><td colspan="6" class="py-3 text-center text-slate-500">No requests yet</td></tr>`;
+  }
+  html += `</tbody></table>`;
+  html += `</div>`;
+
+  // ── Latency table ──
+  const latencyEndpoints = Object.keys(latency).sort();
+  if (latencyEndpoints.length > 0) {
+    html += `<div class="mb-3 overflow-x-auto">`;
+    html += `<table class="w-full text-[11px]">`;
+    html += `<thead><tr class="text-slate-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">`;
+    html += `<th class="text-left py-1 pr-2 font-medium">Endpoint</th>`;
+    html += `<th class="text-right px-2 py-1 font-medium">Avg</th>`;
+    html += `<th class="text-right px-2 py-1 font-medium">p50</th>`;
+    html += `<th class="text-right px-2 py-1 font-medium">p95</th>`;
+    html += `<th class="text-right px-2 py-1 font-medium">p99</th>`;
+    html += `<th class="text-right pl-2 py-1 font-medium">Count</th>`;
+    html += `</tr></thead><tbody>`;
+    for (const ep of latencyEndpoints) {
+      const l = latency[ep];
+      html += `<tr class="border-b border-gray-100 dark:border-slate-800">`;
+      html += `<td class="py-1.5 pr-2 text-slate-700 dark:text-slate-300 font-medium">${escapeHtml(ep)}</td>`;
+      const avg = l.avg != null ? fmtLatency(l.avg) : '—';
+      const p50 = l.p50 != null ? fmtLatency(l.p50) : '—';
+      const p95 = l.p95 != null ? fmtLatency(l.p95) : '—';
+      const p99 = l.p99 != null ? fmtLatency(l.p99) : '—';
+      html += `<td class="text-right px-2 py-1.5 text-slate-500">${avg}</td>`;
+      html += `<td class="text-right px-2 py-1.5 text-slate-300">${p50}</td>`;
+      html += `<td class="text-right px-2 py-1.5 text-slate-300">${p95}</td>`;
+      html += `<td class="text-right px-2 py-1.5 text-slate-300">${p99}</td>`;
+      html += `<td class="text-right pl-2 py-1.5 text-slate-500">${l.count}</td>`;
+      html += `</tr>`;
+    }
+    html += `</tbody></table>`;
+    html += `</div>`;
+  }
+
+  // ── Error detail (if any type breakdowns) ──
+  const errorEndpoints = Object.entries(errors.by_endpoint || {}).filter(([, v]) => v.total > 0);
+  if (errorEndpoints.length > 0) {
+    html += `<div class="mb-3 p-3 rounded-lg bg-red-500/5 border border-red-500/20">`;
+    html += `<div class="font-medium text-red-400 mb-1.5">Upstream Errors</div>`;
+    for (const [ep, epData] of errorEndpoints) {
+      const byType = epData.by_type || {};
+      const typeEntries = Object.entries(byType).sort((a, b) => b[1] - a[1]);
+      html += `<div class="mb-1">`;
+      html += `<span class="text-slate-600 dark:text-slate-400">${escapeHtml(ep)}</span>`;
+      html += `<div class="flex flex-wrap gap-1.5 mt-0.5">`;
+      for (const [type, count] of typeEntries) {
+        html += `<span class="inline-flex items-center px-1.5 py-0.5 rounded bg-red-500/10 text-red-300 text-[10px]">${escapeHtml(type)}: ${count}</span>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `</div>`;
+  }
+
+  // ── Footer stats ──
+  html += `<div class="flex items-center justify-between pt-2 border-t border-gray-200 dark:border-slate-700 text-slate-500">`;
+  html += `<span>⬇ disconnects: ${disconnects}</span>`;
+  if (totalModels > 0) {
+    html += `<span>${healthyCount}/${totalModels} models healthy</span>`;
+  }
+  html += `</div>`;
+
+  container.innerHTML = html;
+}
 function renderTagFilters() {
   const container = $('#tagFilters');
   if (!DASH) { container.innerHTML = ''; return; }
@@ -2787,6 +2969,27 @@ window.dismissFailedLease = async (id) => {
 
 // ─── Controls & Init ────────────────────────────────────────────────────────
 $('#refreshBtn').addEventListener('click', refresh);
+
+// ─── Metrics Popover toggle ────────────────────────────────────────────────
+$('#metricsBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const popover = $('#metricsPopover');
+  const isHidden = popover.classList.contains('hidden');
+  // Close all other popovers
+  $('#zoomSettingsPopover').classList.add('hidden');
+  if (isHidden) {
+    renderMetricsPopover();
+    popover.classList.remove('hidden');
+  } else {
+    popover.classList.add('hidden');
+  }
+});
+document.addEventListener('click', (e) => {
+  const container = $('#metricsContainer');
+  if (container && !container.contains(e.target)) {
+    $('#metricsPopover').classList.add('hidden');
+  }
+});
 $('#snapToNowBtn').addEventListener('click', () => {
   // Reset the user scroll flag so auto-scroll takes over
   userHasScrolled = false;
@@ -2933,5 +3136,6 @@ window.addEventListener('resize', () => {
 
 // Init
 initDragHandlers();
+refreshMetrics();
 refresh();
 startAutoRefresh();

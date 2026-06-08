@@ -13,6 +13,7 @@ from typing import Optional
 
 from .settings import settings
 from .models import Lease, Endpoint
+from .metrics import get_metrics_summary
 from .schemas import (
     LeaseCreate, LeaseOut, LeaseExtend, LeaseUpdate, LeaseShortenRequest,
     EndpointRegister, EndpointOut, DashboardResponse, DashboardModel,
@@ -378,6 +379,12 @@ def dashboard():
             leases=out_leases,
             endpoint_stats=stats,
         )
+
+
+@router.get("/metrics/summary")
+def metrics_summary():
+    """Return proxy metrics as structured JSON (no auth required for internal route)."""
+    return get_metrics_summary()
 
 
 @router.get("/leases", response_model=list[LeaseOut])

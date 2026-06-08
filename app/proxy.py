@@ -11,6 +11,8 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
+from .metrics import endpoint_label, track_proxy
+
 logger = logging.getLogger(__name__)
 
 HOP_BY_HOP_HEADERS = {
@@ -355,94 +357,102 @@ class _ProxyResponse(Response):
         resp: httpx.Response | None = None
         self._response_started = False  # ← NEW: track ASGI response lifecycle
 
-        try:
-            req = client.build_request(
-                "POST",
-                self._upstream_url,
-                content=self._body,
-                data=self._data,
-                files=self._files,
-                headers=self._headers,
-            )
-
-            resp = await _await_or_disconnect(
-                client.send(req, stream=True),
-                disconnect_task,
-                deadline,
-            )
-
-            # Non-stream: buffer whole upstream body before sending anything.
-            if not self._is_stream:
-                await self._send_buffered_response(scope, receive, send, resp, disconnect_task, deadline)
-                return
-
-            # Stream: if upstream already errored, buffer and return that error.
-            if resp.status_code >= 400:
-                await self._send_buffered_response(scope, receive, send, resp, disconnect_task, deadline)
-                return
-
-            await self._send_streaming_response(send, resp, disconnect_task, deadline)
-
-        except DownstreamDisconnected:
-            # Client disconnected before we finished. If we hadn't started a
-            # response yet, satisfy the ASGI contract with a 499 so uvicorn
-            # does NOT synthesize a 500 "ASGI callable returned without
-            # starting response".
-            logger.info(
-                "proxy: downstream disconnected (url=%s, response_started=%s)",
-                self._upstream_url, self._response_started,
-            )
-            await self._safe_empty_response(send, status=499)
-            return
-
-        except OSError as exc:
-            # Socket-level error talking to the downstream client. If we have
-            # not started a response, still try to satisfy the ASGI contract.
-            logger.warning(
-                "proxy: OSError during proxy (url=%s, response_started=%s): %s",
-                self._upstream_url, self._response_started, exc,
-            )
-            await self._safe_empty_response(send, status=499)
-            return
-
-        except Exception as exc:
-            # Real error (upstream timeout, connection error, proxy bug, ...).
-            # These must be propagated to the client whenever possible.
-            logger.exception("proxy failed: %s", self._upstream_url)
-
-            if not self._response_started:
-                try:
-                    await self._send_error_response(scope, receive, send, exc)
-                except OSError:
-                    # Client is already gone — still satisfy ASGI contract.
-                    await self._safe_empty_response(send, status=500)
-                except Exception:
-                    logger.exception("proxy: failed to send error response")
-                    await self._safe_empty_response(send, status=500)
-            else:
-                # Mid-stream failure: we already sent http.response.start with
-                # a 2xx status, so we cannot change the status code now. Best
-                # we can do is cleanly close the body. Log so ops can see it.
-                logger.error(
-                    "proxy: error after response started (url=%s): %s",
-                    self._upstream_url, exc,
+        async with track_proxy(self._upstream_url) as _ctx:
+            try:
+                req = client.build_request(
+                    "POST",
+                    self._upstream_url,
+                    content=self._body,
+                    data=self._data,
+                    files=self._files,
+                    headers=self._headers,
                 )
-                with contextlib.suppress(Exception):
-                    await send({
-                        "type": "http.response.body",
-                        "body": b"",
-                        "more_body": False,
-                    })
-            return
 
-        finally:
-            disconnect_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await disconnect_task
+                resp = await _await_or_disconnect(
+                    client.send(req, stream=True),
+                    disconnect_task,
+                    deadline,
+                )
 
-            if resp is not None:
-                with contextlib.suppress(Exception):
-                    await resp.aclose()
+                # Non-stream: buffer whole upstream body before sending anything.
+                if not self._is_stream:
+                    await self._send_buffered_response(scope, receive, send, resp, disconnect_task, deadline)
+                    _ctx["status"] = resp.status_code
+                    return
+
+                # Stream: if upstream already errored, buffer and return that error.
+                if resp.status_code >= 400:
+                    await self._send_buffered_response(scope, receive, send, resp, disconnect_task, deadline)
+                    _ctx["status"] = resp.status_code
+                    return
+
+                await self._send_streaming_response(send, resp, disconnect_task, deadline)
+                _ctx["status"] = resp.status_code
+
+            except DownstreamDisconnected:
+                # Client disconnected before we finished. If we hadn't started a
+                # response yet, satisfy the ASGI contract with a 499 so uvicorn
+                # does NOT synthesize a 500 "ASGI callable returned without
+                # starting response".
+                logger.info(
+                    "proxy: downstream disconnected (url=%s, response_started=%s)",
+                    self._upstream_url, self._response_started,
+                )
+                await self._safe_empty_response(send, status=499)
+                _ctx["status"] = 499
+                return
+
+            except OSError as exc:
+                # Socket-level error talking to the downstream client. If we have
+                # not started a response, still try to satisfy the ASGI contract.
+                logger.warning(
+                    "proxy: OSError during proxy (url=%s, response_started=%s): %s",
+                    self._upstream_url, self._response_started, exc,
+                )
+                await self._safe_empty_response(send, status=499)
+                _ctx["status"] = 499
+                return
+
+            except Exception as exc:
+                # Real error (upstream timeout, connection error, proxy bug, ...).
+                # These must be propagated to the client whenever possible.
+                logger.exception("proxy failed: %s", self._upstream_url)
+                _ctx["error"] = type(exc).__name__
+                _ctx["status"] = _status_for_httpx_exc(exc)
+
+                if not self._response_started:
+                    try:
+                        await self._send_error_response(scope, receive, send, exc)
+                    except OSError:
+                        # Client is already gone — still satisfy ASGI contract.
+                        await self._safe_empty_response(send, status=500)
+                    except Exception:
+                        logger.exception("proxy: failed to send error response")
+                        await self._safe_empty_response(send, status=500)
+                else:
+                    # Mid-stream failure: we already sent http.response.start with
+                    # a 2xx status, so we cannot change the status code now. Best
+                    # we can do is cleanly close the body. Log so ops can see it.
+                    logger.error(
+                        "proxy: error after response started (url=%s): %s",
+                        self._upstream_url, exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await send({
+                            "type": "http.response.body",
+                            "body": b"",
+                            "more_body": False,
+                        })
+                return
+
+            finally:
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await disconnect_task
+
+                if resp is not None:
+                    with contextlib.suppress(Exception):
+                        await resp.aclose()
 
 
 async def proxy_json_or_stream(
@@ -500,12 +510,19 @@ async def proxy_get(
     headers = dict(request.headers)
     headers.pop("host", None)
 
-    resp = await client.get(upstream_url, headers=headers, timeout=timeout_s)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers=_filter_headers(resp.headers),
-    )
+    async with track_proxy(upstream_url) as _ctx:
+        try:
+            resp = await client.get(upstream_url, headers=headers, timeout=timeout_s)
+            _ctx["status"] = resp.status_code
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=_filter_headers(resp.headers),
+            )
+        except Exception as exc:
+            _ctx["error"] = type(exc).__name__
+            _ctx["status"] = _status_for_httpx_exc(exc)
+            raise
 
 
 async def proxy_multipart(

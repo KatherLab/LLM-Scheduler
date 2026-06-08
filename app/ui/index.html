@@ -222,6 +222,22 @@
               </div>
             </div>
           </div>
+
+          <!-- Metrics button + popover -->
+          <div id="metricsContainer" class="relative">
+            <button id="metricsBtn" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-gray-300 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition text-xs font-medium text-slate-600 dark:text-slate-300" title="View proxy metrics">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+              <span id="metricsBadgeCount"></span>
+              Metrics
+            </button>
+            <!-- Metrics popover -->
+            <div id="metricsPopover" class="hidden absolute right-0 top-full mt-2 z-50 bg-white dark:bg-slate-900 rounded-xl border border-gray-200 dark:border-slate-700 shadow-2xl w-[420px] popover-enter">
+              <div id="metricsPopoverContent" class="p-4 text-xs">
+                <!-- Rendered by JS -->
+                <div class="text-center text-slate-500 py-4">Loading…</div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <button id="refreshBtn" class="px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-md hover:bg-brand-500 transition flex items-center gap-2">

@@ -232,10 +232,33 @@ def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
     )
     p = placements.get(candidate.id)
     if p and p.conflict:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Not enough GPUs available for that time window (needs {candidate.requested_gpus}).",
-        )
+        # Find conflicting leases for a better error message
+        cand_begin = _lease_begin(candidate)
+        cand_end = _lease_end(candidate)
+        conflict_details = []
+        for other in leases:
+            if other.id == candidate.id:
+                continue
+            if other.state not in ("PLANNED", "SUBMITTED", "STARTING", "RUNNING"):
+                continue
+            ob = _lease_begin(other)
+            oe = _lease_end(other)
+            # Check time overlap
+            if cand_end <= ob or oe <= cand_begin:
+                continue
+            op = placements.get(other.id)
+            if op and not op.conflict and op.lane_start is not None:
+                conflict_details.append(
+                    f"{other.model} (GPU {op.lane_start}-{op.lane_start + op.lane_count - 1}, "
+                    f"{ob.strftime('%H:%M')}–{oe.strftime('%H:%M')})"
+                )
+        if conflict_details:
+            detail = f"GPU conflict: needs {candidate.requested_gpus} GPUs but overlaps with {', '.join(conflict_details[:3])}"
+            if len(conflict_details) > 3:
+                detail += f" and {len(conflict_details) - 3} more"
+        else:
+            detail = f"Not enough contiguous GPUs available for this time window (needs {candidate.requested_gpus})."
+        raise HTTPException(status_code=409, detail=detail)
 
 def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: datetime, end: datetime) -> Optional[Lease]:
     existing = db.execute(

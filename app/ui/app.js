@@ -216,6 +216,11 @@ async function refresh() {
     DASH = await api('/admin/dashboard');
     MODEL_MAP = new Map(DASH.models.map(m => [m.id, m]));
     $('#subtitle').textContent = `${DASH.total_gpus} GPUs · ${fmtTime(new Date(DASH.now))}`;
+    const lr = $('#lastRefreshed');
+    if (lr) {
+      lr.classList.remove('hidden');
+      lr.textContent = `Updated ${fmtTime(new Date())}`;
+    }
     renderCatalog();
     renderTagFilters();
     renderTimeline();
@@ -494,8 +499,20 @@ function renderCatalog() {
   const models = DASH.models
     .filter(m => {
       if (q && !m.id.toLowerCase().includes(q)) return false;
-      if (filter === 'ready' && !m.ready) return false;
-      if (filter === 'stopped' && m.ready) return false;
+      if (filter === 'all') return true;
+
+      // Determine model status for filtering
+      const hasReadyEP = m.ready;
+      const hasLoadingLease = DASH.leases.some(l =>
+        l.model === m.id && ['SUBMITTED', 'STARTING'].includes(l.state)
+      );
+      const hasPlannedLease = DASH.leases.some(l =>
+        l.model === m.id && l.state === 'PLANNED'
+      );
+
+      if (filter === 'ready') return hasReadyEP;
+      if (filter === 'loading') return !hasReadyEP && (hasLoadingLease || hasPlannedLease);
+      if (filter === 'notloaded') return !hasReadyEP && !hasLoadingLease && !hasPlannedLease;
 
       if (selectedTags.size > 0) {
         const modelTags = new Set(m.meta?.tags || []);
@@ -516,7 +533,13 @@ function renderCatalog() {
     const g = meta.gpus ?? '?';
     const tp = meta.tensor_parallel_size ?? '?';
     const notes = meta.notes || '';
-    const isRunning = m.ready;
+    const hasReadyEP = m.ready;
+    const hasLoadingLease = DASH.leases.some(l =>
+      l.model === m.id && ['SUBMITTED', 'STARTING'].includes(l.state)
+    );
+    const hasPlannedLease = DASH.leases.some(l =>
+      l.model === m.id && l.state === 'PLANNED'
+    );
 
     // Find endpoint stats for this model
     const epStats = (DASH.endpoint_stats || []).filter(s => s.model === m.id && s.state === 'READY');
@@ -531,11 +554,22 @@ function renderCatalog() {
       </div>`;
     }
 
-    const badge = isRunning
-      ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-           <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>Running
-         </span>`
-      : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-400 border border-slate-500/30">Idle</span>`;
+    let badge;
+    if (hasReadyEP) {
+      badge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>Ready to use
+      </span>`;
+    } else if (hasLoadingLease) {
+      badge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-amber-500/15 text-amber-300 border border-amber-500/30">
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 mr-1.5 animate-pulse"></span>Loading
+      </span>`;
+    } else if (hasPlannedLease) {
+      badge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-sky-500/15 text-sky-300 border border-sky-500/30">
+        Scheduled to load
+      </span>`;
+    } else {
+      badge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-slate-500/15 text-slate-400 border border-slate-500/30">Not loaded</span>`;
+    }
 
     return `
       <div class="catalog-card rounded-xl border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 hover:shadow-md hover:border-brand-500/30 transition-all duration-150"
@@ -560,7 +594,7 @@ function renderCatalog() {
             <svg class="w-3.5 h-3.5 inline mr-1 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
             Schedule
           </button>
-          ${isRunning ? `
+          ${hasReadyEP ? `
             <button class="px-3 py-2 text-xs rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 transition"
               onclick="event.stopPropagation(); viewLogs('${escapeHtml(m.id)}')">Logs</button>
           ` : ''}
@@ -657,7 +691,8 @@ function onCatalogDragEnd(e) {
     const y = TL.headerH + laneStart * TL.laneH + 4;
     const h = gpus * TL.laneH - 8;
 
-    const hasConflict = checkVisualConflict(hoverDate, endDate, gpus, null);
+    const hasConflict = checkVisualConflict(hoverDate, endDate, laneStart, gpus, null);
+    const conflictInfo = hasConflict ? findConflictingLeaseDetails(hoverDate, endDate, laneStart, gpus, null) : null;
 
     const g = drawGroup(svg, { class: 'catalog-drop-ghost ghost-block' });
     drawRect(g, x, y, Math.max(8, w), h, {
@@ -672,11 +707,24 @@ function onCatalogDragEnd(e) {
       'font-size': 11,
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
     });
-    drawText(g, x + 10, y + 34, `${fmtHour(hoverDate)} → ${fmtHour(endDate)} · ${gpus} GPUs`, {
-      fill: hasConflict ? '#fca5a5' : '#7dd3fc',
-      'font-size': 10,
-      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    });
+    if (hasConflict && conflictInfo) {
+      drawText(g, x + 10, y + 34, `⚠ Conflict with ${conflictInfo.model}`, {
+        fill: '#fca5a5',
+        'font-size': 10,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+      drawText(g, x + 10, y + 48, `GPU ${conflictInfo.laneStart}–${conflictInfo.laneStart + conflictInfo.laneCount - 1} until ${fmtHour(conflictInfo.endAt)}`, {
+        fill: '#fca5a5',
+        'font-size': 10,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    } else {
+      drawText(g, x + 10, y + 34, `${fmtHour(hoverDate)} → ${fmtHour(endDate)} · ${gpus} GPUs`, {
+        fill: hasConflict ? '#fca5a5' : '#7dd3fc',
+        'font-size': 10,
+        'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      });
+    }
   });
 
   container.addEventListener('dragleave', (e) => {
@@ -864,7 +912,7 @@ function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = 
 
   // Populate notes from existing lease if editing
   const existingLease = leaseId ? DASH?.leases?.find(l => l.id === leaseId) : null;
-  $('#modalNotes').value = existingLease?.notes || '';')'
+  $('#modalNotes').value = existingLease?.notes || '';
 
   populateModalModels(model);
 
@@ -1148,6 +1196,39 @@ $('#modalSave').addEventListener('click', async () => {
     await refresh();
   } catch (e) {
     showModalError(e.message);
+    // Offer ASAP retry for 409 conflict errors
+    if (e.message.includes('GPU conflict') || e.message.includes('409') || e.message.includes('Not enough GPUs')) {
+      const el = $('#modalError');
+      const asapBtn = document.createElement('button');
+      asapBtn.className = 'mt-3 px-3 py-1.5 text-xs rounded-lg bg-amber-600 text-white hover:bg-amber-500 transition font-medium block w-full text-center';
+      asapBtn.textContent = '⚡ Find next free slot (ASAP)';
+      asapBtn.onclick = () => {
+        modalState.asap = true;
+        // Re-trigger save by clicking the save button again
+        // Instead, rebuild the payload and submit
+        const model = $('#modalModel').value;
+        const durationHours = modalState.durationHours;
+        const payload = {
+          model,
+          duration_seconds: durationHours * 3600,
+          notes: $('#modalNotes').value.trim() || null,
+          asap: true,
+        };
+        $('#modalError').classList.add('hidden');
+        asapBtn.remove();
+        api("/admin/leases", {
+          method: "POST",
+          body: JSON.stringify(payload)
+        }).then(() => {
+          toast(`Booking created for ${model} (ASAP)`, 'success');
+          closeModal();
+          refresh();
+        }).catch(err => {
+          showModalError(err.message);
+        });
+      };
+      el.appendChild(asapBtn);
+    }
   }
 });
 
@@ -1156,6 +1237,128 @@ function showModalError(msg) {
   el.textContent = msg;
   el.classList.remove('hidden');
 }
+
+// ─── Notes Inline Modal ─────────────────────────────────────────────────────
+let _notesModalLeaseId = null;
+
+function openNotesModal(leaseId, currentNotes, modelName) {
+  _notesModalLeaseId = leaseId;
+  $('#notesModalInput').value = currentNotes || '';
+  $('#notesModalSubtitle').textContent = modelName ? `Edit notes for ${modelName}` : '';
+  $('#notesModalError').classList.add('hidden');
+  $('#notesModalBackdrop').classList.remove('hidden');
+  $('#notesModalInput').focus();
+}
+
+$('#notesModalSave').addEventListener('click', async () => {
+  const notes = $('#notesModalInput').value;
+  const id = _notesModalLeaseId;
+  if (!id) return;
+  try {
+    await api(`/admin/leases/${id}/notes`, {
+      method: "PATCH",
+      body: JSON.stringify({ notes })
+    });
+    toast('Notes updated', 'success');
+    $('#notesModalBackdrop').classList.add('hidden');
+    hideBlockPopover();
+    await refresh();
+  } catch (err) {
+    $('#notesModalError').textContent = err.message;
+    $('#notesModalError').classList.remove('hidden');
+  }
+});
+
+$('#notesModalCancel').addEventListener('click', () => {
+  $('#notesModalBackdrop').classList.add('hidden');
+});
+$('#notesModalBackdrop').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) $('#notesModalBackdrop').classList.add('hidden');
+});
+
+// ─── Shorten Inline Modal ───────────────────────────────────────────────────
+let _shortenLeaseId = null;
+let _shortenEndAt = null;
+
+function openShortenModal(leaseId, endAt, modelName) {
+  const currentEnd = new Date(endAt);
+  const now = new Date();
+  const remainingMin = Math.round((currentEnd - now) / 60000);
+
+  if (remainingMin <= 5) {
+    toast('Booking ends too soon to shorten', 'info');
+    return;
+  }
+
+  _shortenLeaseId = leaseId;
+  _shortenEndAt = currentEnd;
+  $('#shortenModalInfo').textContent = `${modelName} — currently ends at ${fmtTime(currentEnd)} (${remainingMin}m remaining)`;
+  $('#shortenCustomMins').value = '';
+  $('#shortenModalError').classList.add('hidden');
+  // Show/hide preset options based on remaining time
+  $$('#shortenModalBackdrop .shorten-opt').forEach(btn => {
+    const mins = parseInt(btn.dataset.minutes, 10);
+    btn.style.display = mins < remainingMin ? '' : 'none';
+  });
+  $('#shortenModalBackdrop').classList.remove('hidden');
+}
+
+async function _doShorten(minutesFromNow) {
+  const now = new Date();
+  const currentEnd = _shortenEndAt;
+  const id = _shortenLeaseId;
+  if (!id || !currentEnd) return;
+
+  if (minutesFromNow < 1) {
+    $('#shortenModalError').textContent = 'Must be at least 1 minute.';
+    $('#shortenModalError').classList.remove('hidden');
+    return;
+  }
+  if (isNaN(minutesFromNow)) {
+    $('#shortenModalError').textContent = 'Invalid number.';
+    $('#shortenModalError').classList.remove('hidden');
+    return;
+  }
+
+  const newEnd = new Date(now.getTime() + minutesFromNow * 60000);
+  if (newEnd >= currentEnd) {
+    $('#shortenModalError').textContent = 'New end must be before current end. Use extend instead.';
+    $('#shortenModalError').classList.remove('hidden');
+    return;
+  }
+
+  try {
+    await api(`/admin/leases/${id}/shorten`, {
+      method: "POST",
+      body: JSON.stringify({ new_end_at: newEnd.toISOString() })
+    });
+    toast(`Shortened to end at ${fmtTime(newEnd)}`, 'success');
+    $('#shortenModalBackdrop').classList.add('hidden');
+    await refresh();
+  } catch (e) {
+    $('#shortenModalError').textContent = e.message;
+    $('#shortenModalError').classList.remove('hidden');
+  }
+}
+
+$$('#shortenModalBackdrop .shorten-opt').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const mins = parseInt(btn.dataset.minutes, 10);
+    _doShorten(mins);
+  });
+});
+
+$('#shortenModalConfirm').addEventListener('click', () => {
+  const mins = parseInt($('#shortenCustomMins').value, 10);
+  _doShorten(mins);
+});
+
+$('#shortenModalCancel').addEventListener('click', () => {
+  $('#shortenModalBackdrop').classList.add('hidden');
+});
+$('#shortenModalBackdrop').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) $('#shortenModalBackdrop').classList.add('hidden');
+});
 
 // ─── Block Popover (with stop, shorten, logs) ───────────────────────────────
 const blockPopover = $('#blockPopover');
@@ -1330,19 +1533,7 @@ function showBlockPopover(lease, anchorX, anchorY) {
       notesBtn.className = 'w-full px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-slate-600/20 text-gray-700 dark:text-slate-300 border border-gray-300 dark:border-slate-500/30 hover:bg-gray-200 dark:hover:bg-slate-600/30 transition font-medium';
       notesBtn.textContent = '📝 Edit Notes';
       notesBtn.addEventListener('click', async () => {
-        const newNotes = prompt('Booking notes:', lease.notes || '');
-        if (newNotes === null) return; // cancelled
-        try {
-          await api(`/admin/leases/${lease.id}/notes`, {
-            method: "PATCH",
-            body: JSON.stringify({ notes: newNotes })
-          });
-          toast('Notes updated', 'success');
-          hideBlockPopover();
-          await refresh();
-        } catch (err) {
-          toast(err.message, 'error');
-        }
+        openNotesModal(lease.id, lease.notes || '', lease.model);
       });
       actionsEl.appendChild(notesBtn);
     }
@@ -1624,7 +1815,8 @@ function updateDragGhost(pt) {
   const y = TL.headerH + laneStart * TL.laneH + 4;
   const h = laneCount * TL.laneH - 8;
 
-  const hasConflict = checkVisualConflict(ghostBegin, ghostEnd, laneCount, dragState.leaseId);
+  const hasConflict = checkVisualConflict(ghostBegin, ghostEnd, laneStart, laneCount, dragState.leaseId);
+  const conflictInfo = hasConflict ? findConflictingLeaseDetails(ghostBegin, ghostEnd, laneStart, laneCount, dragState.leaseId) : null;
 
   const ghost = drawGroup(svg, { class: 'ghost-block' });
   drawRect(ghost, x, y, Math.max(8, w), h, {
@@ -1647,38 +1839,96 @@ function updateDragGhost(pt) {
     'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
   });
 
+  if (hasConflict && conflictInfo) {
+    drawText(ghost, x + 10, y + 52, `⚠ Conflict: ${conflictInfo.model} GPU ${conflictInfo.laneStart}–${conflictInfo.laneStart + conflictInfo.laneCount - 1}`, {
+      fill: '#fca5a5',
+      'font-size': 9,
+      'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    });
+  }
+
   dragState.ghostEl = ghost;
   dragState._ghostBegin = ghostBegin;
   dragState._ghostEnd = ghostEnd;
   dragState._hasConflict = hasConflict;
+  dragState._conflictDetails = conflictInfo;
 }
 
-function checkVisualConflict(begin, end, gpusNeeded, excludeLeaseId = null) {
+function checkVisualConflict(begin, end, laneStart, laneCount, excludeLeaseId = null) {
   if (!DASH) return false;
 
   const OVERLAP_TOLERANCE_MS = 30 * 1000; // 30s, matching backend planner.py
 
   const activeLeases = DASH.leases.filter(l =>
-    ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state) && l.id !== excludeLeaseId
+    ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state)
+    && l.id !== excludeLeaseId
+    && l.lane_start != null
+    && l.lane_count != null
   );
 
-  const step = 15 * 60000;
-  for (let t = begin.getTime(); t < end.getTime(); t += step) {
-    let usedGpus = 0;
-    for (const l of activeLeases) {
-      const lb = new Date(l.begin_at || l.created_at).getTime();
-      const le = new Date(l.end_at).getTime();
-      // Mirror backend: intervals within OVERLAP_TOLERANCE of each other
-      // are NOT overlapping (allows back-to-back scheduling)
-      if (t >= lb && t < le - OVERLAP_TOLERANCE_MS) {
-        usedGpus += l.requested_gpus || 0;
-      }
+  const candBegin = begin.getTime();
+  const candEnd = end.getTime();
+  const myStart = laneStart;
+  const myEnd = laneStart + laneCount;
+
+  for (const l of activeLeases) {
+    const lb = new Date(l.begin_at || l.created_at).getTime();
+    const le = new Date(l.end_at).getTime();
+
+    // Mirror backend planner.py: intervals within OVERLAP_TOLERANCE are NOT overlapping
+    if (candEnd <= lb + OVERLAP_TOLERANCE_MS || le <= candBegin + OVERLAP_TOLERANCE_MS) {
+      continue; // No time overlap
     }
-    if (usedGpus + gpusNeeded > TL.gpuTotal) {
-      return true;
+
+    // Time overlaps — check GPU lane overlap
+    const otherStart = l.lane_start;
+    const otherEnd = l.lane_start + l.lane_count;
+    if (myStart < otherEnd && myEnd > otherStart) {
+      return true; // Both time AND lane overlap = conflict
     }
   }
+
   return false;
+}
+
+function findConflictingLeaseDetails(begin, end, laneStart, laneCount, excludeLeaseId = null) {
+  if (!DASH) return null;
+
+  const OVERLAP_TOLERANCE_MS = 30 * 1000;
+
+  const activeLeases = DASH.leases.filter(l =>
+    ['PLANNED', 'SUBMITTED', 'STARTING', 'RUNNING'].includes(l.state)
+    && l.id !== excludeLeaseId
+    && l.lane_start != null
+    && l.lane_count != null
+  );
+
+  const candBegin = begin.getTime();
+  const candEnd = end.getTime();
+  const myStart = laneStart;
+  const myEnd = laneStart + laneCount;
+
+  for (const l of activeLeases) {
+    const lb = new Date(l.begin_at || l.created_at).getTime();
+    const le = new Date(l.end_at).getTime();
+
+    if (candEnd <= lb + OVERLAP_TOLERANCE_MS || le <= candBegin + OVERLAP_TOLERANCE_MS) {
+      continue;
+    }
+
+    const otherStart = l.lane_start;
+    const otherEnd = l.lane_start + l.lane_count;
+    if (myStart < otherEnd && myEnd > otherStart) {
+      return {
+        model: l.model,
+        laneStart: l.lane_start,
+        laneCount: l.lane_count,
+        endAt: new Date(l.end_at),
+      };
+    }
+  }
+
+  return null;
 }
 
 function updateDragTooltip(clientX, clientY) {
@@ -1696,7 +1946,16 @@ function updateDragTooltip(clientX, clientY) {
 
   let text = `${fmtHour(begin)} → ${fmtHour(end)} (${hours}h${mins > 0 ? ` ${mins}m` : ''})`;
   if (dragState._hasConflict) {
-    text += ' ⚠ CONFLICT';
+    const conflictInfo = dragState._conflictDetails;
+    if (conflictInfo) {
+      const conflictEnd = fmtHour(conflictInfo.endAt);
+      text += ` ⚠ Conflict: ${conflictInfo.model} on GPU ${conflictInfo.laneStart}–${conflictInfo.laneStart + conflictInfo.laneCount - 1} until ${conflictEnd}`;
+    } else {
+      text += ' ⚠ CONFLICT';
+    }
+  }
+  if (dragState._hasConflict) {
+    text += ' · Try ASAP scheduling';
   }
 
   tip.textContent = text;
@@ -1718,7 +1977,12 @@ async function commitDrag() {
   const hasConflict = dragState._hasConflict;
 
   if (hasConflict) {
-    toast('Cannot place booking — GPU conflict detected', 'error');
+    const ci = dragState._conflictDetails;
+    if (ci) {
+      toast(`Conflict: ${ci.model} on GPU ${ci.laneStart}–${ci.laneStart + ci.laneCount - 1} until ${fmtHour(ci.endAt)}`, 'error');
+    } else {
+      toast('Cannot place booking — GPU conflict detected', 'error');
+    }
     resetDrag();
     return;
   }
@@ -1808,6 +2072,7 @@ function resetDrag() {
   dragState._ghostBegin = null;
   dragState._ghostEnd = null;
   dragState._hasConflict = false;
+  dragState._conflictDetails = null;
   document.body.style.cursor = '';
   hideTimelineTooltip();
 }
@@ -2911,52 +3176,7 @@ window.editLease = (id) => {
 window.shortenLeasePrompt = async (id) => {
   const lease = DASH?.leases?.find(l => l.id === id);
   if (!lease) return;
-
-  const now = new Date();
-  const currentEnd = new Date(lease.end_at);
-  const remainingMin = Math.round((currentEnd - now) / 60000);
-
-  if (remainingMin <= 5) {
-    toast('Booking ends too soon to shorten', 'info');
-    return;
-  }
-
-  // Simple prompt: ask how many minutes from now to end
-  const options = [];
-  if (remainingMin > 30) options.push('30 minutes');
-  if (remainingMin > 60) options.push('1 hour');
-  if (remainingMin > 120) options.push('2 hours');
-
-  const choice = prompt(
-    `Current end: ${fmtTime(currentEnd)} (${remainingMin}m remaining)\n\n` +
-    `Enter minutes from now to set new end time:\n` +
-    `(Suggestions: ${options.join(', ') || 'N/A'})`,
-    Math.min(60, Math.floor(remainingMin / 2)).toString()
-  );
-
-  if (!choice) return;
-  const mins = parseInt(choice, 10);
-  if (isNaN(mins) || mins < 1) {
-    toast('Invalid number of minutes', 'error');
-    return;
-  }
-
-  const newEnd = new Date(now.getTime() + mins * 60000);
-  if (newEnd >= currentEnd) {
-    toast('New end must be before current end. Use extend instead.', 'info');
-    return;
-  }
-
-  try {
-    await api(`/admin/leases/${id}/shorten`, {
-      method: "POST",
-      body: JSON.stringify({ new_end_at: newEnd.toISOString() })
-    });
-    toast(`Shortened to end at ${fmtTime(newEnd)}`, 'success');
-    await refresh();
-  } catch (e) {
-    toast(e.message, 'error');
-  }
+  openShortenModal(id, lease.end_at, lease.model);
 };
 
 window.dismissFailedLease = async (id) => {

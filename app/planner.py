@@ -90,10 +90,11 @@ def find_earliest_slot(
 ) -> Optional[datetime]:
     """
     Find the earliest time within [search_start, search_end] where `gpus_needed`
-    GPUs are free for the full `duration`.
+    contiguous GPUs are free for the full `duration`.
 
-    Uses a sweep-line approach: builds a sorted list of GPU usage change events,
-    then sweeps to find windows where enough GPUs are free.
+    Uses lane-aware placement: builds an occupancy grid from existing leases,
+    then sweeps candidate start times to find when a contiguous block of free lanes
+    is available for the full duration.
     """
     search_start = ensure_utc(search_start)
     search_end = ensure_utc(search_end)
@@ -101,30 +102,58 @@ def find_earliest_slot(
     if gpus_needed > total_gpus:
         return None
 
-    # Build event list: (time, gpu_delta)
-    # +gpus at lease begin, -gpus at lease end
-    events: list[tuple[datetime, int]] = []
+    # Use compute_placements to get proper lane assignments for existing leases
+    placements = compute_placements(
+        leases=existing_leases,
+        total_gpus=total_gpus,
+        horizon_start=search_start,
+        horizon_end=search_end + duration,
+    )
+
+    # Build occupancy grid from placed leases
+    occ: list[list[tuple[datetime, datetime]]] = [[] for _ in range(total_gpus)]
     for l in existing_leases:
-        begin = _t(l.begin_at, l.created_at)
-        end = ensure_utc(l.end_at) if l.end_at else (begin + timedelta(hours=1))
-        g = max(1, int(getattr(l, "requested_gpus", 1) or 1))
-        # Only consider leases that overlap with our search window
-        if end <= search_start or begin >= search_end + duration:
+        lb = _t(l.begin_at, l.created_at)
+        le = ensure_utc(l.end_at) if l.end_at else (lb + timedelta(hours=1))
+        if le <= search_start or lb >= search_end + duration:
             continue
-        events.append((begin, g))
-        events.append((end, -g))
+        p = placements.get(l.id)
+        if p and p.lane_start is not None and not p.conflict:
+            for lane in range(p.lane_start, p.lane_start + p.lane_count):
+                occ[lane].append((lb, le))
 
-    # Sort events by time (ties broken by delta: releases before acquisitions)
-    events.sort(key=lambda e: (e[0], e[1]))
+    def overlaps(a0, a1, b0, b1):
+        return not (a1 <= b0 + OVERLAP_TOLERANCE or b1 <= a0 + OVERLAP_TOLERANCE)
 
-    # Build a sorted list of all "interesting" time points to check
+    def lanes_free_at(begin: datetime, end: datetime, g: int) -> Optional[int]:
+        """Check if there's a contiguous block of g free lanes for [begin, end).
+        Returns the starting lane index, or None if no block is available."""
+        for start_lane in range(0, total_gpus - g + 1):
+            ok = True
+            for lane in range(start_lane, start_lane + g):
+                for (s, e) in occ[lane]:
+                    if overlaps(begin, end, s, e):
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                return start_lane
+        return None
+
+    # Build interesting candidate start times
     interesting_times: set[datetime] = {search_start}
-    for evt_time, _ in events:
-        if search_start <= evt_time <= search_end:
-            interesting_times.add(evt_time)
-        snapped = search_start + step * int((evt_time - search_start) / step)
-        if search_start <= snapped <= search_end:
-            interesting_times.add(snapped)
+    for l in existing_leases:
+        lb = _t(l.begin_at, l.created_at)
+        le = ensure_utc(l.end_at) if l.end_at else (lb + timedelta(hours=1))
+        if le <= search_start or lb >= search_end + duration:
+            continue
+        for t in (lb, le):
+            if search_start <= t <= search_end:
+                interesting_times.add(t)
+            snapped = search_start + step * int((t - search_start) / step)
+            if search_start <= snapped <= search_end:
+                interesting_times.add(snapped)
 
     t = search_start
     while t + duration <= search_end:
@@ -133,36 +162,13 @@ def find_earliest_slot(
 
     sorted_times = sorted(interesting_times)
 
-    def gpus_used_at(t: datetime) -> int:
-        """Compute GPUs in use at time t by summing all events before t."""
-        used = 0
-        for evt_time, delta in events:
-            if evt_time <= t:
-                used += delta
-            else:
-                break
-        return used
-
     for candidate in sorted_times:
         candidate_end = candidate + duration
         if candidate_end > search_end:
             break
 
-        ok = True
-
-        if total_gpus - gpus_used_at(candidate) < gpus_needed:
-            continue
-
-        for evt_time, _ in events:
-            if evt_time < candidate:
-                continue
-            if evt_time >= candidate_end:
-                break
-            if total_gpus - gpus_used_at(evt_time) < gpus_needed:
-                ok = False
-                break
-
-        if ok:
+        start_lane = lanes_free_at(candidate, candidate_end, gpus_needed)
+        if start_lane is not None:
             return candidate
 
     return None

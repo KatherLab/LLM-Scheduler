@@ -184,6 +184,10 @@ def get_metrics_summary() -> dict:
                 latency_sums[ep] = value
                 latency_model_sums[model_label] = latency_model_sums.get(model_label, 0) + value
 
+    def _isfinite(x: float) -> bool:
+        """Check *x* is neither NaN nor infinity (works in IEEE 754)."""
+        return not (x != x or x == float("inf") or x == -float("inf"))
+
     def _build_latency_dict(
         keys: list[str],
         buckets: dict[str, list],
@@ -212,6 +216,8 @@ def get_metrics_summary() -> dict:
                 }
                 for pct_key, target in percentile_targets.items():
                     pct_value = _histogram_quantile(target, b)
+                    if pct_value is not None and not _isfinite(pct_value):
+                        pct_value = None
                     entry[pct_key] = round(pct_value, 3) if pct_value is not None else None
             else:
                 for k in ("p50", "p95", "p99"):

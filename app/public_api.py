@@ -5,6 +5,7 @@ Protected by SCHEDULE_API_KEY (separate from admin auth and VLLM_API_KEY).
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
@@ -13,8 +14,10 @@ from sqlalchemy import select
 from .auth import require_schedule_key
 from .catalog import get_catalog
 from .dependencies import SessionLocal
+from .metrics import get_metrics_summary
 from .models import Endpoint, Lease
 from .planner import compute_placements
+from .router_core import fetch_vllm_metrics
 from .schemas import (
     PublicLeaseInfo,
     PublicModelInfo,
@@ -175,3 +178,87 @@ def list_active_leases():
             )
             for l in leases
         ]
+
+
+# ── Metrics router ─────────────────────────────────────────────────────────
+
+metrics_router = APIRouter(
+    prefix="/api/v1",
+    tags=["public-metrics"],
+    dependencies=[Depends(require_schedule_key)],
+)
+
+
+@metrics_router.get("/metrics")
+async def get_metrics():
+    """
+    Aggregated metrics snapshot for external dashboards.
+
+    Combines proxy-level Prometheus metrics (latency, errors, health) with
+    live per-instance vLLM stats (KV cache usage, throughput, requests, version)
+    and cluster GPU utilization. Everything in one JSON response.
+
+    Requires ``SCHEDULE_API_KEY`` via ``Authorization: Bearer <key>`` or ``?token=<key>``.
+    """
+    now = _now()
+
+    # 1. Proxy-level aggregated metrics
+    proxy_metrics = get_metrics_summary()
+
+    # 2. Per-instance vLLM stats
+    stats_data: list[dict] = []
+    allocated_gpus = 0
+    running_models: set[str] = set()
+
+    with SessionLocal() as db:
+        eps = db.execute(
+            select(Endpoint).where(Endpoint.state.in_(["READY", "STARTING"]))
+        ).scalars().all()
+
+        for e in eps:
+            uptime = None
+            if e.created_at:
+                uptime = (now - ensure_utc(e.created_at)).total_seconds()
+            stats_data.append({
+                "model": e.model,
+                "host": e.host,
+                "port": e.port,
+                "state": e.state,
+                "slurm_job_id": e.slurm_job_id,
+                "uptime_seconds": uptime,
+                "vllm_version": e.vllm_version,
+            })
+            if e.state == "READY":
+                running_models.add(e.model)
+
+        # Count GPUs allocated by active leases
+        active_leases = db.execute(
+            select(Lease).where(
+                Lease.state.in_(["SUBMITTED", "STARTING", "RUNNING"])
+            )
+        ).scalars().all()
+        allocated_gpus = sum(
+            lease.requested_gpus for lease in active_leases if lease.requested_gpus
+        )
+
+    # Fetch live vLLM metrics in parallel (no DB session held)
+    async def _enrich(s: dict) -> None:
+        vm = await fetch_vllm_metrics(s["host"], s["port"])
+        s["gpu_cache_usage"] = vm["gpu_cache_usage"]
+        s["active_requests"] = vm["active_requests"]
+        s["pending_requests"] = vm["pending_requests"]
+        s["throughput_tps"] = vm["throughput_tps"]
+
+    if stats_data:
+        await asyncio.gather(*[_enrich(s) for s in stats_data])
+
+    # 3. Assemble response
+    return {
+        "proxy": proxy_metrics,
+        "instances": stats_data,
+        "cluster": {
+            "total_gpus": settings.total_gpus,
+            "allocated_gpus": allocated_gpus,
+            "running_models": sorted(running_models),
+        },
+    }

@@ -21,7 +21,7 @@ from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
 from .proxy import proxy_get, proxy_json_or_stream, proxy_multipart
 from .admin import internal_router
-from .public_api import router as public_api_router
+from .public_api import router as public_api_router, metrics_router
 from . import slurm
 from .utils import ensure_utc
 from .lifecycle_logger import log_health_check, log_state_transition, log_slurm_action
@@ -86,6 +86,7 @@ app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(internal_router)
 app.include_router(public_api_router)
+app.include_router(metrics_router)
 
 # Initialize DB tables (uses shared engine from dependencies.py)
 init_db()

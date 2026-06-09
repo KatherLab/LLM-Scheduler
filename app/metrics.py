@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, REGISTRY
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, REGISTRY  # noqa: F401 — re-exported for app.main
 
 # ── Upstream proxy metrics (tracked inside _ProxyResponse) ────────────
 
@@ -38,6 +39,77 @@ PROXY_DOWNSTREAM_DISCONNECTS = Counter(
     "llm_proxy_downstream_disconnects_total",
     "Total downstream client disconnects during proxy",
 )
+
+
+# ── Sliding window of recent request durations ────────────────────────
+# Keyed by (model, endpoint), stores (monotonic_timestamp, duration_s) tuples.
+# Used by the dashboard summary to show "current" latency rather than
+# lifetime cumulative averages from the Prometheus histogram.
+_RECENT_DURATIONS: dict[tuple[str, str], deque[tuple[float, float]]] = defaultdict(
+    lambda: deque(maxlen=2000)
+)
+_RECENT_WINDOW_SECONDS = 300  # 5 minute sliding window
+
+
+def _record_recent(model: str, endpoint: str, duration: float) -> None:
+    """Store a request duration in the sliding window buffer."""
+    _RECENT_DURATIONS[(model, endpoint)].append((time.monotonic(), duration))
+
+
+def _prune_recent() -> None:
+    """Remove entries older than the sliding window."""
+    cutoff = time.monotonic() - _RECENT_WINDOW_SECONDS
+    for key, deq in list(_RECENT_DURATIONS.items()):
+        while deq and deq[0][0] < cutoff:
+            deq.popleft()
+        if not deq:
+            del _RECENT_DURATIONS[key]
+
+
+def _compute_recent_latency() -> tuple[dict[str, dict], dict[str, dict]]:
+    """Compute avg/p50/p95/p99 from the sliding window, grouped by endpoint and by model.
+
+    Returns (latency_by_endpoint, latency_by_model) in the same format as
+    the Prometheus-derived latency dicts.
+    """
+    _prune_recent()
+
+    # Collect durations per endpoint and per model
+    by_ep: dict[str, list[float]] = defaultdict(list)
+    by_model: dict[str, list[float]] = defaultdict(list)
+    for (model, ep), deq in _RECENT_DURATIONS.items():
+        durations = [d for _, d in deq]
+        by_ep[ep].extend(durations)
+        by_model[model].extend(durations)
+
+    def _stats(values: list[float]) -> dict:
+        n = len(values)
+        if n == 0:
+            return {"count": 0, "sum": 0.0, "avg": 0.0, "p50": None, "p95": None, "p99": None}
+        values.sort()
+        s = sum(values)
+        return {
+            "count": n,
+            "sum": round(s, 3),
+            "avg": round(s / n, 3),
+            "p50": round(_percentile(values, 0.50), 3),
+            "p95": round(_percentile(values, 0.95), 3),
+            "p99": round(_percentile(values, 0.99), 3),
+        }
+
+    latency_by_endpoint = {ep: _stats(vals) for ep, vals in sorted(by_ep.items())}
+    latency_by_model = {m: _stats(vals) for m, vals in sorted(by_model.items())}
+    return latency_by_endpoint, latency_by_model
+
+
+def _percentile(sorted_values: list[float], p: float) -> float:
+    """Return the p-th percentile from a sorted list using linear interpolation."""
+    if not sorted_values:
+        return 0.0
+    k = (len(sorted_values) - 1) * p
+    f = int(k)
+    c = f + 1 if f + 1 < len(sorted_values) else f
+    return sorted_values[f] + (k - f) * (sorted_values[c] - sorted_values[f])
 
 
 # ── Upstream health (set by a background gauge worker) ────────────────
@@ -103,6 +175,9 @@ async def track_proxy(upstream_url: str, model: str = "") -> AsyncIterator[dict]
 
         PROXY_REQUEST_DURATION.labels(model=model_label, endpoint=ep).observe(duration)
 
+        # Also record into the sliding window for recent-latency computation.
+        _record_recent(model_label, ep, duration)
+
 
 # ── Metrics summary (JSON-friendly) ───────────────────────────────────
 
@@ -163,15 +238,18 @@ def get_metrics_summary() -> dict:
         ep_data["total"] += value
         ep_data["by_type"][err_type] = ep_data["by_type"].get(err_type, 0) + value
 
-    # --- Latency (histogram) ---
+    # --- Latency (sliding window of recent requests) ---
+    latency, latency_by_model = _compute_recent_latency()
+
+    # --- Latency (lifetime Prometheus histogram) — kept for external monitoring ---
     # Collect bucket samples per endpoint
-    latency_buckets: dict[str, list[tuple[float, float]]] = {}
-    latency_counts: dict[str, float] = {}
-    latency_sums: dict[str, float] = {}
+    latency_buckets_lifetime: dict[str, list[tuple[float, float]]] = {}
+    latency_counts_lifetime: dict[str, float] = {}
+    latency_sums_lifetime: dict[str, float] = {}
     # Also collect by model
-    latency_model_buckets: dict[str, list[tuple[float, float]]] = {}
-    latency_model_counts: dict[str, float] = {}
-    latency_model_sums: dict[str, float] = {}
+    latency_model_buckets_lifetime: dict[str, list[tuple[float, float]]] = {}
+    latency_model_counts_lifetime: dict[str, float] = {}
+    latency_model_sums_lifetime: dict[str, float] = {}
     for name in samples:
         if not name.startswith("llm_proxy_request_duration_seconds"):
             continue
@@ -181,62 +259,20 @@ def get_metrics_summary() -> dict:
             if name.endswith("_bucket"):
                 le_str = labels.get("le", "+Inf")
                 le = float("inf") if le_str in ("+Inf", "+inf", "inf") else float(le_str)
-                latency_buckets.setdefault(ep, []).append((le, value))
-                latency_model_buckets.setdefault(model_label, []).append((le, value))
+                latency_buckets_lifetime.setdefault(ep, []).append((le, value))
+                latency_model_buckets_lifetime.setdefault(model_label, []).append((le, value))
             elif name.endswith("_count"):
-                latency_counts[ep] = value
-                latency_model_counts[model_label] = latency_model_counts.get(model_label, 0) + value
+                latency_counts_lifetime[ep] = value
+                latency_model_counts_lifetime[model_label] = latency_model_counts_lifetime.get(model_label, 0) + value
             elif name.endswith("_sum"):
-                latency_sums[ep] = value
-                latency_model_sums[model_label] = latency_model_sums.get(model_label, 0) + value
+                latency_sums_lifetime[ep] = value
+                latency_model_sums_lifetime[model_label] = latency_model_sums_lifetime.get(model_label, 0) + value
 
-    def _isfinite(x: float) -> bool:
-        """Check *x* is neither NaN nor infinity (works in IEEE 754)."""
-        return not (x != x or x == float("inf") or x == -float("inf"))
-
-    def _build_latency_dict(
-        keys: list[str],
-        buckets: dict[str, list],
-        counts: dict[str, float],
-        sums: dict[str, float],
-    ) -> dict[str, dict]:
-        result: dict[str, dict] = {}
-        for key in keys:
-            entry: dict = {
-                "count": counts.get(key, 0),
-                "sum": sums.get(key, 0),
-            }
-            if entry["count"]:
-                entry["avg"] = round(entry["sum"] / entry["count"], 3)
-            else:
-                entry["avg"] = 0.0
-
-            b = buckets.get(key, [])
-            b.sort(key=lambda x: x[0])
-            total = entry["count"]
-            if total > 0 and b:
-                percentile_targets = {
-                    "p50": total * 0.50,
-                    "p95": total * 0.95,
-                    "p99": total * 0.99,
-                }
-                for pct_key, target in percentile_targets.items():
-                    pct_value = _histogram_quantile(target, b)
-                    if pct_value is not None and not _isfinite(pct_value):
-                        pct_value = None
-                    entry[pct_key] = round(pct_value, 3) if pct_value is not None else None
-            else:
-                for k in ("p50", "p95", "p99"):
-                    entry[k] = None
-
-            result[key] = entry
-        return result
-
-    latency = _build_latency_dict(
-        list(latency_counts.keys()), latency_buckets, latency_counts, latency_sums
+    latency_lifetime = _build_latency_dict(
+        list(latency_counts_lifetime.keys()), latency_buckets_lifetime, latency_counts_lifetime, latency_sums_lifetime
     )
-    latency_by_model = _build_latency_dict(
-        list(latency_model_counts.keys()), latency_model_buckets, latency_model_counts, latency_model_sums
+    latency_by_model_lifetime = _build_latency_dict(
+        list(latency_model_counts_lifetime.keys()), latency_model_buckets_lifetime, latency_model_counts_lifetime, latency_model_sums_lifetime
     )
 
     # --- Downstream disconnects ---
@@ -265,9 +301,55 @@ def get_metrics_summary() -> dict:
         },
         "latency_by_model": latency_by_model,
         "latency": latency,
+        "latency_lifetime": latency_lifetime,
+        "latency_by_model_lifetime": latency_by_model_lifetime,
         "downstream_disconnects": disconnects,
         "upstream_health": upstream_health,
     }
+
+
+def _isfinite(x: float) -> bool:
+    """Check *x* is neither NaN nor infinity (works in IEEE 754)."""
+    return not (x != x or x == float("inf") or x == -float("inf"))
+
+
+def _build_latency_dict(
+    keys: list[str],
+    buckets: dict[str, list],
+    counts: dict[str, float],
+    sums: dict[str, float],
+) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for key in keys:
+        entry: dict = {
+            "count": counts.get(key, 0),
+            "sum": sums.get(key, 0),
+        }
+        if entry["count"]:
+            entry["avg"] = round(entry["sum"] / entry["count"], 3)
+        else:
+            entry["avg"] = 0.0
+
+        b = buckets.get(key, [])
+        b.sort(key=lambda x: x[0])
+        total = entry["count"]
+        if total > 0 and b:
+            percentile_targets = {
+                "p50": total * 0.50,
+                "p95": total * 0.95,
+                "p99": total * 0.99,
+            }
+            for pct_key, target in percentile_targets.items():
+                pct_value = _histogram_quantile(target, b)
+                if pct_value is not None and not _isfinite(pct_value):
+                    pct_value = None
+                entry[pct_key] = round(pct_value, 3) if pct_value is not None else None
+        else:
+            for k in ("p50", "p95", "p99"):
+                entry[k] = None
+
+        result[key] = entry
+    return result
 
 
 def _histogram_quantile(target: float, buckets: list[tuple[float, float]]) -> float | None:

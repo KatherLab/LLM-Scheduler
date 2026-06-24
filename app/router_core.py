@@ -100,6 +100,8 @@ _VLLM_METRIC_KEYS = {
     "vllm:num_requests_running": "active_requests",
     "vllm:num_requests_waiting": "pending_requests",
     "vllm:generation_tokens_total": "gen_tokens_total",
+    "vllm:time_to_first_token_seconds_count": "ttft_count",
+    "vllm:time_to_first_token_seconds_sum": "ttft_sum",
 }
 
 # Counter delta cache for throughput rate computation.
@@ -118,6 +120,8 @@ def _parse_vllm_metrics(text: str) -> dict[str, float | int | None]:
         "active_requests": None,
         "pending_requests": None,
         "gen_tokens_total": None,
+        "ttft_count": None,
+        "ttft_sum": None,
     }
     for line in text.splitlines():
         line = line.strip()
@@ -155,6 +159,7 @@ async def fetch_vllm_metrics(
         "active_requests": None,
         "pending_requests": None,
         "throughput_tps": None,
+        "ttft_avg": None,
     }
     url = f"http://{host}:{port}/metrics"
     try:
@@ -163,6 +168,12 @@ async def fetch_vllm_metrics(
         if r.status_code == 200:
             parsed = _parse_vllm_metrics(r.text)
             result.update(parsed)
+
+            # Compute TTFT average from vLLM's own histogram
+            ttft_count = parsed.get("ttft_count")
+            ttft_sum = parsed.get("ttft_sum")
+            if ttft_count is not None and ttft_sum is not None and ttft_count > 0:
+                result["ttft_avg"] = round(ttft_sum / ttft_count, 3)
 
             # Compute generation throughput from counter deltas
             gen_total = parsed.get("gen_tokens_total")

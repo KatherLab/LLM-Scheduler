@@ -404,6 +404,7 @@ async def dashboard():
         s["active_requests"] = vm["active_requests"]
         s["pending_requests"] = vm["pending_requests"]
         s["throughput_tps"] = vm["throughput_tps"]
+        s["ttft_avg"] = vm["ttft_avg"]
 
     if stats_data:
         await asyncio.gather(*[_enrich(s) for s in stats_data])

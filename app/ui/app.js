@@ -398,6 +398,9 @@ function renderMetricsPopover() {
       if (ep.throughput_tps != null && ep.throughput_tps > 0) {
         html += `<span title="Generation tokens per second"><span class="text-slate-300 font-medium">${ep.throughput_tps.toFixed(1)}</span> tok/s</span>`;
       }
+      if (ep.ttft_avg != null) {
+        html += `<span title="Average time to first token"><span class="text-slate-300 font-medium">${fmtLatency(ep.ttft_avg)}</span> TTFT</span>`;
+      }
       html += `<span>⏱ ${uptime}</span>`;
       if (ep.vllm_version) {
         html += `<span>⚡ vLLM ${ep.vllm_version}</span>`;
@@ -412,7 +415,7 @@ function renderMetricsPopover() {
   const latencyByModel = m.latency_by_model || {};
   const latencyModels = Object.keys(latencyByModel).filter(k => k).sort();
   if (latencyModels.length > 0) {
-    html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2 mt-1">Latency</div>`;
+    html += `<div class="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2 mt-1">Latency <span class="font-normal text-slate-400 lowercase">(last 5 min)</span></div>`;
     html += `<div class="mb-1 overflow-x-auto">`;
     html += `<table class="w-full text-[11px]">`;
     html += `<thead><tr class="text-slate-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">`;

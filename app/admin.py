@@ -15,9 +15,17 @@ from .settings import settings
 from .models import Lease, Endpoint
 from .metrics import get_metrics_summary
 from .schemas import (
-    LeaseCreate, LeaseOut, LeaseExtend, LeaseUpdate, LeaseShortenRequest,
-    EndpointRegister, EndpointOut, DashboardResponse, DashboardModel,
-    EndpointStats, LogResponse,
+    LeaseCreate,
+    LeaseOut,
+    LeaseExtend,
+    LeaseUpdate,
+    LeaseShortenRequest,
+    EndpointRegister,
+    EndpointOut,
+    DashboardResponse,
+    DashboardModel,
+    EndpointStats,
+    LogResponse,
 )
 from .catalog import get_catalog
 from .planner import compute_placements, find_earliest_slot
@@ -26,12 +34,43 @@ from . import slurm
 from .dependencies import SessionLocal, init_db
 from .utils import ensure_utc
 
-router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_auth)])
+router = APIRouter(
+    prefix="/admin", tags=["admin"], dependencies=[Depends(require_auth)]
+)
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
+# Horizon used for lane placement. Must be wide enough that future PLANNED
+# leases still receive a real lane assignment instead of being skipped (which
+# collapses them onto lane 0 in the timeline). Matches the UI's max zoom (14d)
+# plus a buffer so bookings near the edge of the view are still placed.
+PLACEMENT_HORIZON_HOURS = 24 * 14 + 24  # 15 days
+
+
+def _placement_horizon(now: datetime) -> tuple[datetime, datetime]:
+    """Return the [start, end) horizon used for lane placement and validation."""
+    return now - timedelta(hours=1), now + timedelta(hours=PLACEMENT_HORIZON_HOURS)
+
+
+def _active_like_leases(leases: list[Lease], now: datetime) -> list[Lease]:
+    """
+    Leases that occupy GPU lanes: active states plus FAILED leases that haven't
+    passed their end_at yet. Used consistently for both booking-time validation
+    and dashboard rendering so the two never disagree.
+    """
+    return [
+        l
+        for l in leases
+        if l.state in ("PLANNED", "SUBMITTED", "STARTING", "RUNNING")
+        or (l.state == "FAILED" and l.end_at and ensure_utc(l.end_at) > now)
+    ]
+
+
 # ---------- helpers -------------------------------------------------------------
+
 
 def _time_limit_from_duration(seconds: int) -> str:
     h = seconds // 3600
@@ -39,15 +78,25 @@ def _time_limit_from_duration(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+
 def _lease_begin(l: Lease) -> datetime:
-    return ensure_utc(l.begin_at) if l.begin_at is not None else ensure_utc(l.created_at)
+    return (
+        ensure_utc(l.begin_at) if l.begin_at is not None else ensure_utc(l.created_at)
+    )
+
 
 def _lease_end(l: Lease) -> datetime:
     if l.end_at is not None:
         return ensure_utc(l.end_at)
     return _lease_begin(l) + timedelta(hours=1)
 
-def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Optional[int] = None, conflict: bool = False) -> LeaseOut:
+
+def _lease_to_out(
+    l: Lease,
+    lane_start: Optional[int] = None,
+    lane_count: Optional[int] = None,
+    conflict: bool = False,
+) -> LeaseOut:
     return LeaseOut(
         id=l.id,
         model=l.model,
@@ -67,6 +116,7 @@ def _lease_to_out(l: Lease, lane_start: Optional[int] = None, lane_count: Option
         conflict=conflict,
     )
 
+
 def _build_job_env(lease: Lease) -> dict[str, str]:
     env = {
         "MODEL_PATH": lease.model_path,
@@ -80,17 +130,20 @@ def _build_job_env(lease: Lease) -> dict[str, str]:
         "ROUTER_REGISTER_URL": f"http://{settings.public_hostname}:{settings.router_port}/admin/endpoints/register",
     }
 
-    env.update({
-        "VLLM_HEALTH_TIMEOUT_SECONDS": str(settings.vllm_health_timeout_seconds),
-        "VLLM_MAX_RETRIES": str(settings.vllm_max_retries),
-        "VLLM_RETRY_DELAY_SECONDS": str(settings.vllm_retry_delay_seconds),
-    })
+    env.update(
+        {
+            "VLLM_HEALTH_TIMEOUT_SECONDS": str(settings.vllm_health_timeout_seconds),
+            "VLLM_MAX_RETRIES": str(settings.vllm_max_retries),
+            "VLLM_RETRY_DELAY_SECONDS": str(settings.vllm_retry_delay_seconds),
+        }
+    )
 
     if lease.venv_activate:
         env["VENV_ACTIVATE"] = lease.venv_activate
 
     if lease.env_json:
         import json
+
         try:
             model_env = json.loads(lease.env_json)
             if isinstance(model_env, dict):
@@ -100,6 +153,7 @@ def _build_job_env(lease: Lease) -> dict[str, str]:
 
     return env
 
+
 def _submit_to_slurm(lease: Lease) -> str:
     seconds = int((_lease_end(lease) - (_lease_begin(lease))).total_seconds())
     seconds = max(60, seconds)
@@ -108,7 +162,9 @@ def _submit_to_slurm(lease: Lease) -> str:
     env = _build_job_env(lease)
 
     # Per-model CPU/mem from lease, fall back to global settings
-    cpus = lease.requested_cpus if lease.requested_cpus else settings.slurm_cpus_per_task
+    cpus = (
+        lease.requested_cpus if lease.requested_cpus else settings.slurm_cpus_per_task
+    )
     mem = lease.requested_mem  # None is fine — slurm.py won't add --mem
 
     res = slurm.submit_vllm_job(
@@ -131,11 +187,16 @@ def _submit_to_slurm(lease: Lease) -> str:
 
     return res.job_id
 
+
 def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     """
     Submit a Slurm job using a plain-dict snapshot instead of an ORM object.
     """
-    begin = ensure_utc(snapshot["begin_at"]) if snapshot["begin_at"] else ensure_utc(snapshot["created_at"])
+    begin = (
+        ensure_utc(snapshot["begin_at"])
+        if snapshot["begin_at"]
+        else ensure_utc(snapshot["created_at"])
+    )
     end = ensure_utc(snapshot["end_at"])
     seconds = int((end - begin).total_seconds())
     seconds = max(60, seconds)
@@ -164,6 +225,7 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
 
     if snapshot.get("env_json"):
         import json
+
         try:
             model_env = json.loads(snapshot["env_json"])
             if isinstance(model_env, dict):
@@ -190,6 +252,7 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     )
     return res.job_id
 
+
 def _snapshot_lease(lease: "Lease") -> dict:
     """Create a plain-dict snapshot of a Lease for use outside a DB session."""
     return {
@@ -213,16 +276,12 @@ def _snapshot_lease(lease: "Lease") -> dict:
     }
 
 
-
 def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
     now = now_utc()
-    horizon_start = now - timedelta(hours=1)
-    horizon_end = now + timedelta(hours=48)
+    horizon_start, horizon_end = _placement_horizon(now)
 
-    leases = db.execute(
-        select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"]))
-    ).scalars().all()
-
+    leases = db.execute(select(Lease)).scalars().all()
+    leases = _active_like_leases(leases, now)
     leases = [l for l in leases if l.id != candidate.id] + [candidate]
 
     placements = compute_placements(
@@ -261,13 +320,22 @@ def _validate_no_conflicts(db: Session, candidate: Lease) -> None:
             detail = f"Not enough contiguous GPUs available for this time window (needs {candidate.requested_gpus})."
         raise HTTPException(status_code=409, detail=detail)
 
-def _merge_same_model_if_applicable(db: Session, req: LeaseCreate, begin: datetime, end: datetime) -> Optional[Lease]:
-    existing = db.execute(
-        select(Lease).where(
-            Lease.model == req.model,
-            Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"])
-        ).order_by(Lease.id.desc())
-    ).scalars().first()
+
+def _merge_same_model_if_applicable(
+    db: Session, req: LeaseCreate, begin: datetime, end: datetime
+) -> Optional[Lease]:
+    existing = (
+        db.execute(
+            select(Lease)
+            .where(
+                Lease.model == req.model,
+                Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"]),
+            )
+            .order_by(Lease.id.desc())
+        )
+        .scalars()
+        .first()
+    )
     if not existing:
         return None
     ex_begin = _lease_begin(existing)
@@ -327,25 +395,22 @@ def _find_log_files(slurm_job_id: str) -> tuple[str, str]:
 
 # ---------- endpoints ------------------------------------------------------------
 
+
 @router.get("/dashboard", response_model=DashboardResponse)
 async def dashboard():
     now = now_utc()
-    horizon_start = now - timedelta(hours=1)
-    horizon_end = now + timedelta(hours=48)
+    horizon_start, horizon_end = _placement_horizon(now)
 
     with SessionLocal() as db:
         ready = set(
-            db.execute(select(Endpoint.model).where(Endpoint.state == "READY")).scalars().all()
+            db.execute(select(Endpoint.model).where(Endpoint.state == "READY"))
+            .scalars()
+            .all()
         )
 
         leases = db.execute(select(Lease).order_by(Lease.id.desc())).scalars().all()
 
-        # Include FAILED leases that haven't passed their end_at yet
-        active_like = [
-            l for l in leases
-            if l.state in ("PLANNED", "SUBMITTED", "STARTING", "RUNNING")
-            or (l.state == "FAILED" and l.end_at and ensure_utc(l.end_at) > now)
-        ]
+        active_like = _active_like_leases(leases, now)
         placements = compute_placements(
             leases=active_like,
             total_gpus=settings.total_gpus,
@@ -356,46 +421,56 @@ async def dashboard():
         out_leases: list[LeaseOut] = []
         for l in leases:
             p = placements.get(l.id)
-            out_leases.append(_lease_to_out(
-                l,
-                lane_start=p.lane_start if p else None,
-                lane_count=p.lane_count if p else None,
-                conflict=p.conflict if p else False,
-            ))
+            out_leases.append(
+                _lease_to_out(
+                    l,
+                    lane_start=p.lane_start if p else None,
+                    lane_count=p.lane_count if p else None,
+                    conflict=p.conflict if p else False,
+                )
+            )
 
         catalog = get_catalog()
         models: list[DashboardModel] = []
         for name, m in catalog.items():
-            models.append(DashboardModel(
-                id=name,
-                ready=(name in ready),
-                meta={
-                    "gpus": m.gpus,
-                    "tensor_parallel_size": m.tensor_parallel_size,
-                    "notes": m.notes,
-                    "tags": m.tags or [],
-                }
-            ))
+            models.append(
+                DashboardModel(
+                    id=name,
+                    ready=(name in ready),
+                    meta={
+                        "gpus": m.gpus,
+                        "tensor_parallel_size": m.tensor_parallel_size,
+                        "notes": m.notes,
+                        "tags": m.tags or [],
+                    },
+                )
+            )
 
         # Endpoint stats (DB portion)
-        eps = db.execute(
-            select(Endpoint).where(Endpoint.state.in_(["READY", "STARTING"]))
-        ).scalars().all()
+        eps = (
+            db.execute(
+                select(Endpoint).where(Endpoint.state.in_(["READY", "STARTING"]))
+            )
+            .scalars()
+            .all()
+        )
         stats_data: list[dict] = []
         for e in eps:
             uptime = None
             if e.created_at:
                 uptime = (now - ensure_utc(e.created_at)).total_seconds()
-            stats_data.append(dict(
-                model=e.model,
-                host=e.host,
-                port=e.port,
-                state=e.state,
-                slurm_job_id=e.slurm_job_id,
-                last_health_at=e.last_health_at,
-                uptime_seconds=uptime,
-                vllm_version=e.vllm_version,
-            ))
+            stats_data.append(
+                dict(
+                    model=e.model,
+                    host=e.host,
+                    port=e.port,
+                    state=e.state,
+                    slurm_job_id=e.slurm_job_id,
+                    last_health_at=e.last_health_at,
+                    uptime_seconds=uptime,
+                    vllm_version=e.vllm_version,
+                )
+            )
 
     # Fetch vLLM /metrics for all endpoints in parallel (no DB session held)
     async def _enrich(s: dict) -> None:
@@ -432,15 +507,27 @@ def list_leases():
         leases = db.execute(select(Lease).order_by(Lease.id.desc())).scalars().all()
         return [_lease_to_out(l) for l in leases]
 
+
 @router.get("/endpoints", response_model=list[EndpointOut])
 def list_endpoints():
     with SessionLocal() as db:
         eps = db.execute(select(Endpoint).order_by(Endpoint.id.desc())).scalars().all()
-        return [EndpointOut(
-            id=e.id, model=e.model, host=e.host, port=e.port, slurm_job_id=e.slurm_job_id, state=e.state,
-            last_health_at=e.last_health_at, last_error=e.last_error, created_at=e.created_at,
-            vllm_version=e.vllm_version,
-        ) for e in eps]
+        return [
+            EndpointOut(
+                id=e.id,
+                model=e.model,
+                host=e.host,
+                port=e.port,
+                slurm_job_id=e.slurm_job_id,
+                state=e.state,
+                last_health_at=e.last_health_at,
+                last_error=e.last_error,
+                created_at=e.created_at,
+                vllm_version=e.vllm_version,
+            )
+            for e in eps
+        ]
+
 
 @router.post("/leases", response_model=LeaseOut)
 async def create_lease(req: LeaseCreate):
@@ -457,9 +544,15 @@ async def create_lease(req: LeaseCreate):
     # --- ASAP logic ---
     if req.asap:
         with SessionLocal() as db:
-            active = db.execute(
-                select(Lease).where(Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"]))
-            ).scalars().all()
+            active = (
+                db.execute(
+                    select(Lease).where(
+                        Lease.state.in_(["PLANNED", "SUBMITTED", "STARTING", "RUNNING"])
+                    )
+                )
+                .scalars()
+                .all()
+            )
 
             now = now_utc()
             horizon_end = now + timedelta(hours=48)
@@ -473,14 +566,16 @@ async def create_lease(req: LeaseCreate):
                 search_end=horizon_end,
             )
             if earliest is None:
-                raise HTTPException(status_code=409, detail="No available slot in the next 48h for this model.")
+                raise HTTPException(
+                    status_code=409,
+                    detail="No available slot in the next 48h for this model.",
+                )
             begin = earliest
             end = begin + duration
 
     else:
         begin = ensure_utc(req.begin_at) if req.begin_at else now_utc()
         end = begin + duration
-
 
     snapshot = None
     lease_id = None
@@ -491,18 +586,28 @@ async def create_lease(req: LeaseCreate):
         if merged:
             _validate_no_conflicts(db, merged)
 
-            if merged.slurm_job_id and merged.state in ("SUBMITTED", "STARTING", "RUNNING"):
-                total_seconds = int((_lease_end(merged) - _lease_begin(merged)).total_seconds())
+            if merged.slurm_job_id and merged.state in (
+                "SUBMITTED",
+                "STARTING",
+                "RUNNING",
+            ):
+                total_seconds = int(
+                    (_lease_end(merged) - _lease_begin(merged)).total_seconds()
+                )
                 total_seconds = max(60, total_seconds)
                 new_time_limit = _time_limit_from_duration(total_seconds)
                 try:
-                    await asyncio.to_thread(slurm.extend_time, merged.slurm_job_id, new_time_limit)
+                    await asyncio.to_thread(
+                        slurm.extend_time, merged.slurm_job_id, new_time_limit
+                    )
                     print(
                         f"create_lease: extended Slurm job {merged.slurm_job_id} "
                         f"time to {new_time_limit} after merge"
                     )
                 except Exception as e:
-                    print(f"Warning: failed to extend Slurm time for merged lease {merged.id}: {e}")
+                    print(
+                        f"Warning: failed to extend Slurm time for merged lease {merged.id}: {e}"
+                    )
 
             db.add(merged)
             db.commit()
@@ -511,7 +616,7 @@ async def create_lease(req: LeaseCreate):
 
         begin = ensure_utc(begin)
         end = ensure_utc(end)
-        planned = (begin > now_utc() + timedelta(seconds=30))
+        planned = begin > now_utc() + timedelta(seconds=30)
 
         lease = Lease(
             model=req.model,
@@ -528,9 +633,13 @@ async def create_lease(req: LeaseCreate):
             model_path=cat.model_path,
             tool_args=req.tool_args if req.tool_args is not None else cat.tool_args,
             extra_args=req.extra_args if req.extra_args is not None else cat.extra_args,
-            reasoning_parser=req.reasoning_parser if req.reasoning_parser is not None else cat.reasoning_parser,
+            reasoning_parser=req.reasoning_parser
+            if req.reasoning_parser is not None
+            else cat.reasoning_parser,
             gpu_memory_utilization=str(
-                req.gpu_memory_utilization if req.gpu_memory_utilization is not None else cat.gpu_memory_utilization
+                req.gpu_memory_utilization
+                if req.gpu_memory_utilization is not None
+                else cat.gpu_memory_utilization
             ),
             venv_activate=cat.venv_activate,
             env_json=json.dumps(cat.env) if cat.env else None,
@@ -560,7 +669,9 @@ async def create_lease(req: LeaseCreate):
                     lease.state = "FAILED"
                     lease.failed_at = now_utc()
                     db.commit()
-            raise HTTPException(status_code=500, detail=f"Failed to submit Slurm job: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to submit Slurm job: {e}"
+            )
 
         with SessionLocal() as db:
             lease = db.get(Lease, lease_id)
@@ -572,6 +683,7 @@ async def create_lease(req: LeaseCreate):
 
     return out
 
+
 @router.patch("/leases/{lease_id}", response_model=LeaseOut)
 def update_lease(lease_id: int, req: LeaseUpdate):
     with SessionLocal() as db:
@@ -580,7 +692,10 @@ def update_lease(lease_id: int, req: LeaseUpdate):
             raise HTTPException(status_code=404, detail="Booking not found")
 
         if lease.state != "PLANNED":
-            raise HTTPException(status_code=409, detail="Only planned bookings can be edited (move/resize).")
+            raise HTTPException(
+                status_code=409,
+                detail="Only planned bookings can be edited (move/resize).",
+            )
 
         if req.begin_at is not None:
             lease.begin_at = req.begin_at
@@ -592,9 +707,14 @@ def update_lease(lease_id: int, req: LeaseUpdate):
         b = _lease_begin(lease)
         e = _lease_end(lease)
         if e <= b:
-            raise HTTPException(status_code=400, detail="End time must be after start time.")
+            raise HTTPException(
+                status_code=400, detail="End time must be after start time."
+            )
         if lease.requested_gpus > settings.total_gpus:
-            raise HTTPException(status_code=400, detail=f"Cannot request more than {settings.total_gpus} GPUs.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot request more than {settings.total_gpus} GPUs.",
+            )
 
         _validate_no_conflicts(db, lease)
         db.commit()
@@ -610,10 +730,13 @@ def update_lease_notes(lease_id: int, req: dict):
         if not lease:
             raise HTTPException(status_code=404, detail="Booking not found")
         if lease.state in ("CANCELED", "ENDED"):
-            raise HTTPException(status_code=409, detail="Cannot edit notes on a finished booking.")
+            raise HTTPException(
+                status_code=409, detail="Cannot edit notes on a finished booking."
+            )
         lease.notes = req.get("notes", "")
         db.commit()
         return {"ok": True, "notes": lease.notes}
+
 
 @router.delete("/leases/{lease_id}")
 async def cancel_lease(lease_id: int):
@@ -631,12 +754,19 @@ async def cancel_lease(lease_id: int):
         lease.state = "CANCELED"
 
         if lease.slurm_job_id:
-            ep = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == lease.slurm_job_id)).scalars().first()
+            ep = (
+                db.execute(
+                    select(Endpoint).where(Endpoint.slurm_job_id == lease.slurm_job_id)
+                )
+                .scalars()
+                .first()
+            )
             if ep:
                 ep.state = "STOPPED"
 
         db.commit()
     return {"ok": True}
+
 
 @router.post("/leases/{lease_id}/extend")
 async def extend_lease(lease_id: int, req: LeaseExtend):
@@ -675,7 +805,9 @@ async def shorten_lease(lease_id: int, req: LeaseShortenRequest):
             raise HTTPException(status_code=404, detail="Booking not found")
 
         if lease.state not in ("RUNNING", "SUBMITTED", "STARTING", "PLANNED"):
-            raise HTTPException(status_code=409, detail="Can only shorten active bookings.")
+            raise HTTPException(
+                status_code=409, detail="Can only shorten active bookings."
+            )
 
         now = now_utc()
         new_end = ensure_utc(req.new_end_at)
@@ -683,11 +815,18 @@ async def shorten_lease(lease_id: int, req: LeaseShortenRequest):
         b = _lease_begin(lease)
 
         if new_end <= now:
-            raise HTTPException(status_code=400, detail="New end time must be in the future.")
+            raise HTTPException(
+                status_code=400, detail="New end time must be in the future."
+            )
         if new_end <= b:
-            raise HTTPException(status_code=400, detail="New end time must be after start time.")
+            raise HTTPException(
+                status_code=400, detail="New end time must be after start time."
+            )
         if new_end >= current_end:
-            raise HTTPException(status_code=400, detail="New end time must be before current end time. Use extend instead.")
+            raise HTTPException(
+                status_code=400,
+                detail="New end time must be before current end time. Use extend instead.",
+            )
 
         lease.end_at = new_end
 
@@ -726,7 +865,13 @@ async def stop_lease_now(lease_id: int):
         lease.end_at = now_utc()
 
         if lease.slurm_job_id:
-            ep = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == lease.slurm_job_id)).scalars().first()
+            ep = (
+                db.execute(
+                    select(Endpoint).where(Endpoint.slurm_job_id == lease.slurm_job_id)
+                )
+                .scalars()
+                .first()
+            )
             if ep:
                 ep.state = "STOPPED"
 
@@ -742,12 +887,18 @@ def get_lease_logs(lease_id: int):
         if not lease:
             raise HTTPException(status_code=404, detail="Booking not found")
         if not lease.slurm_job_id:
-            raise HTTPException(status_code=404, detail="No Slurm job associated with this booking.")
+            raise HTTPException(
+                status_code=404, detail="No Slurm job associated with this booking."
+            )
 
         stdout_path, stderr_path = _find_log_files(lease.slurm_job_id)
 
-        stdout_content, stdout_trunc = _read_log_file(stdout_path) if stdout_path else ("", False)
-        stderr_content, stderr_trunc = _read_log_file(stderr_path) if stderr_path else ("", False)
+        stdout_content, stdout_trunc = (
+            _read_log_file(stdout_path) if stdout_path else ("", False)
+        )
+        stderr_content, stderr_trunc = (
+            _read_log_file(stderr_path) if stderr_path else ("", False)
+        )
 
         return LogResponse(
             slurm_job_id=lease.slurm_job_id,
@@ -756,6 +907,7 @@ def get_lease_logs(lease_id: int):
             truncated=stdout_trunc or stderr_trunc,
         )
 
+
 # ── Internal router (no session auth, uses internal token) ──────────────────
 internal_router = APIRouter(prefix="/admin", tags=["internal"])
 
@@ -763,7 +915,13 @@ internal_router = APIRouter(prefix="/admin", tags=["internal"])
 @internal_router.post("/endpoints/register", response_model=EndpointOut)
 def register_endpoint(req: EndpointRegister, _: None = Depends(require_internal_token)):
     with SessionLocal() as db:
-        existing = db.execute(select(Endpoint).where(Endpoint.slurm_job_id == req.slurm_job_id)).scalars().first()
+        existing = (
+            db.execute(
+                select(Endpoint).where(Endpoint.slurm_job_id == req.slurm_job_id)
+            )
+            .scalars()
+            .first()
+        )
         if existing:
             existing.model = req.model
             existing.host = req.host
@@ -776,12 +934,23 @@ def register_endpoint(req: EndpointRegister, _: None = Depends(require_internal_
             db.refresh(existing)
             e = existing
         else:
-            e = Endpoint(model=req.model, host=req.host, port=req.port, slurm_job_id=req.slurm_job_id, vllm_version=req.vllm_version, state="STARTING")
+            e = Endpoint(
+                model=req.model,
+                host=req.host,
+                port=req.port,
+                slurm_job_id=req.slurm_job_id,
+                vllm_version=req.vllm_version,
+                state="STARTING",
+            )
             db.add(e)
             db.commit()
             db.refresh(e)
 
-        lease = db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id)).scalars().first()
+        lease = (
+            db.execute(select(Lease).where(Lease.slurm_job_id == req.slurm_job_id))
+            .scalars()
+            .first()
+        )
         if lease:
             lease.requested_port = req.port
             if lease.state in ("SUBMITTED", "PLANNED"):
@@ -790,9 +959,14 @@ def register_endpoint(req: EndpointRegister, _: None = Depends(require_internal_
             db.refresh(e)
 
         return EndpointOut(
-            id=e.id, model=e.model, host=e.host, port=e.port,
-            slurm_job_id=e.slurm_job_id, state=e.state,
-            last_health_at=e.last_health_at, last_error=e.last_error,
-            created_at=e.created_at, vllm_version=e.vllm_version,
+            id=e.id,
+            model=e.model,
+            host=e.host,
+            port=e.port,
+            slurm_job_id=e.slurm_job_id,
+            state=e.state,
+            last_health_at=e.last_health_at,
+            last_error=e.last_error,
+            created_at=e.created_at,
+            vllm_version=e.vllm_version,
         )
-

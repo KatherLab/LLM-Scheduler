@@ -6,11 +6,12 @@ Protected by SCHEDULE_API_KEY (separate from admin auth and VLLM_API_KEY).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 
+from .admin import _active_like_leases, _placement_horizon
 from .auth import require_schedule_key
 from .catalog import get_catalog
 from .dependencies import SessionLocal
@@ -74,8 +75,7 @@ def get_schedule():
     placements. Suitable for rendering an external timeline view.
     """
     now = _now()
-    horizon_start = now - timedelta(hours=1)
-    horizon_end = now + timedelta(hours=48)
+    horizon_start, horizon_end = _placement_horizon(now)
     catalog = get_catalog()
 
     with SessionLocal() as db:
@@ -91,17 +91,9 @@ def get_schedule():
             select(Lease).order_by(Lease.id.desc())
         ).scalars().all()
 
-        # Active-like leases for placement computation
-        active_like = [
-            l
-            for l in leases
-            if l.state in ("PLANNED", "SUBMITTED", "STARTING", "RUNNING")
-            or (
-                l.state == "FAILED"
-                and l.end_at
-                and ensure_utc(l.end_at) > now
-            )
-        ]
+        # Active-like leases for placement computation. Uses the same helper as
+        # the admin dashboard so the two views never disagree on lane placement.
+        active_like = _active_like_leases(leases, now)
 
         placements = compute_placements(
             leases=active_like,

@@ -1,3 +1,15 @@
+# Applied to every model below. Per-model values win: a scalar replaces the
+# default, `env` merges key-by-key, and in extra_args/tool_args a default flag
+# is dropped when the model sets the same flag (overridden, not duplicated).
+# Keep this to flags that make sense cluster-wide — things like
+# --max-model-len belong on the individual model, or nowhere at all if the
+# model's own default context length should be used.
+defaults:
+  extra_args: "--enable-prompt-tokens-details"
+  venv_activate: /path/to/.venv/bin/activate
+  env:
+    HF_HUB_OFFLINE: "1"
+
 models:
   - name: Qwen3-0.6B-FP8
     model_path: Qwen/Qwen3-0.6B-FP8

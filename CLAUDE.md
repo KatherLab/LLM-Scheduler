@@ -50,7 +50,7 @@ FastAPI app managing GPU bookings and vLLM model serving on Slurm clusters. Acts
 | `app/public_api.py` | Read-only public API for external schedule viewers (SCHEDULE_API_KEY) |
 | `app/metrics.py` | Prometheus metric definitions, `track_proxy()` context manager, `get_metrics_summary()` |
 | `app/lifecycle_logger.py` | Rotating file logger for lifecycle events (separate from proxy logs) |
-| `app/catalog.py` | Model catalog from YAML with auto-reload on file change |
+| `app/catalog.py` | Model catalog from YAML with auto-reload on file change, plus shared `defaults:` merging |
 | `app/auth.py` | HMAC-signed cookie sessions |
 | `app/ui/app.js` | ~1800-line vanilla JS frontend (no framework), SVG timeline with drag-and-drop |
 | `app/ui/login.html` | Login page |
@@ -152,6 +152,20 @@ Also logs to stderr at INFO level. Uses a dedicated `vllm_lifecycle` logger (non
 Copy from `config/`:
 - `config/example.env` → `.env`
 - `config/models.example.yaml` → `config/models.yaml` (model catalog)
+
+### Model Catalog `defaults:`
+
+`config/models.yaml` may carry an optional top-level `defaults:` block with the same keys as a
+model entry. It is merged into every model at load time (`load_catalog`), so cluster-wide flags
+like `--enable-prompt-tokens-details` live in one place. Merge rules:
+- Scalars (`venv_activate`, `cpus`, `mem`, `gpu_memory_utilization`, `reasoning_parser`, …) — per-model value wins
+- `env` — dict merge, per-model key wins
+- `extra_args` / `tool_args` — `merge_args()` prepends the defaults, dropping any default flag the model also sets (so `--max-num-batched-tokens` is overridden, not passed twice); `--flag=value` and `--flag value` forms are treated as the same flag
+- `name`, `model_path`, `notes`, `tags` — always per-model
+
+Defaults are resolved at catalog load, so they apply to leases created afterwards; existing leases
+keep the args baked into their row. An explicit `extra_args`/`tool_args` on `POST /admin/leases`
+replaces the merged catalog value entirely.
 
 ### All Environment Variables (`app/settings.py`)
 

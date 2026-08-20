@@ -227,6 +227,42 @@ models:
 | `notes` | Optional | Short description shown in the catalog UI. |
 | `env` | Optional | Extra environment variables passed to the vLLM process. |
 
+**Shared defaults:**
+
+An optional top-level `defaults:` block holds settings that apply to every model, so cluster-wide
+flags and paths only have to be written once:
+
+```yaml
+defaults:
+  extra_args: "--enable-prompt-tokens-details --max-num-batched-tokens 16384"
+  venv_activate: /opt/vllm-stable/.venv/bin/activate
+  cpus: 8
+  env:
+    HF_HUB_OFFLINE: "1"
+
+models:
+  - name: Qwen3-0.6B-FP8
+    model_path: Qwen/Qwen3-0.6B-FP8
+    gpus: 1
+    tensor_parallel_size: 1
+    extra_args: "--enforce-eager --max-num-batched-tokens 4096"
+    # effective: --enable-prompt-tokens-details --enforce-eager --max-num-batched-tokens 4096
+```
+
+Only put flags here that make sense for every model. Per-model concerns — `--max-model-len` in
+particular, where the model's own default context length is usually the right choice — belong on
+the model entry.
+
+It accepts the same fields as a model entry, and the model always wins:
+
+- **Scalars** (`venv_activate`, `cpus`, `mem`, `gpu_memory_utilization`, `reasoning_parser`, …) — the model's value replaces the default.
+- **`env`** — merged key by key; the model's keys win.
+- **`extra_args` / `tool_args`** — the defaults are prepended, but a default flag is dropped when the model sets the same flag, so it gets overridden rather than passed twice (`--flag value` and `--flag=value` count as the same flag).
+- **`name`, `model_path`, `notes`, `tags`** — always taken from the model entry.
+
+Defaults are resolved when the catalog is (re)loaded, so they take effect for bookings made after
+the change; already-submitted bookings keep the arguments they were created with.
+
 ### 5. Run the scheduler
 
 ```bash

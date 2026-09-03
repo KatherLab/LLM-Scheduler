@@ -88,15 +88,22 @@ pools:
   # Shared research nodes. Slurm's backfill scheduler decides, so we never
   # promise a start time — we preview with `sbatch --test-only` and render the
   # booking as a ghost block until it actually starts.
+  #
+  # `scale_out: true` makes the pool opt-in: it is collapsed on the timeline and
+  # excluded from automatic GPU-class selection and placement, so a booking only
+  # lands here when it names the pool or a node in it. Use it for capacity that
+  # is a way to scale out rather than the normal place to run.
   - name: general
     partition: gpu
     scheduling: slurm
+    scale_out: true
 
   # The A100 box: gpu80 exists only here, and job_submit.lua rejects gpu80
   # outside this partition.
   - name: dgx
     partition: dgx
     scheduling: slurm
+    scale_out: true
     gpu_classes: [gpu80]
 
 quotas:

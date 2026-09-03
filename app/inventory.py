@@ -54,6 +54,35 @@ class Inventory:
             n for n in self.usable_nodes() if self.node_pools.get(n.name) == pool
         ]
 
+    def scale_out_nodes(self, cluster: ClusterConfig) -> set[str]:
+        """Nodes in opt-in pools — capacity we can reach but do not default to."""
+        return {
+            name for name, pool in self.node_pools.items()
+            if cluster.is_scale_out(pool)
+        }
+
+    def candidate_nodes(
+        self,
+        cluster: ClusterConfig,
+        pool: Pool | None = None,
+        *,
+        include_scale_out: bool = False,
+    ) -> list[NodeInfo]:
+        """Nodes a booking may land on.
+
+        Naming a pool is already an explicit choice, so it is honoured whether
+        or not the pool is scale-out. Without one, opt-in pools are left out:
+        they are hidden on the timeline, and placing a booking on a lane nobody
+        can see is worse than saying there is no room.
+        """
+        if pool is not None:
+            return self.nodes_in_pool(pool.name)
+        nodes = self.usable_nodes()
+        if include_scale_out:
+            return nodes
+        excluded = self.scale_out_nodes(cluster)
+        return [n for n in nodes if n.name not in excluded]
+
     def gpu_class_counts(self) -> dict[str, int]:
         """Total GPUs per class across usable nodes — what the UI shows."""
         counts: dict[str, int] = {}
@@ -171,6 +200,13 @@ def set_inventory(inv: Inventory | None) -> None:
 
 # ── GPU class selection ──────────────────────────────────────────────────────
 
+def _classes_on(nodes) -> set[str]:
+    """GPU classes present on these nodes. Untyped groups are not a class."""
+    return {
+        group.gpu_class for node in nodes for group in node.gpus if group.gpu_class
+    }
+
+
 def eligible_gpu_classes(
     model,
     cluster: ClusterConfig,
@@ -178,6 +214,7 @@ def eligible_gpu_classes(
     *,
     pool: Pool | None = None,
     min_memory_gb: float | None = None,
+    include_scale_out: bool = False,
 ) -> list[str]:
     """Every GPU class this model could actually run on, smallest first.
 
@@ -191,8 +228,11 @@ def eligible_gpu_classes(
     """
     from .catalog import resolve_variant
 
+    candidates = inv.candidate_nodes(
+        cluster, pool, include_scale_out=include_scale_out
+    )
     out: list[tuple[float, str]] = []
-    for name in inv.classes_available():
+    for name in _classes_on(candidates):
         gpu_class = cluster.gpu_class(name)
         if gpu_class is None:
             continue
@@ -203,7 +243,6 @@ def eligible_gpu_classes(
         if min_memory_gb and gpu_class.usable_gb < min_memory_gb:
             continue
         needed = resolve_variant(model, name).gpus
-        candidates = inv.nodes_in_pool(pool.name if pool else None)
         if not any(n.count_of(name) >= needed for n in candidates):
             continue
         out.append((gpu_class.vram_gb, name))
@@ -218,6 +257,7 @@ def choose_gpu_class(
     *,
     pool: Pool | None = None,
     preferred: str | None = None,
+    include_scale_out: bool = False,
 ) -> str | None:
     """Pick the GPU class a model should run on.
 
@@ -229,8 +269,15 @@ def choose_gpu_class(
     Smallest sufficient class wins, so a model that fits on 48 GB does not
     occupy a 96 GB card. Returns None when nothing matches, and the caller
     should refuse the booking rather than fall back to untyped.
+
+    Scale-out pools are excluded unless one is named: their cards are often the
+    *smallest* in the cluster, so ranking by size would otherwise make opt-in
+    capacity the default landing place.
     """
-    available = inv.classes_available()
+    candidates = inv.candidate_nodes(
+        cluster, pool, include_scale_out=include_scale_out
+    )
+    available = _classes_on(candidates)
     if not available:
         return None
 
@@ -249,7 +296,6 @@ def choose_gpu_class(
         # booking that cannot load is worth refusing before it queues.
         if not model.requires.fits_on(gpu_class, needed):
             return False
-        candidates = inv.nodes_in_pool(pool.name if pool else None)
         return any(n.count_of(name) >= needed for n in candidates)
 
     if preferred:

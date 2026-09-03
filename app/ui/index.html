@@ -313,6 +313,11 @@
                 </button>
               </div>
 
+              <!-- Shared partitions are extra capacity, not the default place
+                   to serve a model: their rows are collapsed until asked for,
+                   and the planner stays off them until then. -->
+              <button id="scaleOutToggle" class="hidden px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-slate-600 text-slate-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 transition whitespace-nowrap"></button>
+
               <button id="snapToNowBtn" class="px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-slate-600 text-slate-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 transition flex items-center gap-1" title="Snap timeline to current time">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                 Now

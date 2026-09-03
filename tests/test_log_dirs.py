@@ -45,7 +45,7 @@ def test_submission_sends_the_cluster_path_not_ours():
     """The regression that motivated the split: `/app/logs` reaching sbatch."""
     import app.admin as admin
 
-    src = inspect.getsource(admin._submit_to_slurm_from_snapshot)
+    src = inspect.getsource(admin._build_submit_kwargs)
     assert "log_dir=settings.job_log_dir" in src
     assert "settings.vllm_log_dir" not in src
 

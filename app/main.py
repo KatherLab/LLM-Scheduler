@@ -536,7 +536,7 @@ RENEW_INTERVAL_SECONDS = 30
 
 async def renew_worker():
     from . import renew
-    from .admin import _snapshot_lease, _submit_to_slurm_from_snapshot
+    from .admin import _snapshot_lease, _submit_to_slurm_from_snapshot_async
 
     while True:
         try:
@@ -582,9 +582,7 @@ async def renew_worker():
             submitted: list[tuple[int, str]] = []
             for snapshot in created:
                 try:
-                    job_id = await asyncio.to_thread(
-                        _submit_to_slurm_from_snapshot, snapshot
-                    )
+                    job_id = await _submit_to_slurm_from_snapshot_async(snapshot)
                     submitted.append((snapshot["id"], job_id))
                 except Exception as e:
                     logger.error(
@@ -901,7 +899,7 @@ async def _timed_health_check(host: str, port: int) -> tuple[bool, str | None, f
 
 
 async def planned_submit_worker():
-    from .admin import _submit_to_slurm_from_snapshot, _snapshot_lease
+    from .admin import _submit_to_slurm_from_snapshot_async, _snapshot_lease
 
     while True:
         try:
@@ -947,9 +945,7 @@ async def planned_submit_worker():
             for snapshot in to_submit:
                 try:
                     # Submit to Slurm without any DB session open
-                    job_id = await asyncio.to_thread(
-                        _submit_to_slurm_from_snapshot, snapshot
-                    )
+                    job_id = await _submit_to_slurm_from_snapshot_async(snapshot)
 
                     # Phase 3: write result back to DB
                     with SessionLocal() as db:
@@ -1383,7 +1379,7 @@ async def image_build_worker():
 # Cleans up old endpoint, resubmits to Slurm, resets lease to SUBMITTED.
 # =============================================================================
 async def retry_worker():
-    from .admin import _submit_to_slurm_from_snapshot, _snapshot_lease
+    from .admin import _submit_to_slurm_from_snapshot_async, _snapshot_lease
 
     while True:
         try:
@@ -1476,9 +1472,7 @@ async def retry_worker():
                             logger.warning("retry_worker: scancel failed for %s: %s", old_slurm_job_id, ex)
 
                     # Phase 2b: submit to Slurm (NO DB session open)
-                    new_job_id = await asyncio.to_thread(
-                        _submit_to_slurm_from_snapshot, snapshot
-                    )
+                    new_job_id = await _submit_to_slurm_from_snapshot_async(snapshot)
 
                     # Phase 2c: write result back to DB
                     with SessionLocal() as db:

@@ -96,6 +96,86 @@ let TL = {
   height: 0,
 };
 
+// ─── Scale-out capacity ─────────────────────────────────────────────────────
+// Pools marked `scale_out` in cluster.yaml are extra capacity rather than the
+// normal place to serve a model. The backend sorts their lanes to the *end* of
+// the strip and keeps the planner off them unless a booking names them — so
+// hiding them here is just drawing a shorter timeline, and every default lane
+// keeps the same index whether they are shown or not.
+let showScaleOut = localStorage.getItem('showScaleOut') === '1';
+
+function scaleOutNodes() {
+  return (DASH?.nodes || []).filter(n => n.scale_out);
+}
+
+function scaleOutGpus() {
+  return scaleOutNodes().reduce((sum, n) => sum + n.gpu_count, 0);
+}
+
+/** Lanes to draw: the default pools, plus scale-out when it is revealed. */
+function visibleLaneCount() {
+  const total = DASH?.total_gpus || 8;
+  if (showScaleOut) return total;
+  // A cluster where *everything* is scale-out would otherwise render empty;
+  // showing it all is the less confusing failure.
+  const dflt = DASH?.default_gpus || 0;
+  return dflt > 0 ? dflt : total;
+}
+
+/** GPU classes the booking dialog may offer for a model. */
+function eligibleClassesFor(modelId) {
+  const meta = modelMeta(modelId);
+  const base = meta.gpu_classes || [];
+  if (!showScaleOut) return base;
+  const extra = (meta.gpu_classes_scale_out || []).filter(c => !base.includes(c));
+  return base.concat(extra);
+}
+
+function isScaleOutClass(modelId, cls) {
+  return !(modelMeta(modelId).gpu_classes || []).includes(cls);
+}
+
+/**
+ * The pool a scale-out-only GPU class lives in.
+ *
+ * Choosing such a class is itself the opt-in, but the server excludes
+ * scale-out pools unless one is named — so the booking has to carry the pool
+ * or it would be refused as "no GPU class available".
+ */
+function poolForClass(cls) {
+  const hit = scaleOutNodes().find(
+    n => (n.gpu_classes || []).some(([c]) => c === cls)
+  );
+  return hit?.pool || null;
+}
+
+/** The reveal control. Hidden entirely when there is nothing to reveal. */
+function renderScaleOutToggle() {
+  const btn = $('#scaleOutToggle');
+  if (!btn) return;
+  const gpus = scaleOutGpus();
+  if (!gpus) { btn.classList.add('hidden'); return; }
+  btn.classList.remove('hidden');
+
+  const names = scaleOutNodes().map(n => n.name).join(', ');
+  btn.textContent = showScaleOut
+    ? `Hide scale-out · ${gpus} GPUs`
+    : `+ Scale-out · ${gpus} GPUs`;
+  btn.title = showScaleOut
+    ? `Shared capacity: ${names}. Drop a booking on one of these rows to use it.`
+    : `${gpus} more GPUs on shared partitions (${names}). Not used unless you `
+      + `ask for them — show the rows to book one.`;
+  btn.classList.toggle('border-brand-500/60', showScaleOut);
+  btn.classList.toggle('text-brand-600', showScaleOut);
+  btn.classList.toggle('dark:text-brand-400', showScaleOut);
+}
+
+$('#scaleOutToggle')?.addEventListener('click', () => {
+  showScaleOut = !showScaleOut;
+  localStorage.setItem('showScaleOut', showScaleOut ? '1' : '0');
+  if (DASH) renderTimeline();
+});
+
 // ─── Zoom State ─────────────────────────────────────────────────────────────
 let zoomState = {
   // Current continuous pxPerHour (the "truth" for zoom level)
@@ -217,8 +297,11 @@ async function refresh() {
     MODEL_MAP = new Map(DASH.models.map(m => [m.id, m]));
     // Summarise the discovered cluster: node count and GPU mix, so it is
     // obvious when a node has drained or discovery has gone stale.
-    const realNodes = (DASH.nodes || []).filter(n => !n.synthetic);
-    const parts = [`${DASH.total_gpus} GPUs`];
+    // Counts describe what is on offer, i.e. the lanes actually drawn —
+    // claiming GPUs that no booking can reach would be worse than silent.
+    const realNodes = (DASH.nodes || [])
+      .filter(n => !n.synthetic && (showScaleOut || !n.scale_out));
+    const parts = [`${visibleLaneCount()} GPUs`];
     if (realNodes.length) {
       parts.push(`${realNodes.length} node${realNodes.length === 1 ? '' : 's'}`);
       const mix = {};
@@ -231,7 +314,14 @@ async function refresh() {
       const mixText = Object.entries(mix).sort().map(([c, n]) => `${n}×${c}`).join(', ');
       if (mixText) parts.push(mixText);
     }
-    const foreign = (DASH.foreign_jobs || []).length;
+    if (!showScaleOut && scaleOutGpus()) {
+      parts.push(`+${scaleOutGpus()} scale-out`);
+    }
+    // Foreign jobs on collapsed nodes are not drawn, so counting them here
+    // would point at blocks that are not on screen.
+    const shownNodes = new Set(realNodes.map(n => n.name));
+    const foreign = (DASH.foreign_jobs || [])
+      .filter(j => (j.nodes || []).some(n => shownNodes.has(n))).length;
     if (foreign) parts.push(`${foreign} foreign job${foreign === 1 ? '' : 's'}`);
     parts.push(fmtTime(new Date(DASH.now)));
 
@@ -1302,7 +1392,7 @@ function memoryCeilingGb(modelId) {
     const info = gpuClassInfo(chosen);
     if (info && info.usable_gb > 0) return info.usable_gb;
   }
-  const eligible = modelMeta(modelId).gpu_classes || [];
+  const eligible = eligibleClassesFor(modelId);
   const pool = (DASH?.gpu_classes || [])
     .filter(c => c.usable_gb > 0 && (!eligible.length || eligible.includes(c.name)));
   if (!pool.length) return null;
@@ -1316,7 +1406,7 @@ function modelMeta(modelId) {
 /** Populate the GPU type selector with the classes this model can use. */
 function syncGpuClassOptions(modelId) {
   if (!memoryControlPresent) return;
-  const eligible = modelMeta(modelId).gpu_classes || [];
+  const eligible = eligibleClassesFor(modelId);
   const previous = gpuClassSelect.value;
 
   gpuClassSelect.innerHTML = '';
@@ -1329,10 +1419,14 @@ function syncGpuClassOptions(modelId) {
     const info = gpuClassInfo(name);
     const opt = document.createElement('option');
     opt.value = name;
-    opt.textContent = info
+    const scaleOut = isScaleOutClass(modelId, name);
+    opt.textContent = (info
       ? `${name} — ${Math.floor(info.usable_gb)} GB usable`
         + (info.unified_memory ? ' (unified memory)' : '')
-      : name;
+      : name)
+      // Says out loud that this one is on a shared partition, where Slurm
+      // decides the start time rather than our calendar.
+      + (scaleOut ? ` · scale-out (${poolForClass(name) || 'shared'})` : '');
     gpuClassSelect.appendChild(opt);
   }
 
@@ -1483,6 +1577,12 @@ $('#modalSave').addEventListener('click', async () => {
       // picks the smallest class that fits.
       if (gpuClassSelect && gpuClassSelect.value) {
         payload.gpu_class = gpuClassSelect.value;
+        // A scale-out class exists only in an opt-in pool, which the server
+        // ignores unless it is named. A pinned node already names one.
+        if (!modalState.pinnedNode && isScaleOutClass(model, gpuClassSelect.value)) {
+          const pool = poolForClass(gpuClassSelect.value);
+          if (pool) payload.pool = pool;
+        }
       }
       if (modalState.pinnedNode) {
         payload.node = modalState.pinnedNode;
@@ -2671,7 +2771,8 @@ function applyZoom(hours, pxPerHour, preserveScrollCenter = true) {
 
 function renderTimeline() {
   const svg = $('#timelineSvg');
-  const gpuTotal = DASH?.total_gpus || 8;
+  const gpuTotal = visibleLaneCount();
+  renderScaleOutToggle();
 
   const container = $('#timelineContainer');
   const containerWidth = container.clientWidth || 1200;
@@ -2849,10 +2950,15 @@ function renderTimeline() {
       const drained = label.node.state && /DOWN|DRAIN|FAIL|MAINT/i.test(label.node.state);
       const classes = (label.node.gpu_classes || [])
         .map(([cls, n]) => `${n}×${cls || 'gpu'}`).join(' ');
+      // Scale-out nodes are drawn dimmer: they are reachable, but Slurm — not
+      // this calendar — decides when a job there actually starts.
+      const secondary = label.node.scale_out;
       drawText(svg, 10, y + 13, label.node.name + (drained ? ' (unavailable)' : ''), {
-        fill: drained ? '#ef4444' : (dark ? '#e2e8f0' : '#0f172a'),
+        fill: drained ? '#ef4444'
+          : secondary ? (dark ? '#94a3b8' : '#64748b')
+          : (dark ? '#e2e8f0' : '#0f172a'),
         'font-size': 11,
-        'font-weight': 600,
+        'font-weight': secondary ? 500 : 600,
       });
       if (classes) {
         drawText(svg, 10, y + 25, classes, {
@@ -2877,7 +2983,7 @@ function renderTimeline() {
   // Other users' jobs on shared nodes. Drawn *under* our bookings, hatched and
   // grey, because they are capacity we can see but cannot move. Without them
   // the calendar would promise GPUs Slurm has already given away.
-  drawForeignJobs(svg, nodeLanes);
+  drawForeignJobs(svg, nodeLanes.filter(n => n.lane_offset < gpuTotal));
 
   // ── Lease blocks ──
   const nowDate = new Date(DASH.now);
@@ -2889,6 +2995,9 @@ function renderTimeline() {
     .sort((a, b) => new Date(a.begin_at || a.created_at) - new Date(b.begin_at || b.created_at));
 
   for (const l of leases) {
+    // Bookings on collapsed scale-out lanes have no row to sit on. They stay
+    // in the table below, which is where they can still be found.
+    if ((l.lane_start ?? 0) >= gpuTotal) continue;
     drawLeaseBlock(svg, l);
   }
 

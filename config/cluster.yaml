@@ -12,6 +12,11 @@
 #                our calendar is the allocator: jobs go out with --begin +
 #                --nodelist + typed --gres and a booking is a real promise.
 #
+# Only the second kind is on offer by default. gpu / dgx carry
+# `scale_out: true`, which hides them from the timeline and keeps the planner
+# off them until someone explicitly asks — they are a way to scale out, not the
+# normal place to serve a model.
+#
 # The service account `slurmweb` must be in `llm-hosting` or neither of those
 # partitions will accept a submission. Note the membership is read on the
 # CONTROLLER: after changing it, titan's SSSD cache and Slurm's own
@@ -173,16 +178,30 @@ gpu_classes:
     guard_gap_seconds: 180           # weights load from shared storage
 
 pools:
+  # ── Scale-out capacity (opt-in) ───────────────────────────────────────────
+  # These are the cluster's shared partitions: usable, but a special case
+  # rather than where LLM serving normally happens. `scale_out: true` keeps
+  # them out of the default view AND out of default placement — the timeline
+  # collapses them behind a toggle, and a booking only lands here when it
+  # names the pool or is dropped onto one of its rows.
+  #
+  # Both halves of that matter. Hiding them alone would be worse than not
+  # hiding them: `choose_gpu_class` picks the *smallest* sufficient class, and
+  # the smallest cards in this cluster (gpu24/gpu48) are here — so bookings
+  # would keep landing on lanes nobody can see.
+
   # The shared research partition. Slurm decides; we estimate and never promise.
   - name: general
     partition: gpu
     scheduling: slurm
+    scale_out: true
 
   # The A100 box. job_submit.lua rejects gpu80 outside this partition, so the
   # class restriction here mirrors a rule the cluster already enforces.
   - name: dgx
     partition: dgx
     scheduling: slurm
+    scale_out: true
     gpu_classes: [gpu80]
 
   # ── Exclusive LLM nodes ──────────────────────────────────────────────────

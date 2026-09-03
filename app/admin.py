@@ -184,10 +184,19 @@ def _scheduling_mode(pool_name: str | None) -> str:
     schedules — including the legacy no-cluster.yaml case, where we never told
     Slurm anything — is only ever an estimate.
     """
-    pool = get_cluster().pool(pool_name)
-    if pool is None:
-        return SCHEDULING_MANAGED if not get_cluster().pools else SCHEDULING_SLURM
-    return SCHEDULING_MANAGED if pool.is_managed else SCHEDULING_SLURM
+    cluster = get_cluster()
+    pool = cluster.pool(pool_name)
+    if pool is not None:
+        return SCHEDULING_MANAGED if pool.is_managed else SCHEDULING_SLURM
+
+    # No pool named. The booking is confined to the default (non-scale-out)
+    # pools, so it is a promise exactly when all of those are ours to allocate.
+    # With no cluster.yaml at all there are none, which is the legacy
+    # single-node case — that one we do allocate.
+    defaults = [p for p in cluster.pools.values() if not p.scale_out]
+    if all(p.is_managed for p in defaults):
+        return SCHEDULING_MANAGED
+    return SCHEDULING_SLURM
 
 
 def _mail_user_for(owner_email: str | None) -> str | None:
@@ -220,6 +229,22 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     """
     Submit a Slurm job using a plain-dict snapshot instead of an ORM object.
     """
+    kwargs = _build_submit_kwargs(snapshot)
+    return slurm.submit_vllm_job(**kwargs).job_id
+
+
+async def _submit_to_slurm_from_snapshot_async(snapshot: dict) -> str:
+    """Async twin of `_submit_to_slurm_from_snapshot`.
+
+    Must be awaited directly from the caller's running loop rather than via
+    `asyncio.to_thread` — see the docstring on `slurm.async_submit_vllm_job`.
+    """
+    kwargs = _build_submit_kwargs(snapshot)
+    res = await slurm.async_submit_vllm_job(**kwargs)
+    return res.job_id
+
+
+def _build_submit_kwargs(snapshot: dict) -> dict:
     begin = (
         ensure_utc(snapshot["begin_at"])
         if snapshot["begin_at"]
@@ -296,7 +321,7 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
     if snapshot.get("id"):
         comment_bits.append(f"lease:{snapshot['id']}")
 
-    res = slurm.submit_vllm_job(
+    return dict(
         template_path=settings.sbatch_template_path,
         job_name=f"vllm-{snapshot['model']}",
         gpus=snapshot["requested_gpus"],
@@ -316,7 +341,6 @@ def _submit_to_slurm_from_snapshot(snapshot: dict) -> str:
         mail_user=_mail_user_for(snapshot.get("owner_email")),
         mail_type=settings.slurm_mail_type,
     )
-    return res.job_id
 
 
 def _snapshot_lease(lease: "Lease") -> dict:
@@ -589,6 +613,16 @@ async def dashboard(user: User = Depends(current_user)):
         catalog = get_catalog()
         models: list[DashboardModel] = []
         for name, m in catalog.items():
+            default_classes = inventory.eligible_gpu_classes(m, cluster, inv)
+            # Classes only reachable by opting into a scale-out pool. Offered
+            # separately so the dialog can widen its list exactly when the
+            # timeline is showing those nodes.
+            scale_out_classes = [
+                c for c in inventory.eligible_gpu_classes(
+                    m, cluster, inv, include_scale_out=True
+                )
+                if c not in default_classes
+            ]
             models.append(
                 DashboardModel(
                     id=name,
@@ -605,9 +639,8 @@ async def dashboard(user: User = Depends(current_user)):
                         # The dialog offers only these, and bounds the memory
                         # cap by whichever the user picks — bounding by the
                         # smallest class is only honest while it is unknown.
-                        "gpu_classes": inventory.eligible_gpu_classes(
-                            m, cluster, inv
-                        ),
+                        "gpu_classes": default_classes,
+                        "gpu_classes_scale_out": scale_out_classes,
                         "min_vram_gb": m.min_vram_gb or None,
                     },
                 )
@@ -658,6 +691,9 @@ async def dashboard(user: User = Depends(current_user)):
         # Sum over what was actually discovered; falls back to the synthetic
         # node built from TOTAL_GPUS when there is no inventory.
         total_gpus=sum(lane.gpu_count for lane in lanes),
+        default_gpus=sum(
+            lane.gpu_count for lane in lanes if not lane.scale_out
+        ),
         models=models,
         leases=out_leases,
         endpoint_stats=stats,
@@ -678,6 +714,7 @@ async def dashboard(user: User = Depends(current_user)):
                 state=lane.state,
                 pool=lane.pool,
                 synthetic=lane.synthetic,
+                scale_out=lane.scale_out,
             )
             for lane in lanes
         ],
@@ -891,6 +928,12 @@ async def create_lease(req: LeaseCreate, user: User = Depends(current_user)):
     if req.pool and pool is None:
         raise HTTPException(status_code=404, detail=f"Unknown pool '{req.pool}'")
 
+    # Naming a node names a pool. This is the whole opt-in path for scale-out
+    # capacity: dropping onto one of those rows asks for that machine, and the
+    # pool has to follow or the job would be submitted to the wrong partition.
+    if pool is None and req.node:
+        pool = cluster.pool(inv.node_pools.get(req.node))
+
     # Pick the GPU class before anything else: it decides the variant, and
     # submitting untyped would let job_submit.lua pin us to gpu24.
     gpu_class = None
@@ -1048,9 +1091,7 @@ async def create_lease(req: LeaseCreate, user: User = Depends(current_user)):
                 total_seconds = max(60, total_seconds)
                 new_time_limit = _time_limit_from_duration(total_seconds)
                 try:
-                    await asyncio.to_thread(
-                        slurm.extend_time, merged.slurm_job_id, new_time_limit
-                    )
+                    await slurm.async_extend_time(merged.slurm_job_id, new_time_limit)
                     print(
                         f"create_lease: extended Slurm job {merged.slurm_job_id} "
                         f"time to {new_time_limit} after merge"
@@ -1126,7 +1167,7 @@ async def create_lease(req: LeaseCreate, user: User = Depends(current_user)):
     # ── Outside DB session: submit to Slurm if needed ──
     if snapshot is not None:
         try:
-            job_id = await asyncio.to_thread(_submit_to_slurm_from_snapshot, snapshot)
+            job_id = await _submit_to_slurm_from_snapshot_async(snapshot)
         except Exception as e:
             with SessionLocal() as db:
                 lease = db.get(Lease, lease_id)

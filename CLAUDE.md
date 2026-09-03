@@ -186,6 +186,7 @@ See `docs/architecture-v2.md` for the full multi-node / heterogeneous design.
 - **Runtimes** (`apptainer` | `venv`) are selected *by GPU class*, so an
   aarch64 node gets an aarch64 image without any model naming one.
 - **Pools** carry `scheduling: managed | slurm` — see below.
+- **Pools** also carry `scale_out: true` for opt-in capacity — see below.
 - **Quotas** resolve `default -> group -> per_pool`; admins are exempt.
 
 **`TOTAL_GPUS` is derived, not configured.** `inventory_worker` refreshes a node
@@ -229,6 +230,39 @@ We deliberately do **not** create per-booking Slurm reservations: on dedicated
 nodes nothing else can land there, and on shared nodes a reservation would take
 capacity from other users while Slurm's backfill already answers "earliest
 slot" better than we can.
+
+### `scale_out: true` — capacity that is opt-in
+
+The shared partitions (`gpu`, `dgx`) are a way to scale out, not where LLM
+serving normally happens. `scale_out: true` on a pool makes it opt-in, and
+that is deliberately **one switch for two things**:
+
+- the timeline collapses its lanes (a toggle above the schedule reveals them,
+  remembered in `localStorage`), and
+- `choose_gpu_class` / `eligible_gpu_classes` / the placer ignore its nodes.
+
+Hiding alone would be *worse* than not hiding: class selection picks the
+smallest sufficient class and the smallest cards on this cluster are in those
+pools, so bookings would keep landing on lanes nobody can see.
+
+Opting in is per booking, either by naming `pool`, or by naming a `node` —
+`create_lease` derives the pool from the node, which is what makes "drop it on
+titan's row" submit to the right partition. The dashboard exposes
+`default_gpus` (the strip's default height), `NodeLaneOut.scale_out`, and
+`meta.gpu_classes_scale_out` (the extra classes the dialog offers only while
+the rows are shown).
+
+`node_lanes()` sorts scale-out nodes **last** as a block, which is why hiding
+them is just drawing fewer lanes — every default lane keeps its index either
+way, so nothing has to be remapped.
+
+With no `scale_out` pool anywhere, `allowed_nodes()` returns "no restriction"
+and placement is byte-identical to before, including the legacy single-node
+fallback.
+
+`_scheduling_mode(None)` follows from this: no pool means the default pools,
+so a booking is `managed` when all of *those* are — it is no longer downgraded
+to an estimate merely because a `cluster.yaml` exists.
 
 ### Catalog `variants`
 

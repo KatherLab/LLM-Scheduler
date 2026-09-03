@@ -32,10 +32,14 @@ NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
 NO_CLUSTER = ClusterConfig()
 
 
-def _lease(id, begin, end, gpus=1, state="PLANNED", gpu_class=None, node=None):
+def _lease(
+    id, begin, end, gpus=1, state="PLANNED", gpu_class=None, node=None,
+    pool=None, pinned_node=None,
+):
     return SimpleNamespace(
         id=id, state=state, begin_at=begin, end_at=end, created_at=begin,
         requested_gpus=gpus, gpu_class=gpu_class, node=node, model=f"m{id}",
+        pool=pool, pinned_node=pinned_node,
     )
 
 
@@ -183,6 +187,7 @@ def test_lease_without_begin_falls_back_to_created_at():
     lease = SimpleNamespace(
         id=1, state="PLANNED", begin_at=None, end_at=NOW + timedelta(hours=1),
         created_at=NOW, requested_gpus=1, gpu_class=None, node=None, model="m",
+        pool=None, pinned_node=None,
     )
     assert lease_to_demand(lease).begin == NOW
 
@@ -191,6 +196,7 @@ def test_lease_without_end_gets_an_hour():
     lease = SimpleNamespace(
         id=1, state="PLANNED", begin_at=NOW, end_at=None, created_at=NOW,
         requested_gpus=1, gpu_class=None, node=None, model="m",
+        pool=None, pinned_node=None,
     )
     demand = lease_to_demand(lease)
     assert demand.end - demand.begin == timedelta(hours=1)

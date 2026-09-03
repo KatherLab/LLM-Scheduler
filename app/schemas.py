@@ -146,6 +146,9 @@ class NodeLaneOut(BaseModel):
     pool: Optional[str] = None
     # True when standing in for TOTAL_GPUS because no inventory was discovered.
     synthetic: bool = False
+    # Node in an opt-in ("scale-out") pool. These sort to the end of the lane
+    # strip, so the UI hides them by drawing fewer lanes.
+    scale_out: bool = False
 
 class ForeignJobOut(BaseModel):
     """Someone else's job occupying GPUs we can see but do not control."""
@@ -223,6 +226,10 @@ class DashboardResponse(BaseModel):
     now: datetime
     # Derived from discovered inventory, not the TOTAL_GPUS env var.
     total_gpus: int
+    # GPUs in the pools shown by default — i.e. excluding scale-out. The
+    # timeline's default height, so revealing scale-out capacity is purely
+    # additive at the bottom of the strip.
+    default_gpus: int = 0
     models: list[DashboardModel]
     leases: list[LeaseOut]
     endpoint_stats: list[EndpointStats] = []

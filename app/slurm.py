@@ -60,7 +60,7 @@ def _call_sync(sync_name: str, async_name: str, *args):
 
 # ── Submission ───────────────────────────────────────────────────────────────
 
-def submit_vllm_job(
+def _build_job_spec(
     *,
     template_path: str,
     job_name: str,
@@ -80,8 +80,8 @@ def submit_vllm_job(
     gres: str | None = None,
     reservation: str | None = None,
     comment: str | None = None,
-) -> SlurmSubmitResult:
-    spec = JobSpec(
+) -> JobSpec:
+    return JobSpec(
         job_name=job_name,
         script_path=template_path,
         gpus=gpus,
@@ -101,12 +101,28 @@ def submit_vllm_job(
         mail_user=mail_user,
         mail_type=mail_type,
     )
+
+
+def submit_vllm_job(**kwargs) -> SlurmSubmitResult:
+    spec = _build_job_spec(**kwargs)
     res = _call_sync("submit_sync", "submit", spec)
     return SlurmSubmitResult(job_id=res.job_id, raw=res.raw)
 
 
 async def async_submit_vllm_job(**kwargs) -> SlurmSubmitResult:
-    return await asyncio.to_thread(lambda: submit_vllm_job(**kwargs))
+    """Submit on the *current* running loop.
+
+    Unlike the sync `submit_vllm_job`, this must not be driven through
+    `_call_sync`'s worker-thread + `asyncio.run()` fallback: backends like
+    `SlurmRestBackend` hold a persistent `httpx.AsyncClient` bound to the loop
+    they were constructed on, and handing its coroutine to a freshly spun-up
+    loop in another thread raises "bound to a different event loop". The CLI
+    backend's `submit()` already wraps its blocking subprocess call in
+    `asyncio.to_thread` internally, so calling it directly here is safe too.
+    """
+    spec = _build_job_spec(**kwargs)
+    res = await get_backend().submit(spec)
+    return SlurmSubmitResult(job_id=res.job_id, raw=res.raw)
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────────────

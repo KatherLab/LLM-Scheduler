@@ -43,6 +43,10 @@ class NodeLane:
     state: str
     pool: str | None
     synthetic: bool = False
+    #: Node in an opt-in pool. Sorted to the end of the strip so the UI can
+    #: collapse it by simply drawing fewer lanes — lane indices of the default
+    #: nodes stay put whether it is shown or not.
+    scale_out: bool = False
 
 
 def effective_nodes(inv: Inventory) -> list[NodeInfo]:
@@ -62,26 +66,57 @@ def effective_nodes(inv: Inventory) -> list[NodeInfo]:
     )]
 
 
-def node_lanes(nodes: list[NodeInfo], inv: Inventory) -> list[NodeLane]:
+def node_lanes(
+    nodes: list[NodeInfo], inv: Inventory, cluster: ClusterConfig | None = None
+) -> list[NodeLane]:
     """Assign each node a stable lane offset, ordered by name.
 
     Stability matters: the timeline would jump around between refreshes if
     offsets shifted when a node drained.
+
+    Scale-out nodes come last as a block. That is what lets the UI hide them by
+    shortening the strip instead of remapping every lane index — and it keeps a
+    default booking's lane the same whether or not they are shown.
     """
+    def key(node: NodeInfo) -> tuple[int, str]:
+        pool = inv.node_pools.get(node.name)
+        scale_out = cluster.is_scale_out(pool) if cluster else False
+        return (1 if scale_out else 0, node.name)
+
     lanes: list[NodeLane] = []
     offset = 0
-    for node in sorted(nodes, key=lambda n: n.name):
+    for node in sorted(nodes, key=key):
+        pool = inv.node_pools.get(node.name)
         lanes.append(NodeLane(
             name=node.name,
             lane_offset=offset,
             gpu_count=node.gpu_count,
             gpu_classes=tuple((g.gpu_class, g.count) for g in node.gpus),
             state=node.state,
-            pool=inv.node_pools.get(node.name),
+            pool=pool,
             synthetic=node.name == SYNTHETIC_NODE,
+            scale_out=cluster.is_scale_out(pool) if cluster else False,
         ))
         offset += node.gpu_count
     return lanes
+
+
+def allowed_nodes(
+    pool_name: str | None, inv: Inventory, cluster: ClusterConfig
+) -> tuple[str, ...]:
+    """Nodes a booking with this pool may be placed on.
+
+    Empty means "no restriction", which is what a cluster with no scale-out
+    pools gets — including the legacy single-node fallback, whose placement must
+    stay byte-identical.
+    """
+    if not cluster.has_scale_out:
+        return ()
+    nodes = (
+        inv.nodes_in_pool(pool_name) if pool_name
+        else inv.candidate_nodes(cluster)
+    )
+    return tuple(sorted(n.name for n in nodes))
 
 
 def lane_index(lanes: list[NodeLane], placement: Placement) -> int | None:
@@ -94,21 +129,29 @@ def lane_index(lanes: list[NodeLane], placement: Placement) -> int | None:
     return None
 
 
-def lease_to_demand(lease, *, pinned: bool = False) -> Demand:
+def lease_to_demand(
+    lease, *, pinned: bool = False, nodes: tuple[str, ...] = ()
+) -> Demand:
     """Convert a Lease row into a placement Demand.
 
     A running booking is pinned to the node it actually landed on, so
-    re-planning cannot "move" a model that is already serving traffic.
+    re-planning cannot "move" a model that is already serving traffic. A user
+    pin (`pinned_node`, which is what dropping onto a node's row sets) is also
+    honoured: the job goes out with `--nodelist`, so drawing it anywhere else
+    would show a machine it will not run on.
     """
     begin = ensure_utc(lease.begin_at) if lease.begin_at else ensure_utc(lease.created_at)
     end = ensure_utc(lease.end_at) if lease.end_at else begin + timedelta(hours=1)
-    pin = lease.node if (pinned or lease.state in ("RUNNING", "STARTING")) else None
+    pin = lease.pinned_node or (
+        lease.node if (pinned or lease.state in ("RUNNING", "STARTING")) else None
+    )
     return Demand(
         lease_id=lease.id,
         gpus=max(1, lease.requested_gpus or 1),
         begin=begin,
         end=end,
         gpu_class=lease.gpu_class,
+        nodes=nodes,
         pinned_node=pin if pin else None,
     )
 
@@ -130,16 +173,24 @@ def plan(
     *,
     include_foreign: bool = True,
 ) -> tuple[dict[int, Placement], list[NodeLane]]:
-    """Place every booking and return the lane layout to render them in."""
+    """Place every booking and return the lane layout to render them in.
+
+    Each booking is confined to its own pool's nodes: without a pool that means
+    the default pools only, so a booking nobody asked to scale out does not get
+    placed on capacity the timeline hides.
+    """
     nodes = effective_nodes(inv)
     foreign: list[ForeignJob] = list(inv.foreign_jobs) if include_foreign else []
     placements = compute_placements(
-        [lease_to_demand(x) for x in leases],
+        [
+            lease_to_demand(x, nodes=allowed_nodes(x.pool, inv, cluster))
+            for x in leases
+        ],
         nodes,
         cluster=cluster,
         foreign_jobs=foreign,
     )
-    return placements, node_lanes(nodes, inv)
+    return placements, node_lanes(nodes, inv, cluster)
 
 
 def earliest_start(
@@ -164,17 +215,19 @@ def earliest_start(
     if not nodes:
         return None
 
-    demand = lease_to_demand(lease)
-    if pool is not None and pool.nodes:
-        demand = Demand(
-            lease_id=demand.lease_id, gpus=demand.gpus, begin=demand.begin,
-            end=demand.end, gpu_class=demand.gpu_class, nodes=tuple(pool.nodes),
-        )
+    # An explicit `nodes:` list on the pool is a hard restriction; otherwise the
+    # pool (or its absence) still decides which nodes are on offer.
+    restrict = tuple(pool.nodes) if pool is not None and pool.nodes else \
+        allowed_nodes(pool.name if pool else None, inv, cluster)
+    demand = lease_to_demand(lease, nodes=restrict)
 
     return find_earliest_slot(
         demand,
         nodes,
-        [lease_to_demand(x) for x in others],
+        [
+            lease_to_demand(x, nodes=allowed_nodes(x.pool, inv, cluster))
+            for x in others
+        ],
         cluster=cluster,
         foreign_jobs=list(inv.foreign_jobs),
         search_end=search_end,

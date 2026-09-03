@@ -148,6 +148,12 @@ class Pool:
     name: str
     partition: str
     scheduling: str = SCHEDULING_SLURM
+    #: Extra capacity that is not offered by default. The pool is collapsed on
+    #: the timeline and excluded from automatic GPU-class selection and
+    #: placement; a booking only lands here when it names the pool or a node in
+    #: it. This is for partitions we do not own — being *able* to scale out onto
+    #: them should not make them the thing every booking silently lands on.
+    scale_out: bool = False
     operators: tuple[str, ...] = ()
     #: Explicit node list; empty means "every node in the partition".
     nodes: tuple[str, ...] = ()
@@ -215,6 +221,15 @@ class ClusterConfig:
 
     def pool(self, name: str | None) -> Pool | None:
         return self.pools.get(name) if name else None
+
+    def is_scale_out(self, pool_name: str | None) -> bool:
+        """True for a pool that is opt-in rather than part of the default view."""
+        pool = self.pool(pool_name)
+        return bool(pool and pool.scale_out)
+
+    @property
+    def has_scale_out(self) -> bool:
+        return any(p.scale_out for p in self.pools.values())
 
     def pools_for_partition(self, partition: str) -> list[Pool]:
         return [p for p in self.pools.values() if p.partition == partition]
@@ -386,6 +401,7 @@ def load_cluster(path: str) -> ClusterConfig:
             name=name,
             partition=str(partition),
             scheduling=scheduling,
+            scale_out=bool(raw.get("scale_out", False)),
             operators=_as_tuple(raw.get("operators")),
             nodes=_as_tuple(raw.get("nodes")),
             gpu_classes=classes,

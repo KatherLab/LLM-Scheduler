@@ -1,0 +1,117 @@
+# Cluster topology — what exists. (models.yaml describes what to run on it.)
+#
+# Copy to config/cluster.yaml. If the file is absent the app falls back to the
+# old single-node behaviour: untyped --gres and TOTAL_GPUS.
+#
+# The GPU class names here MUST match the GRES types in slurm.conf, because
+# job_submit.lua validates and rewrites --gres against them. Getting this wrong
+# is not a silent failure — but getting it *missing* is: an untyped
+# `--gres=gpu:N` gets `gpu24` appended as a hard constraint, so the job never
+# lands on anything bigger.
+
+runtimes:
+  # Apptainer cannot cross-build: build the aarch64 image on an aarch64 node.
+  x86-cuda:
+    kind: apptainer
+    image: /shared/sif/vllm-0.11.0-cu128.sif
+    nv: true
+    binds:
+      - /models:/models:ro
+      - /scratch
+  # Kept so existing venv deployments keep working — there is no flag day.
+  legacy-venv:
+    kind: venv
+    activate: /path/to/.venv/bin/activate
+
+gpu_classes:
+  gpu24:
+    vram_gb: 24
+    arch: x86_64
+    runtime: legacy-venv
+    models: [rtx_6000, rtx_a5000, rtx_3090, rtx_pro_6000]
+    guard_gap_seconds: 60
+
+  gpu48:
+    vram_gb: 48
+    arch: x86_64
+    runtime: legacy-venv
+    models: [rtx_6000_ada, rtx_a6000, l40]
+    guard_gap_seconds: 90
+
+  gpu80:
+    vram_gb: 80
+    arch: x86_64
+    runtime: legacy-venv
+    models: [a100]
+    # Large weights over shared storage take minutes to load, and teardown is
+    # not instant; too small a gap makes one overrun cascade into the next
+    # booking on the same node.
+    guard_gap_seconds: 180
+
+  gpu96:
+    vram_gb: 96
+    arch: x86_64
+    runtime: legacy-venv
+    models: [rtx_pro_6000]
+    guard_gap_seconds: 180
+
+  # DGX Spark (GB10). RAM *is* VRAM: 128 GB shared with the OS, so
+  # --gpu-memory-utilization's denominator is the whole machine. An uncapped
+  # 0.95 would try to take ~121 GB and destabilise the node.
+  #
+  # Prefer stating `reserved_gb` — how much the host needs — over hand-computing
+  # a fraction. `gpu_memory_utilization_max` is then a belt-and-braces ceiling.
+  # gb10:
+  #   vram_gb: 128
+  #   arch: aarch64
+  #   runtime: arm-spark
+  #   unified_memory: true
+  #   reserved_gb: 40              # -> default utilization 0.69
+  #   gpu_memory_utilization_max: 0.70
+  #   guard_gap_seconds: 180       # weights load from shared storage
+
+  # A couple of GB on a discrete card covers the CUDA context and
+  # fragmentation. Only needed if you hit OOM at startup.
+  # reserved_gb: 2
+
+pools:
+  # Nodes carved out for LLM serving. Our calendar is the allocator here, so a
+  # booking is a promise: jobs are pinned with --nodelist and submitted with
+  # --begin. No Slurm reservation is needed — nothing else can land here.
+  - name: llm-dedicated
+    partition: gpu
+    scheduling: managed
+    operators: [llm-gpu-team]
+    nodes: [jupiter, titan]
+    gpu_classes: [gpu48, gpu96]
+
+  # Shared research nodes. Slurm's backfill scheduler decides, so we never
+  # promise a start time — we preview with `sbatch --test-only` and render the
+  # booking as a ghost block until it actually starts.
+  - name: general
+    partition: gpu
+    scheduling: slurm
+
+  # The A100 box: gpu80 exists only here, and job_submit.lua rejects gpu80
+  # outside this partition.
+  - name: dgx
+    partition: dgx
+    scheduling: slurm
+    gpu_classes: [gpu80]
+
+quotas:
+  default:
+    max_concurrent_gpus: 4
+    max_gpu_hours_inflight: 96
+    max_booking_horizon_days: 14
+    max_booking_duration_hours: 48
+
+  groups:
+    llm-power-users:
+      max_concurrent_gpus: 8
+      max_booking_horizon_days: 30
+
+  per_pool:
+    # Best-effort anyway — a long booking here costs nobody a guaranteed slot.
+    general:
+      max_booking_duration_hours: 168

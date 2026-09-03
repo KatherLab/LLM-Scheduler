@@ -1,0 +1,138 @@
+# LLM Scheduler — slurmrestd deployment.
+#
+# With CLUSTER_BACKEND=slurm_rest this container needs no Slurm binaries, no
+# munge socket, no /etc/slurm and no host-matching UID. It can therefore run on
+# any VM that can reach slurmrestd over HTTP.
+#
+# The remaining requirement is NETWORK, not software:
+#   this container  -> slurmrestd            (:6820)
+#   this container  -> compute nodes         (vLLM's ephemeral ports)
+#   compute nodes   -> this container        (ROUTER_REGISTER_URL)
+#
+# See the bottom of this file for the legacy CLI-backend setup.
+
+services:
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-scheduler
+    restart: unless-stopped
+
+    # ── Port mapping ────────────────────────────────────────────────
+    # Left side = host port (what users + Slurm jobs connect to)
+    # Right side = container port (always 9000)
+    #
+    # IMPORTANT: ROUTER_PORT in .env MUST match the left side!
+    # e.g., if you map 8080:9000, set ROUTER_PORT=8080 in .env
+    ports:
+      - "${ROUTER_PORT:-9000}:9000"
+
+    env_file:
+      - .env
+
+    environment:
+      # Paths inside the container; these override anything in .env.
+      - DATABASE_URL=sqlite:////app/data/router.db
+      # Our own lifecycle.log — container-local, bind-mounted below.
+      - VLLM_LOG_DIR=/app/logs
+      # JOB_LOG_DIR is deliberately NOT set here: it is a path on the COMPUTE
+      # NODES, so a container path would be wrong. Set it in .env.
+      - SBATCH_TEMPLATE_PATH=/app/templates/vllm_job.sh
+      # Set CLUSTER_BACKEND=slurm_cli in .env to fall back to the legacy mode.
+      - CLUSTER_BACKEND=${CLUSTER_BACKEND:-slurm_rest}
+
+    # Lets the container reach the host as "host.docker.internal" — only
+    # needed if slurmrestd runs on the Docker host itself.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # ── Persistent data ──────────────────────────────────────────
+      - scheduler-data:/app/data
+
+      # ── Configuration ────────────────────────────────────────────
+      - ./config/models.yaml:/app/config/models.yaml:ro
+      # Cluster topology: GPU classes, runtimes, pools, quotas.
+      # Comment out to fall back to flat TOTAL_GPUS behaviour.
+      - ./config/cluster.yaml:/app/config/cluster.yaml:ro
+
+      # ── Our own logs ─────────────────────────────────────────────
+      # lifecycle.log, written by this process. Nothing on the cluster reads
+      # or writes it, so a plain host directory is fine.
+      - ${ROUTER_LOG_DIR:-./logs}:/app/logs
+
+      # ── Slurm job logs (shared filesystem) ───────────────────────
+      # The compute nodes write stdout/stderr to JOB_LOG_DIR — a path THEY
+      # resolve, so it must exist cluster-wide. Mounting it here at the SAME
+      # path is what lets the UI show those logs without translating paths
+      # (otherwise set JOB_LOG_DIR_LOCAL to wherever it lands).
+      #
+      # Left commented because it only works where that filesystem is actually
+      # mounted — on the macOS/Podman dev setup the path does not exist and the
+      # bind would fail at startup. Uncomment on the cluster-side deployment:
+      #
+      #   - /mnt/copernicus0/llm-scheduler/logs:/mnt/copernicus0/llm-scheduler/logs:ro
+      #
+      # Without it, log viewing is empty and everything else still works —
+      # submission does not depend on us seeing the directory.
+
+      # ── Apptainer images (shared filesystem) ─────────────────────
+      # Listing and deleting images are plain filesystem operations, so the
+      # images UI needs this directory mounted READ-WRITE at the same path the
+      # compute nodes use. Building does not: that goes out as a Slurm job.
+      #
+      # Same caveat as above — uncomment on a host that has the mount:
+      #
+      #   - /mnt/copernicus0/llm-scheduler/images:/mnt/copernicus0/llm-scheduler/images
+      #
+      # Without it the images panel says the directory is unreachable, rather
+      # than showing an empty list that would read as "you have no images".
+
+      # ── SSH key for automatic token renewal ──────────────────────
+      # Only for SLURM_TOKEN_MODE=command with the SSH recipe.
+      #
+      # SECURITY: this key can mint Slurm tokens. On the REMOTE host, pin it to
+      # a forced command in ~/.ssh/authorized_keys so a stolen key cannot open
+      # a shell:
+      #
+      #   command="scontrol token lifespan=3600",no-port-forwarding,\
+      #   no-agent-forwarding,no-pty,no-X11-forwarding ssh-ed25519 AAAA...
+      #
+      # Key must be 0600 and owned by uid 1000 (the `scheduler` user).
+      # known_hosts is not optional: without it, host key checking cannot
+      # verify we are talking to the real token host.
+      - ./secrets/slurm_token_key:/run/secrets/slurm_token_key:ro
+      - ./secrets/known_hosts:/run/secrets/known_hosts:ro
+
+    # Unprivileged; matches the `scheduler` user baked into the image.
+    # No host UID matching needed — that was a CLI-backend requirement.
+    user: "1000:1000"
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  scheduler-data:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEGACY: CLUSTER_BACKEND=slurm_cli
+#
+# Only needed if slurmrestd is unavailable, or to keep `sbatch --test-only`
+# start-time previews (which have no REST equivalent — see ESTIMATE_BACKEND).
+# This is the setup the REST backend replaces: it requires the container to run
+# on a submit host, as a UID with Slurm permissions.
+#
+#    volumes:
+#      - /usr/bin/sbatch:/usr/bin/sbatch:ro
+#      - /usr/bin/scancel:/usr/bin/scancel:ro
+#      - /usr/bin/scontrol:/usr/bin/scontrol:ro
+#      - /usr/bin/squeue:/usr/bin/squeue:ro
+#      - /usr/bin/sacct:/usr/bin/sacct:ro
+#      - /usr/bin/sinfo:/usr/bin/sinfo:ro
+#      - /usr/lib/x86_64-linux-gnu/slurm:/usr/lib/x86_64-linux-gnu/slurm:ro
+#      - /etc/slurm:/etc/slurm:ro
+#      - /etc/munge:/etc/munge:ro
+#      - /var/run/munge:/var/run/munge
+#    user: "${UID:-0}:${GID:-0}"
+# ═══════════════════════════════════════════════════════════════════════════

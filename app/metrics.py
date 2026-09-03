@@ -157,12 +157,26 @@ async def track_proxy(upstream_url: str, model: str = "") -> AsyncIterator[dict]
     model_label = model or ""
     PROXY_ACTIVE.labels(model=model_label, endpoint=ep).inc()
 
+    # Every proxy dispatch already passes through here, so this is also where
+    # per-endpoint in-flight load is tracked for least-loaded routing — no
+    # extra call sites, and it cannot drift out of sync with the request.
+    #
+    # Keyed on host:port, NOT `ep`: `ep` is the *route* label
+    # ("chat.completions"), which is identical across replicas and would make
+    # every replica look equally loaded.
+    from .loadbalancer import REGISTRY as _LOADS
+    host_key = urlparse(upstream_url).netloc
+    if host_key:
+        _LOADS.acquire(host_key)
+
     ctx: dict = {}
     try:
         yield ctx
     finally:
         duration = time.perf_counter() - t0
         PROXY_ACTIVE.labels(model=model_label, endpoint=ep).dec()
+        if host_key:
+            _LOADS.release(host_key)
 
         status = ctx.get("status", "502")
         error_type = ctx.get("error")

@@ -42,3 +42,54 @@ models:
     tags: [vision,reasoning]
     tool_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder"
     venv_activate: /path/to/vllm-nightly/.venv/bin/activate
+  # ── Co-location ───────────────────────────────────────────────────────────
+  # Small models can share one GPU. Book with:
+  #   POST /admin/leases {"model": "bge-m3", "colocate": ["bge-reranker-v2"]}
+  #
+  # Slurm grants ONE GPU and the job runs both servers inside it, each on its
+  # own port, each registering as a normal endpoint. Routing, health checks and
+  # metrics are unchanged.
+  #
+  # `memory_gb` is REQUIRED for co-location and is the whole point: absolute
+  # budgets add up, fractions of a shared card do not. The group is proven to
+  # fit before submission.
+  #
+  # Trade-offs: co-tenants share one Slurm job (they stop together), and the
+  # GPU time-slices between them — fine for embedding/reranking, but it will
+  # quietly invalidate benchmark numbers.
+  #
+  # - name: bge-m3
+  #   model_path: BAAI/bge-m3
+  #   gpus: 1
+  #   tensor_parallel_size: 1
+  #   memory_gb: 12
+  #   tags: [embedding]
+  #
+  # - name: bge-reranker-v2
+  #   model_path: BAAI/bge-reranker-v2-m3
+  #   gpus: 1
+  #   tensor_parallel_size: 1
+  #   memory_gb: 8
+  #   tags: [reranker]
+
+  # ── A model that needs a whole HGX H200 node ──────────────────────────────
+  # `min_vram_gb` is the per-GPU floor (one TP shard + its KV cache).
+  # `min_total_vram_gb` is the aggregate floor — WITHOUT it, `min_vram_gb: 140`
+  # is satisfied by a *single* H200, so a booking for 2 GPUs would queue, wait,
+  # allocate, and only then OOM at load.
+  #
+  # The `variants` entry is what actually sizes it; `requires` is the guard that
+  # catches a wrong per-lease override.
+  #
+  # - name: DeepSeek-V3
+  #   model_path: deepseek-ai/DeepSeek-V3
+  #   gpus: 8
+  #   tensor_parallel_size: 8
+  #   requires:
+  #     gpu_classes: [gpu141]       # nothing else will do
+  #     min_vram_gb: 140
+  #     min_total_vram_gb: 1000
+  #   variants:
+  #     gpu141: {gpus: 8, tp: 8, gpu_memory_utilization: 0.92}
+  #   cpus: 64
+  #   mem: "900G"

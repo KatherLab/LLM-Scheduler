@@ -215,7 +215,36 @@ async function refresh() {
   try {
     DASH = await api('/admin/dashboard');
     MODEL_MAP = new Map(DASH.models.map(m => [m.id, m]));
-    $('#subtitle').textContent = `${DASH.total_gpus} GPUs · ${fmtTime(new Date(DASH.now))}`;
+    // Summarise the discovered cluster: node count and GPU mix, so it is
+    // obvious when a node has drained or discovery has gone stale.
+    const realNodes = (DASH.nodes || []).filter(n => !n.synthetic);
+    const parts = [`${DASH.total_gpus} GPUs`];
+    if (realNodes.length) {
+      parts.push(`${realNodes.length} node${realNodes.length === 1 ? '' : 's'}`);
+      const mix = {};
+      for (const n of realNodes) {
+        for (const [cls, count] of (n.gpu_classes || [])) {
+          const key = cls || 'untyped';
+          mix[key] = (mix[key] || 0) + count;
+        }
+      }
+      const mixText = Object.entries(mix).sort().map(([c, n]) => `${n}×${c}`).join(', ');
+      if (mixText) parts.push(mixText);
+    }
+    const foreign = (DASH.foreign_jobs || []).length;
+    if (foreign) parts.push(`${foreign} foreign job${foreign === 1 ? '' : 's'}`);
+    parts.push(fmtTime(new Date(DASH.now)));
+
+    const subtitle = $('#subtitle');
+    subtitle.textContent = parts.join(' · ');
+    // Discovery failures keep the previous snapshot rather than showing an
+    // empty cluster — say so, or the view silently looks authoritative.
+    if (DASH.inventory_error) {
+      subtitle.textContent += ' · ⚠ inventory stale';
+      subtitle.title = `Node discovery failed: ${DASH.inventory_error}`;
+    } else {
+      subtitle.title = '';
+    }
     const lr = $('#lastRefreshed');
     if (lr) {
       lr.classList.remove('hidden');
@@ -757,9 +786,15 @@ function onCatalogDragEnd(e) {
     if (pt.x < TL.leftPad) return;
 
     const dropDate = snapDate(xToDate(pt.x));
+    // The row you dropped on names a node, and therefore a GPU class. Pass it
+    // through so "drop it on the Spark row" means what it looks like.
+    const droppedLane = Math.floor((pt.y - TL.headerH) / TL.laneH);
 
-    // Open booking modal pre-filled with the model and time
-    openModal({ model: modelId, beginAt: dropDate, durationHours: 2 });
+    // Open booking modal pre-filled with the model, time and GPU type
+    openModal({
+      model: modelId, beginAt: dropDate, durationHours: 2,
+      lane: droppedLane >= 0 ? droppedLane : null,
+    });
   });
 })();
 
@@ -767,12 +802,16 @@ function onCatalogDragEnd(e) {
 const logModalBackdrop = $('#logModalBackdrop');
 let logState = {
   leaseId: null,
+  // The endpoint to read from. Leases and image builds are both Slurm jobs
+  // with the same two log files, so the viewer only needs to know the URL.
+  url: null,
   activeTab: 'stdout',
   data: null,
 };
 
 function openLogModal(leaseId) {
   logState.leaseId = leaseId;
+  logState.url = `/admin/leases/${leaseId}/logs`;
   logState.activeTab = 'stdout';
 
   const lease = DASH?.leases?.find(l => l.id === leaseId);
@@ -788,13 +827,14 @@ function openLogModal(leaseId) {
 
   document.body.style.overflow = 'hidden';
 
-  fetchLogs(leaseId);
+  fetchLogs();
 }
 
 function closeLogModal() {
   logModalBackdrop.classList.add('hidden');
   logModalBackdrop.setAttribute('aria-hidden', 'true');
   logState.leaseId = null;
+  logState.url = null;
   logState.data = null;
 
   document.body.style.overflow = '';
@@ -806,7 +846,7 @@ logModalBackdrop.addEventListener('click', (e) => {
 });
 
 $('#logRefreshBtn').addEventListener('click', () => {
-  if (logState.leaseId) fetchLogs(logState.leaseId);
+  if (logState.url) fetchLogs();
 });
 
 $('#logTabStdout').addEventListener('click', () => {
@@ -837,9 +877,10 @@ function updateLogTabs() {
   }
 }
 
-async function fetchLogs(leaseId) {
+async function fetchLogs() {
+  if (!logState.url) return;
   try {
-    const data = await api(`/admin/leases/${leaseId}/logs`);
+    const data = await api(logState.url);
     logState.data = data;
     renderLogContent();
   } catch (e) {
@@ -896,11 +937,61 @@ let modalState = {
   startDate: null,
   durationHours: 4,
   asap: false,
+  // Absolute GB. `memoryDefault` is the catalog value we seeded from, so we
+  // can tell "user chose this" from "user left it alone" and only send an
+  // override in the former case.
+  memoryGb: null,
+  memoryDefault: null,
+  droppedLane: null,
+  pinnedNode: null,
 };
 
-function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = null } = {}) {
+/** Which node and GPU class a global lane index belongs to. */
+function nodeForLane(lane) {
+  for (const node of (DASH?.nodes || [])) {
+    if (lane >= node.lane_offset && lane < node.lane_offset + node.gpu_count) {
+      let local = lane - node.lane_offset;
+      for (const [cls, count] of (node.gpu_classes || [])) {
+        if (local < count) return { node, gpuClass: cls };
+        local -= count;
+      }
+      return { node, gpuClass: null };
+    }
+  }
+  return null;
+}
+
+function gpuClassForLane(lane) {
+  return nodeForLane(lane)?.gpuClass ?? null;
+}
+
+function renderNodePin() {
+  if (!memoryControlPresent) return;
+  const name = modalState.pinnedNode;
+  nodePin.classList.toggle('hidden', !name || modalState.mode === 'edit');
+  if (!name) return;
+  nodePinName.textContent = name;
+
+  // Be explicit about the cost: one machine is much narrower than one class.
+  const cls = gpuClassSelect.value;
+  const sameClass = (DASH?.nodes || []).filter(n =>
+    (n.gpu_classes || []).some(([c]) => !cls || c === cls)).length;
+  nodePinWarn.textContent = sameClass > 1
+    ? `Waits for this machine specifically — ${sameClass - 1} other node`
+      + `${sameClass === 2 ? '' : 's'} could also run it. Remove the pin to use whichever frees up first.`
+    : 'This is the only node that can run it, so pinning costs nothing.';
+}
+
+function openModal({ model = null, beginAt = null, durationHours = 4, leaseId = null,
+                     lane = null } = {}) {
   modalState.mode = leaseId ? 'edit' : 'create';
   modalState.leaseId = leaseId;
+  modalState.memoryGb = null;
+  modalState.memoryDefault = null;
+  // Dropping onto a specific row is a statement about hardware: pre-select
+  // that GPU class rather than making the user say it twice.
+  modalState.droppedLane = lane;
+  modalState.pinnedNode = null;
   modalState.durationHours = durationHours;
   modalState.asap = false;
 
@@ -1064,6 +1155,9 @@ $('#modalModel').addEventListener('change', () => {
   const meta = m.meta || {};
   $('#modalModelMeta').textContent = `${meta.notes || ''}`;
   $('#modalGpuInfo').textContent = `Requires ${meta.gpus} GPUs · TP ${meta.tensor_parallel_size}`;
+  // Each model has its own eligible classes and memory default.
+  syncGpuClassOptions(id);
+  syncMemorySlider(id);
 });
 
 // Quick time buttons (including ASAP)
@@ -1146,6 +1240,221 @@ modalDurationRange.addEventListener('input', () => {
   updateDurationButtons(h);
 });
 
+
+// ─── GPU memory limit ───────────────────────────────────────────────────────
+// The default is greedy: vLLM takes ~95% of whatever card it lands on, so
+// everything left over becomes KV cache. That default is not a number — it
+// depends on the card — so this is an opt-in *cap* rather than a value that is
+// always shown. You reach for it when sharing a GPU, or to be polite on a busy
+// partition.
+//
+// The cap is in GB, not a percentage: a fraction means different things on a
+// 48 GB card and a 128 GB Spark.
+
+const gpuClassSection = $('#modalGpuClassSection');
+const gpuClassSelect = $('#modalGpuClass');
+const gpuClassHint = $('#modalGpuClassHint');
+const nodePin = $('#modalNodePin');
+const nodePinName = $('#modalNodePinName');
+const nodePinWarn = $('#modalNodePinWarn');
+const nodePinClear = $('#modalNodePinClear');
+
+const memorySection = $('#modalMemorySection');
+const memoryLimit = $('#modalMemoryLimit');
+const memoryControls = $('#modalMemoryControls');
+const memoryRange = $('#modalMemoryRange');
+const memoryLabel = $('#modalMemoryLabel');
+const memoryHint = $('#modalMemoryHint');
+const memoryDefaultHint = $('#modalMemoryDefaultHint');
+
+// A browser holding a cached index.html while running a newer app.js will not
+// find these. Without this guard the script dies on the first null and takes
+// the whole UI — timeline, drag-and-drop, everything below — down with it.
+// One stale feature is a far better outcome than a blank page.
+const memoryControlPresent = Boolean(
+  memorySection && memoryLimit && memoryControls && memoryRange
+    && memoryLabel && memoryHint && memoryDefaultHint
+    && gpuClassSection && gpuClassSelect && gpuClassHint
+    && nodePin && nodePinName && nodePinWarn && nodePinClear
+);
+if (!memoryControlPresent) {
+  console.warn(
+    'GPU memory control markup not found — the page is probably a cached '
+    + 'index.html. Hard-reload (Cmd/Ctrl+Shift+R). Everything else still works.'
+  );
+}
+
+function gpuClassInfo(name) {
+  return (DASH?.gpu_classes || []).find(c => c.name === name) || null;
+}
+
+/**
+ * Memory ceiling for the memory cap, in GB.
+ *
+ * With a class chosen, that class's usable memory is the honest bound. With
+ * "any", we must assume the worst case the booking could land on — offering
+ * 96 GB when it might end up on a 24 GB card would be a promise we cannot
+ * keep.
+ */
+function memoryCeilingGb(modelId) {
+  const chosen = gpuClassSelect && gpuClassSelect.value;
+  if (chosen) {
+    const info = gpuClassInfo(chosen);
+    if (info && info.usable_gb > 0) return info.usable_gb;
+  }
+  const eligible = modelMeta(modelId).gpu_classes || [];
+  const pool = (DASH?.gpu_classes || [])
+    .filter(c => c.usable_gb > 0 && (!eligible.length || eligible.includes(c.name)));
+  if (!pool.length) return null;
+  return Math.min(...pool.map(c => c.usable_gb));
+}
+
+function modelMeta(modelId) {
+  return MODEL_MAP.get(modelId)?.meta || {};
+}
+
+/** Populate the GPU type selector with the classes this model can use. */
+function syncGpuClassOptions(modelId) {
+  if (!memoryControlPresent) return;
+  const eligible = modelMeta(modelId).gpu_classes || [];
+  const previous = gpuClassSelect.value;
+
+  gpuClassSelect.innerHTML = '';
+  const any = document.createElement('option');
+  any.value = '';
+  any.textContent = 'Any suitable GPU';
+  gpuClassSelect.appendChild(any);
+
+  for (const name of eligible) {
+    const info = gpuClassInfo(name);
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = info
+      ? `${name} — ${Math.floor(info.usable_gb)} GB usable`
+        + (info.unified_memory ? ' (unified memory)' : '')
+      : name;
+    gpuClassSelect.appendChild(opt);
+  }
+
+  // Keep an explicit choice across model changes when it is still valid.
+  const hit = modalState.droppedLane != null
+    ? nodeForLane(modalState.droppedLane) : null;
+  const dropped = hit?.gpuClass ?? null;
+  const wanted = dropped && eligible.includes(dropped) ? dropped : previous;
+  gpuClassSelect.value = eligible.includes(wanted) ? wanted : '';
+  // Dropping on a row names a machine, not just a GPU type.
+  if (hit && eligible.includes(dropped)) modalState.pinnedNode = hit.node.name;
+  modalState.droppedLane = null;   // only pre-selects once
+  renderNodePin();
+
+  const minVram = modelMeta(modelId).min_vram_gb;
+  gpuClassHint.textContent = eligible.length
+    ? (minVram ? `Needs at least ${minVram} GB per GPU.` : '')
+    : 'No GPU class in this cluster can run this model.';
+  gpuClassSection.classList.toggle('hidden', modalState.mode === 'edit');
+}
+
+/** Seed the control from the chosen model. */
+function syncMemorySlider(modelId) {
+  if (!memoryControlPresent) return false;
+  // Editing a booking does not resubmit the job, so a memory control there
+  // would imply a change that never reaches vLLM.
+  if (modalState.mode === 'edit') {
+    memorySection.classList.add('hidden');
+    modalState.memoryGb = null;
+    return false;
+  }
+
+  const meta = modelMeta(modelId);
+  const cap = memoryCeilingGb(modelId);
+  const declared = meta.memory_gb ?? null;
+  const util = meta.gpu_memory_utilization ?? 0.95;
+
+  // Default position: the model's sharing budget if it has one, otherwise
+  // half the smallest card it could land on — a sane starting point to drag
+  // from, never presented as a recommendation.
+  const seed = declared ?? (cap ? Math.max(1, Math.round(cap / 2)) : 8);
+
+  memoryRange.min = 1;
+  memoryRange.max = cap ? Math.max(Math.floor(cap), Math.ceil(seed)) : 96;
+  memoryRange.value = Math.min(Math.ceil(seed), memoryRange.max);
+
+  modalState.memoryDefault = seed;
+  modalState.memoryGb = null;          // not limiting unless the box is ticked
+  memoryLimit.checked = false;
+  memoryControls.classList.add('hidden');
+
+  memoryDefaultHint.textContent =
+    `— default: use ~${Math.round(util * 100)}% of the GPU`;
+
+  memorySection.classList.remove('hidden');
+  renderMemoryLabel();
+  return true;
+}
+
+function renderMemoryLabel() {
+  if (!memoryControlPresent) return;
+  const value = Number(memoryRange.value);
+  memoryLabel.textContent = `${value} GB`;
+
+  const parts = [];
+  const modelId = $('#modalModel').value;
+  const declared = modelMeta(modelId).memory_gb;
+  if (declared != null) parts.push(`Catalog sharing budget: ${declared} GB`);
+  const cap = memoryCeilingGb(modelId);
+  const chosen = gpuClassSelect.value;
+  if (cap) {
+    parts.push(chosen
+      ? `max ${Math.floor(cap)} GB on ${chosen}`
+      : `max ${Math.floor(cap)} GB — the smallest GPU it could land on`);
+  }
+  if ((DASH?.gpu_classes || []).some(c => c.unified_memory)) {
+    parts.push('on unified-memory nodes this is shared with the OS');
+  }
+  memoryHint.textContent = parts.join(' · ');
+}
+
+if (memoryControlPresent) {
+nodePinClear.addEventListener('click', () => {
+  modalState.pinnedNode = null;
+  renderNodePin();
+});
+
+gpuClassSelect.addEventListener('change', () => {
+  // A pin implies a class; changing the class invalidates it.
+  const pinned = modalState.pinnedNode
+    ? (DASH?.nodes || []).find(n => n.name === modalState.pinnedNode) : null;
+  if (pinned && gpuClassSelect.value
+      && !(pinned.gpu_classes || []).some(([c]) => c === gpuClassSelect.value)) {
+    modalState.pinnedNode = null;
+  }
+  renderNodePin();
+  // The ceiling depends on the chosen class, so re-clamp rather than leave a
+  // value that is now impossible.
+  const cap = memoryCeilingGb($('#modalModel').value);
+  if (cap) {
+    memoryRange.max = Math.floor(cap);
+    if (Number(memoryRange.value) > Number(memoryRange.max)) {
+      memoryRange.value = memoryRange.max;
+      if (memoryLimit.checked) modalState.memoryGb = Number(memoryRange.value);
+    }
+  }
+  renderMemoryLabel();
+});
+
+memoryLimit.addEventListener('change', () => {
+  const on = memoryLimit.checked;
+  memoryControls.classList.toggle('hidden', !on);
+  modalState.memoryGb = on ? Number(memoryRange.value) : null;
+  renderMemoryLabel();
+});
+
+memoryRange.addEventListener('input', () => {
+  modalState.memoryGb = memoryLimit.checked ? Number(memoryRange.value) : null;
+  renderMemoryLabel();
+});
+}
+
 // Save
 $('#modalSave').addEventListener('click', async () => {
   try {
@@ -1164,6 +1473,20 @@ $('#modalSave').addEventListener('click', async () => {
         duration_seconds: durationHours * 3600,
         notes: $('#modalNotes').value.trim() || null,
       };
+
+      // Only sent when "Limit GPU memory" is ticked; otherwise the server
+      // applies the greedy default, which is what you want running alone.
+      if (modalState.memoryGb != null) {
+        payload.memory_gb = modalState.memoryGb;
+      }
+      // An explicit GPU type. Left out means "any suitable", and the server
+      // picks the smallest class that fits.
+      if (gpuClassSelect && gpuClassSelect.value) {
+        payload.gpu_class = gpuClassSelect.value;
+      }
+      if (modalState.pinnedNode) {
+        payload.node = modalState.pinnedNode;
+      }
 
       if (modalState.asap) {
         payload.asap = true;
@@ -2492,13 +2815,54 @@ function renderTimeline() {
   }
 
   // ── GPU lane labels and lines ──
+  // Lanes are a flat strip of global indices; `DASH.nodes` tells us where each
+  // node's slice begins so rows can be labelled per node instead of "GPU 0..N".
+  // With no discovered inventory the backend sends a single synthetic node, and
+  // this degrades to exactly the old numbering.
+  const nodeLanes = DASH?.nodes || [];
+  const laneLabel = (i) => {
+    for (let n = nodeLanes.length - 1; n >= 0; n--) {
+      const node = nodeLanes[n];
+      if (i >= node.lane_offset && i < node.lane_offset + node.gpu_count) {
+        const local = i - node.lane_offset;
+        if (node.synthetic) return { text: `GPU ${local}`, node: null, local };
+        return { text: `${node.name}:${local}`, node, local };
+      }
+    }
+    return { text: `GPU ${i}`, node: null, local: i };
+  };
+
   for (let i = 0; i < gpuTotal; i++) {
     const y = TL.headerH + i * TL.laneH;
+    const label = laneLabel(i);
+    const startsNode = label.node && label.local === 0;
+
+    // A heavier rule marks a node boundary, so a contiguous block is visibly
+    // confined to one machine — which is what actually constrains placement.
     drawLine(svg, 0, y, TL.width, y, {
       stroke: dark ? '#334155' : '#94a3b8',
-      'stroke-opacity': 0.15,
+      'stroke-opacity': startsNode ? 0.45 : 0.15,
+      'stroke-width': startsNode ? 1.5 : 1,
     });
-    drawText(svg, 10, y + 28, `GPU ${i}`, {
+
+    if (startsNode) {
+      const drained = label.node.state && /DOWN|DRAIN|FAIL|MAINT/i.test(label.node.state);
+      const classes = (label.node.gpu_classes || [])
+        .map(([cls, n]) => `${n}×${cls || 'gpu'}`).join(' ');
+      drawText(svg, 10, y + 13, label.node.name + (drained ? ' (unavailable)' : ''), {
+        fill: drained ? '#ef4444' : (dark ? '#e2e8f0' : '#0f172a'),
+        'font-size': 11,
+        'font-weight': 600,
+      });
+      if (classes) {
+        drawText(svg, 10, y + 25, classes, {
+          fill: dark ? '#64748b' : '#94a3b8',
+          'font-size': 9,
+        });
+      }
+    }
+
+    drawText(svg, 10, y + (startsNode ? 38 : 28), label.text, {
       fill: dark ? '#cbd5e1' : '#334155',
       'font-size': 12,
       'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -2508,6 +2872,12 @@ function renderTimeline() {
     stroke: dark ? '#334155' : '#94a3b8',
     'stroke-opacity': 0.15,
   });
+
+  // ── Foreign jobs ──
+  // Other users' jobs on shared nodes. Drawn *under* our bookings, hatched and
+  // grey, because they are capacity we can see but cannot move. Without them
+  // the calendar would promise GPUs Slurm has already given away.
+  drawForeignJobs(svg, nodeLanes);
 
   // ── Lease blocks ──
   const nowDate = new Date(DASH.now);
@@ -2628,8 +2998,11 @@ function renderMinimap(leases) {
 
   // Lease blocks (simplified colored rectangles)
   for (const l of leases) {
-    const b = new Date(l.begin_at || l.created_at);
-    const e = new Date(l.end_at);
+    // Same window resolution as the main timeline, or the minimap would show
+    // an estimated booking at a different time than the chart above it.
+    const win = leaseWindow(l);
+    const b = win.begin;
+    const e = win.end;
     if (e <= TL.start || b >= TL.end) continue;
 
     const bClamped = new Date(Math.max(b.getTime(), TL.start.getTime()));
@@ -2655,6 +3028,7 @@ function renderMinimap(leases) {
     drawRect(minimapSvg, x, y, w, Math.max(2, h), {
       fill,
       rx: 2,
+      ...(win.ghost ? { opacity: win.known ? 0.6 : 0.35 } : {}),
     });
   }
 
@@ -2778,9 +3152,137 @@ function updateMinimapViewport() {
   });
 })();
 
+/**
+ * Draw other users' jobs as immovable grey blocks.
+ *
+ * Slurm reports which nodes a foreign job holds and how many GPUs, but not
+ * *which* GPU indices. We draw from the top of each node's slice — the same
+ * pessimistic assumption the placer makes, so the picture matches the plan.
+ */
+function drawForeignJobs(svg, nodeLanes) {
+  const jobs = DASH?.foreign_jobs || [];
+  if (!jobs.length || !nodeLanes.length) return;
+
+  const dark = isDark();
+  const byName = Object.fromEntries(nodeLanes.map(n => [n.name, n]));
+
+  // Which GPU rows each job occupies. slurmrestd reports exact indices
+  // (`gres_detail` -> IDX:n), so four 1-GPU jobs on one node land on four
+  // different rows instead of stacking on row 0. When indices are unknown (the
+  // CLI backend cannot report them) we pack sequentially per node, tracking
+  // what earlier jobs already took — overlapping them would misrepresent a
+  // busy node as a mostly-free one.
+  const taken = {};   // node -> Set of local gpu indices already drawn on
+
+  const placements = [];
+  for (const job of jobs) {
+    if (!job.gpus) continue;
+    const begin = job.begin_at ? new Date(job.begin_at) : null;
+    const end = job.end_at ? new Date(job.end_at) : null;
+    if (!begin && !end) continue;   // nothing to place it with
+
+    const b = begin || new Date(end.getTime() - 4 * 3600000);
+    const e = end || new Date(b.getTime() + 4 * 3600000);
+    if (e <= TL.start || b >= TL.end) continue;
+
+    for (const nodeName of (job.nodes || [])) {
+      const node = byName[nodeName];
+      if (!node) continue;
+
+      const used = taken[nodeName] || (taken[nodeName] = new Set());
+      let rows = [];
+
+      if (job.gpu_indices && job.gpu_indices.length) {
+        rows = job.gpu_indices.filter(i => i < node.gpu_count);
+      } else {
+        // Unknown indices: take the first free rows on this node.
+        for (let i = 0; i < node.gpu_count && rows.length < job.gpus; i++) {
+          if (!used.has(i)) rows.push(i);
+        }
+      }
+      rows.forEach(i => used.add(i));
+      if (rows.length) placements.push({ job, node, rows, b, e });
+    }
+  }
+
+  for (const { job, node, rows, b, e } of placements) {
+    const x = dateToX(new Date(Math.max(b.getTime(), TL.start.getTime())));
+    const x2 = dateToX(new Date(Math.min(e.getTime(), TL.end.getTime())));
+    const w = Math.max(2, x2 - x);
+
+    // Contiguous runs get one rectangle; gaps get separate ones.
+    const runs = [];
+    for (const row of rows.slice().sort((p, q) => p - q)) {
+      const last = runs[runs.length - 1];
+      if (last && row === last.end + 1) last.end = row;
+      else runs.push({ start: row, end: row });
+    }
+
+    for (const run of runs) {
+      const y = TL.headerH + (node.lane_offset + run.start) * TL.laneH + 3;
+      const h = (run.end - run.start + 1) * TL.laneH - 6;
+
+      const rect = drawRect(svg, x, y, w, h, {
+        fill: dark ? 'rgba(100, 116, 139, 0.28)' : 'rgba(148, 163, 184, 0.32)',
+        stroke: dark ? '#64748b' : '#94a3b8',
+        'stroke-width': 1,
+        'stroke-dasharray': '4 3',
+        rx: 4,
+      });
+      if (rect) {
+        const which = job.gpu_indices && job.gpu_indices.length
+          ? `GPU ${job.gpu_indices.join(', ')}`
+          : `${job.gpus} GPU${job.gpus === 1 ? '' : 's'} (exact GPUs unknown)`;
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent =
+          `Job ${job.job_id} \u2014 ${job.user} (${job.state})\n` +
+          `${which} on ${node.name}\n` +
+          `Not managed by this scheduler`;
+        rect.appendChild(title);
+      }
+
+      if (w > 70) {
+        drawText(svg, x + 6, y + 16, `${job.user} \u00b7 ${job.gpus} GPU`, {
+          fill: dark ? '#94a3b8' : '#64748b',
+          'font-size': 10,
+          'font-style': 'italic',
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Where a booking should actually be drawn.
+ *
+ * On a `slurm` pool the booked window is a *request*, not a promise — Slurm's
+ * backfill scheduler decides. Once it has an opinion (`estimated_start`), the
+ * block moves there, because drawing it at the requested time would show a
+ * slot the user does not have.
+ */
+function leaseWindow(l) {
+  const requested = new Date(l.begin_at || l.created_at);
+  const end = new Date(l.end_at);
+  const durationMs = end - requested;
+
+  const pending = ['PLANNED', 'SUBMITTED', 'STARTING'].includes(l.state);
+  const estimated = l.scheduling === 'slurm' && pending;
+
+  if (estimated && l.estimated_start) {
+    const start = new Date(l.estimated_start);
+    return { begin: start, end: new Date(start.getTime() + durationMs), ghost: true, known: true };
+  }
+  // Slurm owns the decision but has not told us when — the block is a
+  // placeholder, not a claim.
+  if (estimated) return { begin: requested, end, ghost: true, known: false };
+
+  return { begin: requested, end, ghost: false, known: true };
+}
+
 function drawLeaseBlock(svg, l) {
-  const b = new Date(l.begin_at || l.created_at);
-  const e = new Date(l.end_at);
+  const win = leaseWindow(l);
+  const b = win.begin;
+  const e = win.end;
   if (e <= TL.start || b >= TL.end) return;
 
   const x = dateToX(b);
@@ -2822,12 +3324,36 @@ function drawLeaseBlock(svg, l) {
     dash = '6 4';
   }
 
+  // A booking Slurm has not confirmed must not look like one it has. Ghost
+  // blocks are translucent and dashed; without a start estimate they are
+  // fainter still, because their position is a guess.
+  let opacity = 1;
+  if (win.ghost) {
+    dash = win.known ? '6 4' : '3 5';
+    opacity = win.known ? 0.72 : 0.42;
+  }
+
   const blockW = Math.max(8, w);
 
   const g = drawGroup(svg, { 'data-lease-id': l.id, cursor: 'pointer' });
 
   const stateLabel = isFailed ? 'FAILED ✕' : `${l.state}${isConflict ? ' ⚠' : ''}`;
-  const tooltipText = `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}\n${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
+  let tooltipText =
+    `${l.model} · ${l.requested_gpus} GPU${l.requested_gpus > 1 ? 's' : ''}` +
+    (l.gpu_class ? ` (${l.gpu_class})` : '') +
+    (l.node ? ` on ${l.node}` : '') +
+    `\n${fmtHour(b)} → ${fmtHour(e)} · ${stateLabel}`;
+  if (win.ghost && win.known) {
+    tooltipText += `\n\n⏳ Estimated by Slurm's backfill scheduler.` +
+      `\nThis is not a reservation — it moves as the queue changes.` +
+      `\nRequested: ${fmtHour(new Date(l.begin_at || l.created_at))}`;
+    if (l.estimate_updated_at) {
+      tooltipText += `\nEstimate updated ${fmtHour(new Date(l.estimate_updated_at))}`;
+    }
+  } else if (win.ghost) {
+    tooltipText += `\n\n⏳ Queued — Slurm has not given a start time yet.` +
+      `\nShown at the requested time; the real start may differ.`;
+  }
   const titleEl = svgEl('title');
   titleEl.textContent = tooltipText;
   g.appendChild(titleEl);
@@ -2835,9 +3361,20 @@ function drawLeaseBlock(svg, l) {
   drawRect(g, x, y, blockW, h, {
     fill, stroke, 'stroke-width': 2,
     ...(dash ? { 'stroke-dasharray': dash } : {}),
+    ...(opacity < 1 ? { opacity } : {}),
     rx: 10,
     'data-lease-id': l.id,
   });
+
+  // A tick at the requested time, so the drift from the estimate is visible.
+  if (win.ghost && win.known) {
+    const requestedX = dateToX(new Date(l.begin_at || l.created_at));
+    if (requestedX >= TL.leftPad && Math.abs(requestedX - x) > 3) {
+      drawLine(g, requestedX, y, requestedX, y + h, {
+        stroke, 'stroke-width': 1, 'stroke-dasharray': '2 3', opacity: 0.5,
+      });
+    }
+  }
 
   if (isFailed && w > 20) {
     const clipId = `clip-failed-${l.id}`;
@@ -3360,3 +3897,296 @@ initDragHandlers();
 refreshMetrics();
 refresh();
 startAutoRefresh();
+
+// ─── Container Images (admin only) ──────────────────────────────────────────
+// Builds are Slurm jobs, because Apptainer cannot cross-build: an aarch64
+// image can only be produced on an aarch64 node. So this panel submits and
+// then watches, exactly like a booking.
+
+let ME = null;
+let IMAGES = null;
+let imagesPollTimer = null;
+
+const imagesModalBackdrop = $('#imagesModalBackdrop');
+
+async function loadMe() {
+  try {
+    ME = await api('/api/me');
+    if (ME?.is_admin) $('#imagesBtn').classList.remove('hidden');
+  } catch (e) {
+    // Not fatal — the button simply stays hidden.
+  }
+}
+
+function fmtBytes(n) {
+  if (!n && n !== 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function openImagesModal() {
+  imagesModalBackdrop.classList.remove('hidden');
+  imagesModalBackdrop.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+  loadImages();
+  // A build takes minutes; poll while the panel is open so state moves on its
+  // own rather than making the user hit refresh.
+  clearInterval(imagesPollTimer);
+  imagesPollTimer = setInterval(() => {
+    if (IMAGES?.builds?.some(b => b.state === 'SUBMITTED' || b.state === 'RUNNING')) {
+      loadImages();
+    }
+  }, 10000);
+}
+
+function closeImagesModal() {
+  imagesModalBackdrop.classList.add('hidden');
+  imagesModalBackdrop.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+  clearInterval(imagesPollTimer);
+  imagesPollTimer = null;
+}
+
+$('#imagesBtn')?.addEventListener('click', openImagesModal);
+$('#imagesModalClose')?.addEventListener('click', closeImagesModal);
+$('#imagesRefreshBtn')?.addEventListener('click', () => loadImages());
+imagesModalBackdrop?.addEventListener('click', (e) => {
+  if (e.target === imagesModalBackdrop) closeImagesModal();
+});
+
+async function loadImages() {
+  try {
+    IMAGES = await api('/admin/images');
+  } catch (e) {
+    $('#imgListError').textContent = e.message;
+    $('#imgListError').classList.remove('hidden');
+    return;
+  }
+  renderImageTargets();
+  renderImagesList();
+  renderImageBuilds();
+}
+
+function renderImageTargets() {
+  const archSel = $('#imgArch');
+  const partSel = $('#imgPartition');
+  const targets = IMAGES?.targets || [];
+  const arches = [...new Set(targets.map(t => t.arch))].sort();
+
+  const prevArch = archSel.value;
+  archSel.innerHTML = (arches.length ? arches : ['x86_64', 'aarch64'])
+    .map(a => `<option value="${a}">${a}</option>`).join('');
+  if (prevArch && arches.includes(prevArch)) archSel.value = prevArch;
+
+  const syncPartitions = () => {
+    const arch = archSel.value;
+    const forArch = targets.filter(t => t.arch === arch);
+    partSel.innerHTML = forArch.length
+      ? forArch.map(t => `<option value="${escapeHtml(t.partition)}">${escapeHtml(t.partition)} — ${t.nodes.length} node${t.nodes.length === 1 ? '' : 's'}</option>`).join('')
+      : '<option value="">(no nodes discovered)</option>';
+    const nodes = forArch.flatMap(t => t.nodes);
+    $('#imgArchHint').textContent = nodes.length
+      ? `Can build on: ${nodes.slice(0, 4).join(', ')}${nodes.length > 4 ? '…' : ''}`
+      : 'No node of this architecture was discovered.';
+  };
+  archSel.onchange = () => { syncPartitions(); suggestImageName(); };
+  syncPartitions();
+}
+
+function suggestImageName() {
+  const nameInput = $('#imgName');
+  if (nameInput.dataset.touched === '1') return;
+  const ref = $('#imgSourceRef').value.trim();
+  const arch = $('#imgArch').value;
+  if (!ref) { nameInput.value = ''; return; }
+  // Mirrors images.suggest_name() on the server; the server still decides.
+  let body = ref.split('://').pop().split('@')[0];
+  const idx = body.lastIndexOf(':');
+  let repo = body, tag = 'latest';
+  if (idx > 0 && !body.slice(idx).includes('/')) { repo = body.slice(0, idx); tag = body.slice(idx + 1); }
+  const short = repo.replace(/\/+$/, '').split('/').pop();
+  nameInput.value = `${short}-${tag}-${arch}`.replace(/[^A-Za-z0-9._+-]/g, '-') + '.sif';
+}
+
+$('#imgSourceRef')?.addEventListener('input', suggestImageName);
+$('#imgName')?.addEventListener('input', (e) => {
+  e.target.dataset.touched = e.target.value ? '1' : '';
+});
+
+function renderImagesList() {
+  const wrap = $('#imgList');
+  const err = $('#imgListError');
+
+  if (IMAGES?.error) {
+    err.textContent = IMAGES.error;
+    err.classList.remove('hidden');
+  } else {
+    err.classList.add('hidden');
+  }
+  $('#imagesDirLabel').textContent = IMAGES?.image_dir || '(no images directory configured)';
+
+  const list = IMAGES?.images || [];
+  if (!list.length) {
+    wrap.innerHTML = `<div class="text-sm text-slate-500">No images found.</div>`;
+    return;
+  }
+
+  wrap.innerHTML = list.map(img => {
+    const inUse = (img.used_by_runtimes || []).length > 0;
+    const badge = inUse
+      ? `<span class="px-2 py-0.5 rounded-full text-[10px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/25">in use — ${escapeHtml(img.used_by_runtimes.join(', '))}</span>`
+      : '';
+    const classes = (img.used_by_gpu_classes || []).length
+      ? `<span class="text-slate-500">→ ${escapeHtml(img.used_by_gpu_classes.join(', '))}</span>` : '';
+    return `
+      <div class="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-800/40">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-mono text-sm truncate">${escapeHtml(img.name)}</span>
+            ${badge}
+          </div>
+          <div class="text-xs text-slate-500 mt-0.5 flex items-center gap-2 flex-wrap">
+            <span>${fmtBytes(img.size_bytes)}</span>
+            <span>·</span>
+            <span>${new Date(img.modified_at).toLocaleString()}</span>
+            ${classes}
+          </div>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+          <button class="img-copy px-2 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-700 transition"
+                  data-path="${escapeHtml(img.path)}" title="Copy the path for cluster.yaml">Copy path</button>
+          <button class="img-delete px-2 py-1.5 text-xs rounded-lg border border-red-500/40 text-red-400 hover:bg-red-500/10 transition ${img.can_delete ? '' : 'opacity-40 cursor-not-allowed'}"
+                  data-name="${escapeHtml(img.name)}" ${img.can_delete ? '' : 'disabled'}
+                  title="${img.can_delete ? 'Delete this image' : 'cluster.yaml points at this image'}">Delete</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  wrap.querySelectorAll('.img-copy').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.path);
+        toast('Path copied — paste it into cluster.yaml', 'info');
+      } catch (e) {
+        toast(btn.dataset.path, 'info');
+      }
+    });
+  });
+  wrap.querySelectorAll('.img-delete').forEach(btn => {
+    btn.addEventListener('click', () => deleteImage(btn.dataset.name));
+  });
+}
+
+async function deleteImage(name) {
+  if (!confirm(`Delete ${name}? Any job that still references it will fail to start.`)) return;
+  try {
+    await api(`/admin/images/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Deleted ${name}`);
+    loadImages();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+const IMG_BUILD_BADGE = {
+  SUBMITTED: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
+  RUNNING: 'bg-amber-500/15 text-amber-400 border-amber-500/25',
+  SUCCEEDED: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25',
+  FAILED: 'bg-red-500/15 text-red-400 border-red-500/25',
+  CANCELED: 'bg-slate-500/15 text-slate-400 border-slate-500/25',
+};
+
+function renderImageBuilds() {
+  const section = $('#imgBuildsSection');
+  const wrap = $('#imgBuildsList');
+  const builds = IMAGES?.builds || [];
+  if (!builds.length) {
+    section.classList.add('hidden');
+    return;
+  }
+  section.classList.remove('hidden');
+
+  wrap.innerHTML = builds.slice(0, 10).map(b => {
+    const active = b.state === 'SUBMITTED' || b.state === 'RUNNING';
+    const badge = IMG_BUILD_BADGE[b.state] || IMG_BUILD_BADGE.CANCELED;
+    return `
+      <div class="px-3 py-2.5 rounded-lg border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-800/40">
+        <div class="flex items-center justify-between gap-3">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="font-mono text-sm truncate">${escapeHtml(b.image_name)}</span>
+              <span class="px-2 py-0.5 rounded-full text-[10px] border ${badge}">${b.state}</span>
+              <span class="text-[10px] text-slate-500">${escapeHtml(b.arch)}</span>
+            </div>
+            <div class="text-xs text-slate-500 mt-0.5 font-mono truncate">${escapeHtml(b.source_ref)}</div>
+            ${b.error ? `<div class="text-xs text-red-400 mt-1">${escapeHtml(b.error)}</div>` : ''}
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            ${b.slurm_job_id ? `<button class="img-build-logs px-2 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-700 transition" data-id="${b.id}" data-name="${escapeHtml(b.image_name)}" data-job="${escapeHtml(b.slurm_job_id)}">Logs</button>` : ''}
+            ${active ? `<button class="img-build-cancel px-2 py-1.5 text-xs rounded-lg border border-red-500/40 text-red-400 hover:bg-red-500/10 transition" data-id="${b.id}">Cancel</button>` : ''}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  wrap.querySelectorAll('.img-build-logs').forEach(btn => {
+    btn.addEventListener('click', () => {
+      logState.leaseId = null;
+      logState.url = `/admin/images/builds/${btn.dataset.id}/logs`;
+      logState.activeTab = 'stdout';
+      $('#logModalTitle').textContent = `Build log — ${btn.dataset.name}`;
+      $('#logModalSubtitle').textContent = `Job ID: ${btn.dataset.job}`;
+      $('#logContent').textContent = 'Loading…';
+      $('#logTruncatedBanner').classList.add('hidden');
+      updateLogTabs();
+      $('#logModalBackdrop').classList.remove('hidden');
+      $('#logModalBackdrop').setAttribute('aria-hidden', 'false');
+      fetchLogs();
+    });
+  });
+  wrap.querySelectorAll('.img-build-cancel').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await api(`/admin/images/builds/${btn.dataset.id}/cancel`, { method: 'POST' });
+        toast('Build canceled', 'info');
+        loadImages();
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    });
+  });
+}
+
+$('#imgBuildBtn')?.addEventListener('click', async () => {
+  const btn = $('#imgBuildBtn');
+  const err = $('#imgBuildError');
+  err.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Submitting…';
+  try {
+    const body = {
+      source_ref: $('#imgSourceRef').value.trim(),
+      arch: $('#imgArch').value,
+      name: $('#imgName').value.trim() || null,
+      partition: $('#imgPartition').value || null,
+      overwrite: $('#imgOverwrite').checked,
+    };
+    const build = await api('/admin/images/build', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    toast(`Build submitted — Slurm job ${build.slurm_job_id}`);
+    $('#imgOverwrite').checked = false;
+    loadImages();
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Start build';
+  }
+});
+
+loadMe();

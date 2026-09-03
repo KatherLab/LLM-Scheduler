@@ -177,7 +177,9 @@ Edit `.env` and adjust the following settings:
 | `VLLM_API_KEY` | API Key for using the /v1 endpoints | `some-random-string` |
 | `SLURM_PARTITION` | Slurm partition to submit jobs to (leave empty for default) | `gpu` |
 | `DATABASE_URL` | Path to the SQLite database file | `sqlite:///./router.db` |
-| `VLLM_LOG_DIR` | Directory where Slurm job logs are stored | `./logs` |
+| `VLLM_LOG_DIR` | Directory for the scheduler's own lifecycle log | `./logs` |
+| `JOB_LOG_DIR` | Where Slurm writes job stdout/stderr — a **shared** path the compute nodes can open | `/mnt/shared/llm-scheduler/logs` |
+| `APPTAINER_IMAGE_DIR` | Shared directory of `.sif` images, for the admin images UI | `/mnt/shared/llm-scheduler/images` |
 | `SBATCH_TEMPLATE_PATH` | Path to the Slurm job script template | `./templates/vllm_job.sh` |
 | `VLLM_HEALTH_TIMEOUT_SECONDS` | How long to wait for a model to become healthy before marking it failed | `800` |
 | `VLLM_MAX_RETRIES` | Number of times to retry a failed model launch | `1` |

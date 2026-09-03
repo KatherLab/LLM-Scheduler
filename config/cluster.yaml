@@ -1,0 +1,234 @@
+# Cluster topology — the KatherLab cluster as it actually is today.
+#
+# Two kinds of partition, and the difference is visible to users:
+#
+#   gpu / dgx    SHARED. Other users' jobs land there, so Slurm's backfill —
+#                not our calendar — decides when a booking runs. Bookings show
+#                as *estimates* (ghost blocks), never as confirmed slots.
+#                Promising a start time we cannot deliver is the most
+#                misleading thing this app could do.
+#
+#   llm / spark  OURS. Both are restricted to `llm-hosting` / `llm-admins`, so
+#                our calendar is the allocator: jobs go out with --begin +
+#                --nodelist + typed --gres and a booking is a real promise.
+#
+# The service account `slurmweb` must be in `llm-hosting` or neither of those
+# partitions will accept a submission. Note the membership is read on the
+# CONTROLLER: after changing it, titan's SSSD cache and Slurm's own
+# GroupUpdateTime (600s) both have to turn over before submissions succeed.
+#
+# GPU class names MUST match slurm.conf, because the site's job_submit.lua
+# validates and rewrites --gres against them. Getting them missing is worse
+# than getting them wrong: an untyped --gres=gpu:N silently gets `gpu24`
+# appended as a hard constraint, so the job never reaches a larger card.
+
+runtimes:
+  # TODO: there is still no x86_64 image. Apptainer 1.5.3 *is* installed on
+  # sv-ekfz-cai-h200, and the shared images directory is mounted there, so the
+  # only missing piece is building the .sif:
+  #
+  #   x86-cuda:
+  #     kind: apptainer
+  #     image: /mnt/copernicus0/llm-scheduler/images/vllm-<version>-cu128.sif
+  #     nv: true
+  #     binds: ["/mnt/copernicus0/llm-scheduler"]
+  #     env:
+  #       HF_HOME: /mnt/copernicus0/llm-scheduler/hf-cache
+  #       VLLM_CACHE_ROOT: /mnt/copernicus0/llm-scheduler/vllm-cache
+  #
+  # and point the gpu* classes at it. Until then everything x86 uses a venv —
+  # and the path below is still a placeholder, so no x86 class can actually
+  # launch a model yet. The aarch64 side (gb10) is complete.
+  legacy-venv:
+    kind: venv
+    # TODO: replace with the real shared-filesystem venv.
+    activate: /path/to/.venv/bin/activate
+
+  # DGX Spark (aarch64). Apptainer rather than a venv: one image per arch,
+  # selected by GPU class, so no model entry has to know the node is ARM.
+  #
+  # Verified on BOTH Spark nodes by running an actual Slurm job as `slurmweb`:
+  # apptainer 1.5.3, and `--nv` genuinely works — `nvidia-smi` inside the
+  # container reports "NVIDIA GB10". spark-049c joined later and was missing
+  # the NFS mount entirely, which would have failed on the image, the caches
+  # and the log directory at once; it now mounts /mnt/copernicus0 like the rest.
+  #
+  # Images and caches live on the shared NFS share (13 TB), reachable from
+  # every node and readable *and writable* by `slurmweb` via NFS4 ACLs —
+  # verified by running an actual Slurm job as that account, which is the only
+  # test that counts. Home directories are not an option: ~60 GB and mode 0700.
+  #
+  # Change the tag here to change the vLLM version; a model can also override
+  # it with `runtime:` if one needs a different build.
+  arm-vllm:
+    kind: apptainer
+    image: /mnt/copernicus0/llm-scheduler/images/vllm-0.27.1-aarch64.sif
+    nv: true
+    binds:
+      # One shared cache across the cluster: weights downloaded once are reused
+      # by every node, instead of each node re-fetching to its own local disk.
+      - /mnt/copernicus0/llm-scheduler
+    env:
+      # slurmweb has no home directory on this node, so anything defaulting to
+      # ~/.cache fails. Point HF at the bound scratch explicitly.
+      HF_HOME: /mnt/copernicus0/llm-scheduler/hf-cache
+      HF_HUB_OFFLINE: "0"
+      # REQUIRED on this node. `--nv` binds the host NVIDIA libraries next to
+      # the container's, and between them they exhaust glibc's static-TLS
+      # surplus. Without this, anything that loads the CUDA stack dies with
+      #   Inconsistency detected by ld.so: dl-tls.c: 618:
+      #   _dl_allocate_tls_init: Assertion `listp != NULL' failed!
+      # `import vllm` survives it; `vllm serve` does not — so the failure only
+      # appears once a real job starts. Verified: with this set, both work.
+      GLIBC_TUNABLES: glibc.rtld.optional_static_tls=2097152
+      # vLLM writes its compile/autotune cache to ~/.cache/vllm by default.
+      # `slurmweb` has no home directory on this node, so that path is
+      # unwritable and the engine dies *after* loading weights — several
+      # minutes in. Point it at the bound scratch.
+      VLLM_CACHE_ROOT: /mnt/copernicus0/llm-scheduler/vllm-cache
+
+gpu_classes:
+  # rtx_6000 (curie), rtx_a5000 (europa), rtx_3090 (alien0/1),
+  # rtx_pro_6000 MIG slices (ganymede — 8x 1g)
+  gpu24:
+    vram_gb: 24
+    arch: x86_64
+    runtime: legacy-venv
+    models: [rtx_6000, rtx_a5000, rtx_3090, rtx_pro_6000]
+
+  # rtx_6000_ada (titan, luna), rtx_a6000 (io, callisto), l40 (europa)
+  gpu48:
+    vram_gb: 48
+    arch: x86_64
+    runtime: legacy-venv
+    models: [rtx_6000_ada, rtx_a6000, l40]
+
+  # a100 (dgx) — only reachable in the `dgx` partition.
+  gpu80:
+    vram_gb: 80
+    arch: x86_64
+    runtime: legacy-venv
+    models: [a100]
+    # Weights for a model this size take minutes to load from shared storage.
+    guard_gap_seconds: 180
+
+  # rtx_pro_6000 (jupiter)
+  gpu96:
+    vram_gb: 96
+    arch: x86_64
+    runtime: legacy-venv
+    models: [rtx_pro_6000]
+    guard_gap_seconds: 180
+
+  # NVIDIA HGX H200 — sv-ekfz-cai-h200, in the `llm` partition. It has ARRIVED:
+  #   Arch=x86_64, CPUTot=512, RealMemory=2321739 MB, Gres=gpu:gpu141:8,
+  #   AvailableFeatures=gpu141,h200
+  #
+  # The cluster side is done — verified by submitting a job as `slurmweb` with
+  # `gres/gpu:gpu141:1`, which was accepted (so job_submit.lua's CLASS_TAGS
+  # knows the class; an unknown one is a hard rejection, not a warning) and
+  # landed on a card reporting "NVIDIA H200, 143771 MiB".
+  #
+  # 143771 MiB is 140.4 GiB, so vram_gb is 140 rather than the marketing 141 —
+  # the budget arithmetic should use what the driver actually reports.
+  #
+  # NOTE: this class points at the placeholder venv like every other x86 class,
+  # so bookings will submit but the model will not start until either that path
+  # is real or an x86 image exists. Nothing else here is blocking.
+  gpu141:
+    vram_gb: 140
+    arch: x86_64
+    runtime: legacy-venv
+    models: [h200]
+    # 3 GB reserved -> default utilization ~0.98. That is the number most
+    # likely to be wrong here: it is fine for a single card, but a tensor-
+    # parallel job also wants room for NCCL buffers. Measure it under load,
+    # the way gb10's reserved_gb still needs measuring.
+    reserved_gb: 3            # CUDA context + fragmentation headroom
+    guard_gap_seconds: 300    # a 400B+ model takes minutes to load
+
+  # DGX Spark (GB10) — spark-049c and spark-c127, identical. Values below are
+  # what Slurm actually reports, not the marketing figures:
+  #   architecture aarch64, real_memory 122566 MB (~119.7 GB), 20 CPUs,
+  #   Gres=gpu:gb10:1
+  #
+  # RAM *is* VRAM here. --gpu-memory-utilization's denominator is the whole
+  # machine, so an uncapped 0.95 would try to take ~114 GB and leave the OS,
+  # page cache and the loading process fighting over the rest.
+  #
+  # reserved_gb states a physical fact (what the host needs) and the default
+  # fraction follows from it; the max is a belt-and-braces ceiling.
+  #
+  # NOTE: 24 GB reserved is an ESTIMATE. Measure it — run one model, watch
+  # free memory under load, and adjust. It is the number most likely to be
+  # wrong here.
+  gb10:
+    vram_gb: 119
+    arch: aarch64
+    runtime: arm-vllm
+    unified_memory: true
+    reserved_gb: 24                  # -> default utilization ~0.80
+    gpu_memory_utilization_max: 0.80
+    models: [gb10]
+    guard_gap_seconds: 180           # weights load from shared storage
+
+pools:
+  # The shared research partition. Slurm decides; we estimate and never promise.
+  - name: general
+    partition: gpu
+    scheduling: slurm
+
+  # The A100 box. job_submit.lua rejects gpu80 outside this partition, so the
+  # class restriction here mirrors a rule the cluster already enforces.
+  - name: dgx
+    partition: dgx
+    scheduling: slurm
+    gpu_classes: [gpu80]
+
+  # ── Exclusive LLM nodes ──────────────────────────────────────────────────
+  # The Spark is ours alone, so our calendar IS the allocator: bookings are
+  # promises, not estimates. Jobs go out with --begin + --nodelist + typed
+  # --gres, which is what makes drag-and-drop mean "it runs exactly then".
+  #
+  # Nothing else should land here. If a foreign job ever appears on this node
+  # the timeline will show it, and that is a signal the exclusivity has been
+  # broken rather than something to plan around.
+  - name: spark
+    partition: spark
+    scheduling: managed
+    gpu_classes: [gb10]
+
+  # The exclusive LLM nodes, which have now arrived. `scheduling: managed` is
+  # the important part: our planner allocates the node and GPU, jobs go out
+  # with --begin + --nodelist + typed --gres, and a booking is a real
+  # reservation rather than an estimate — drag-and-drop means it runs then.
+  #
+  # Two nodes, deliberately in one pool:
+  #   sv-ekfz-cai-h200   8x gpu141   the actual serving hardware
+  #   vega               1x gpu48    also the host people SSH into
+  #
+  # Neither is in the `gpu` partition, so nothing here overlaps `general`.
+  #
+  # CAVEAT on vega: being a login host, its GPU can be used outside Slurm
+  # entirely, and such usage is invisible to Slurm and therefore to us. Our
+  # calendar can promise the card and someone's interactive session can still
+  # be sitting on it. If that bites, drop gpu48 from gpu_classes below and the
+  # pool becomes H200-only.
+  - name: llm
+    partition: llm
+    scheduling: managed
+    operators: [llm-admins]
+    gpu_classes: [gpu141, gpu48]
+
+quotas:
+  # Nothing enforced yet — the shared partition is already governed by Slurm's
+  # own fairshare. Turn these on when the exclusive nodes arrive, since those
+  # are ours to over-subscribe.
+  #
+  # default:
+  #   max_concurrent_gpus: 4
+  #   max_gpu_hours_inflight: 96
+  #   max_booking_horizon_days: 14
+  #   max_booking_duration_hours: 48
+  # groups:
+  #   llm-power-users: {max_concurrent_gpus: 8}

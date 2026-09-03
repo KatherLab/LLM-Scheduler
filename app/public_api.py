@@ -11,13 +11,13 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 
-from .admin import _active_like_leases, _placement_horizon
 from .auth import require_schedule_key
 from .catalog import get_catalog
 from .dependencies import SessionLocal
 from .metrics import get_metrics_summary
 from .models import Endpoint, Lease
-from .planner import compute_placements
+from . import inventory, scheduling
+from .cluster import get_cluster
 from .router_core import fetch_vllm_metrics
 from .schemas import (
     PublicLeaseInfo,
@@ -75,7 +75,6 @@ def get_schedule():
     placements. Suitable for rendering an external timeline view.
     """
     now = _now()
-    horizon_start, horizon_end = _placement_horizon(now)
     catalog = get_catalog()
 
     with SessionLocal() as db:
@@ -91,15 +90,11 @@ def get_schedule():
             select(Lease).order_by(Lease.id.desc())
         ).scalars().all()
 
-        # Active-like leases for placement computation. Uses the same helper as
-        # the admin dashboard so the two views never disagree on lane placement.
-        active_like = _active_like_leases(leases, now)
-
-        placements = compute_placements(
-            leases=active_like,
-            total_gpus=settings.total_gpus,
-            horizon_start=horizon_start,
-            horizon_end=horizon_end,
+        # Same placement path as the admin dashboard, so the public view and
+        # the internal one never disagree about where a booking sits.
+        active_like = scheduling.active_leases(leases, now)
+        placements, lanes = scheduling.plan(
+            active_like, inventory.current(), get_cluster()
         )
 
         # Build lease list (only active/planned — not historical)
@@ -115,9 +110,11 @@ def get_schedule():
                     begin_at=l.begin_at,
                     end_at=l.end_at,
                     notes=l.notes,
-                    lane_start=p.lane_start if p else None,
-                    lane_count=p.lane_count if p else None,
+                    lane_start=scheduling.lane_index(lanes, p) if p else None,
+                    lane_count=p.gpu_count if p else None,
                     conflict=p.conflict if p else False,
+                    node=p.node if p else None,
+                    gpu_class=l.gpu_class,
                 )
             )
 
@@ -138,7 +135,7 @@ def get_schedule():
 
     return PublicScheduleResponse(
         now=now,
-        total_gpus=settings.total_gpus,
+        total_gpus=sum(lane.gpu_count for lane in lanes),
         models=model_infos,
         leases=lease_infos,
     )
@@ -147,8 +144,6 @@ def get_schedule():
 @router.get("/leases", response_model=list[PublicLeaseInfo])
 def list_active_leases():
     """List only active/planned leases (no historical data)."""
-    now = _now()
-
     with SessionLocal() as db:
         leases = db.execute(
             select(Lease).where(
@@ -250,7 +245,7 @@ async def get_metrics():
         "proxy": proxy_metrics,
         "instances": stats_data,
         "cluster": {
-            "total_gpus": settings.total_gpus,
+            "total_gpus": inventory.current().total_gpus or settings.total_gpus,
             "allocated_gpus": allocated_gpus,
             "running_models": sorted(running_models),
         },

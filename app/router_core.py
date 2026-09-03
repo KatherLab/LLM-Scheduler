@@ -44,13 +44,20 @@ async def close_health_client() -> None:
 
 
 def choose_ready_endpoint(db: Session, model: str) -> Optional[Endpoint]:
-    """Pick the newest READY endpoint for a model."""
+    """Pick the least-loaded READY endpoint for a model.
+
+    This used to return the newest, which sends every request to one replica
+    and leaves the others idle. Selection now uses in-flight requests plus
+    vLLM's queue depth, and skips replicas being drained for a rolling restart.
+    """
+    from .loadbalancer import choose_least_loaded
+
     eps = db.execute(
         select(Endpoint)
         .where(Endpoint.model == model, Endpoint.state == "READY")
         .order_by(Endpoint.id.desc())
     ).scalars().all()
-    return eps[0] if eps else None
+    return choose_least_loaded(eps)
 
 
 async def health_check_endpoint(
@@ -174,6 +181,17 @@ async def fetch_vllm_metrics(
             ttft_sum = parsed.get("ttft_sum")
             if ttft_count is not None and ttft_sum is not None and ttft_count > 0:
                 result["ttft_avg"] = round(ttft_sum / ttft_count, 3)
+
+            # Feed the routing signal: vLLM's own queue depth catches load we
+            # cannot infer from our request counts (a replica still loading
+            # weights, or one whose engine is backed up).
+            from .loadbalancer import REGISTRY, LoadRegistry
+
+            REGISTRY.record_scrape(
+                LoadRegistry.key(host, port),
+                pending=parsed.get("pending_requests"),
+                running=parsed.get("active_requests"),
+            )
 
             # Compute generation throughput from counter deltas
             gen_total = parsed.get("gen_tokens_total")

@@ -12,14 +12,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
+import logging
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Request, HTTPException, Response, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from fastapi import APIRouter, Request, HTTPException, Response
+from fastapi.responses import FileResponse
 
 from .settings import settings
+
+logger = logging.getLogger(__name__)
 
 # ── Secret key (auto-generate if not configured) ────────────────────────────
 _secret_key: bytes = b""
@@ -73,10 +75,28 @@ def _verify(cookie_value: str) -> Optional[dict]:
 
 # ── Session helpers ──────────────────────────────────────────────────────────
 
-def create_session_cookie(response: Response, username: str = "user") -> None:
-    """Set a signed session cookie on the response."""
+def create_session_cookie(
+    response: Response,
+    username: str = "user",
+    *,
+    groups: list[str] | None = None,
+    display_name: str = "",
+    email: str = "",
+    via: str = "local",
+) -> None:
+    """Set a signed session cookie on the response.
+
+    Group membership is carried in the cookie so authorization does not hit
+    LDAP on every request. The trade-off is that a group change only takes
+    effect at the user's next login, which is acceptable for a session TTL
+    measured in hours.
+    """
     payload = {
         "sub": username,
+        "name": display_name or username,
+        "email": email,
+        "groups": sorted(groups or []),
+        "via": via,
         "iat": int(time.time()),
         "exp": int(time.time()) + settings.auth_session_max_age_seconds,
     }
@@ -117,6 +137,31 @@ def require_auth(request: Request) -> dict:
         # since the JS handles it.
         raise HTTPException(status_code=401, detail="Not authenticated")
     return session
+
+
+def session_to_user(session: dict | None):
+    """Rebuild the authorization `User` from a session cookie.
+
+    Roles are re-derived from the cookie's groups on every request rather than
+    stored, so changing ADMIN_GROUPS takes effect without forcing re-login.
+    """
+    from .authz import ANONYMOUS, build_user
+    from .identity import Principal
+
+    if not session or not session.get("sub"):
+        return ANONYMOUS
+    return build_user(Principal(
+        sub=session["sub"],
+        display_name=session.get("name", ""),
+        email=session.get("email", ""),
+        groups=frozenset(session.get("groups") or []),
+        via=session.get("via", "unknown"),
+    ))
+
+
+def current_user(request: Request):
+    """FastAPI dependency: the authenticated `User`, or 401."""
+    return session_to_user(require_auth(request))
 
 
 # ── Internal endpoint auth (for vLLM job registration) ──────────────────────
@@ -187,28 +232,81 @@ def login_page():
     return FileResponse("app/ui/login.html")
 
 
+@auth_router.get("/api/auth/config")
+def auth_config():
+    """What the login form should render.
+
+    In password mode there is no username field, which keeps the historical
+    single-secret login intact for deployments that have not moved to LDAP.
+    """
+    return {"mode": settings.auth_mode.lower()}
+
+
+@auth_router.get("/api/me")
+def whoami(request: Request):
+    """The current identity and what it may do — the UI hides controls on this."""
+    user = session_to_user(get_session(request))
+    return {
+        "authenticated": bool(user.sub),
+        "sub": user.sub,
+        "display_name": user.display_name,
+        "groups": sorted(user.groups),
+        "is_admin": user.is_admin,
+        "operator_pools": sorted(user.operator_pools),
+        "can_create": user.is_user or user.is_admin,
+        # Surfaced so the UI can warn that this is not a real identity.
+        "is_local_admin": user.is_local_admin,
+        "via": user.via,
+    }
+
+
 @auth_router.post("/api/login")
 def login(request: Request, response: Response, body: dict = None):
     """
-    Authenticate with password.
+    Authenticate against the configured identity provider.
 
-    For SSO: you'd add a separate /auth/callback endpoint that validates
-    the OIDC token and calls create_session_cookie().
+    AUTH_MODE=password  -> shared secret, session is the break-glass admin
+    AUTH_MODE=ldap      -> FreeIPA simple bind, with the break-glass admin as
+                           a fallback when the directory is unreachable
+
+    For SSO: add a /auth/callback route that validates the OIDC token and calls
+    create_session_cookie() with the claims.
     """
-    # Handle both JSON body and form-style
+    from .identity import AuthenticationError, authenticate
+
     if body is None:
         body = {}
+    username = (body.get("username") or "").strip()
     password = body.get("password", "")
 
-    if not hmac.compare_digest(password, settings.auth_password):
-        raise HTTPException(status_code=401, detail="Invalid password")
+    try:
+        principal = authenticate(username, password)
+    except AuthenticationError:
+        # One message for every failure mode — do not reveal whether the
+        # account exists.
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Create session
-    resp = Response(
-        content=json.dumps({"ok": True}),
-        media_type="application/json",
+    if principal.is_local_admin and settings.auth_mode.lower() == "ldap":
+        logger.warning(
+            "break-glass local admin login used (LDAP mode active) from %s",
+            request.client.host if request.client else "unknown",
+        )
+
+    resp = Response(content=json.dumps({
+        "ok": True,
+        "sub": principal.sub,
+        "display_name": principal.display_name,
+        "is_local_admin": principal.is_local_admin,
+    }), media_type="application/json")
+
+    create_session_cookie(
+        resp,
+        username=principal.sub,
+        groups=sorted(principal.groups),
+        display_name=principal.display_name,
+        email=principal.email,
+        via=principal.via,
     )
-    create_session_cookie(resp, username="user")
     return resp
 
 

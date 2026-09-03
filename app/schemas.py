@@ -6,13 +6,42 @@ from typing import Optional, Any
 class LeaseCreate(BaseModel):
     model: str
     owner: Optional[str] = None
+    # Co-own with a team so the booking survives the owner being away.
+    # Must be a group the caller is actually in.
+    owner_group: Optional[str] = None
     notes: Optional[str] = None
     begin_at: Optional[datetime] = None
     duration_seconds: int = Field(default=6*3600, ge=60)
     asap: bool = False  # NEW: find earliest available slot
 
+    # session -> hard stop at end_at (benchmarks)
+    # service -> renewed indefinitely; survives the cluster's MaxWall
+    mode: str = "session"
+    replicas: int = Field(default=1, ge=1, le=16)
+
+    # Additional models to run on the *same* GPU, inside one Slurm job.
+    # Every co-tenant (including `model`) must declare memory_gb in the catalog.
+    colocate: list[str] = Field(default_factory=list)
+
+    # Which pool to book in; None uses the legacy global Slurm settings.
+    pool: Optional[str] = None
+    # Force a GPU class instead of letting the smallest sufficient one win.
+    gpu_class: Optional[str] = None
+    # Pin to one specific node. Narrower than `gpu_class`: the job waits for
+    # that machine rather than any card of the right type, which on a shared
+    # partition can mean waiting considerably longer.
+    node: Optional[str] = None
+    # "Any GPU with at least this much memory." More useful than naming a class:
+    # the user knows how big their model is, not which class is free. Combined
+    # with asap=true, the class that can start soonest wins.
+    min_memory_gb: Optional[float] = Field(default=None, gt=0.0)
+
     gpus: Optional[int] = Field(default=None, ge=1)
     tensor_parallel_size: Optional[int] = Field(default=None, ge=1)
+    # Absolute GPU memory for this booking, in GB. Preferred over
+    # gpu_memory_utilization: a fraction means different things on a 48 GB card
+    # and a 128 GB Spark, GB does not. Capped by the GPU class.
+    memory_gb: Optional[float] = Field(default=None, gt=0.0)
     gpu_memory_utilization: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     extra_args: Optional[str] = None
     tool_args: Optional[str] = None
@@ -25,10 +54,30 @@ class LeaseUpdate(BaseModel):
     requested_tp: Optional[int] = Field(default=None, ge=1)
     notes: Optional[str] = None
 
+class LeaseLockRequest(BaseModel):
+    """Lock marks a deployment as production: exempt from owner cancellation
+    and from auto-cleanup."""
+    reason: Optional[str] = None
+    # Also switch it to `service` mode, making it *permanent*: renewed before
+    # every wall-time expiry and resurrected after a crash, node reboot or
+    # cluster outage, until an admin unlocks it.
+    permanent: bool = False
+
+
 class LeaseOut(BaseModel):
     id: int
     model: str
     owner: Optional[str]
+    owner_sub: Optional[str] = None
+    owner_group: Optional[str] = None
+    pool: Optional[str] = None
+    locked: bool = False
+    locked_by: Optional[str] = None
+    locked_reason: Optional[str] = None
+    # Server-evaluated permissions so the UI can hide controls it cannot use.
+    can_edit: bool = False
+    can_cancel: bool = False
+    can_lock: bool = False
     notes: Optional[str] = None
     state: str
     slurm_job_id: Optional[str]
@@ -40,9 +89,77 @@ class LeaseOut(BaseModel):
     end_at: Optional[datetime]
     created_at: datetime
 
+    # Flat global lane index, for the existing timeline rendering.
     lane_start: Optional[int] = None
     lane_count: Optional[int] = None
     conflict: bool = False
+    # Node-aware placement: lets the timeline group rows per node.
+    node: Optional[str] = None
+    gpu_start: Optional[int] = None
+    gpu_class: Optional[str] = None
+    pinned_node: Optional[str] = None
+    # On a `slurm` pool the start time is Slurm's backfill estimate, not a
+    # promise. The UI must render these differently — presenting an estimate as
+    # confirmed is the most misleading thing this app could do.
+    scheduling: str = "managed"
+    estimated_start: Optional[datetime] = None
+    estimate_updated_at: Optional[datetime] = None
+    mode: str = "session"
+    replicas: int = 1
+    supersedes_id: Optional[int] = None
+    # Models sharing this lease's GPU, if any (includes `model` itself).
+    colocated: list[str] = Field(default_factory=list)
+
+    @property
+    def is_estimated(self) -> bool:
+        return self.scheduling == "slurm"
+
+class LeasePreviewRequest(BaseModel):
+    """Ask when a booking *would* start, without creating it."""
+    model: str
+    pool: Optional[str] = None
+    gpu_class: Optional[str] = None
+    duration_seconds: int = Field(default=6*3600, ge=60)
+    begin_at: Optional[datetime] = None
+
+class LeasePreviewResponse(BaseModel):
+    model: str
+    pool: Optional[str] = None
+    scheduling: str = "managed"
+    gpu_class: Optional[str] = None
+    gpus: int = 1
+    # "confirmed" on a managed pool; "estimated" when Slurm decides; "unknown"
+    # when we genuinely cannot tell.
+    confidence: str = "confirmed"
+    start_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    node: Optional[str] = None
+    detail: str = ""
+
+class NodeLaneOut(BaseModel):
+    """One node's slice of the timeline."""
+    name: str
+    lane_offset: int
+    gpu_count: int
+    gpu_classes: list[list[Any]] = []
+    state: str = "UNKNOWN"
+    pool: Optional[str] = None
+    # True when standing in for TOTAL_GPUS because no inventory was discovered.
+    synthetic: bool = False
+
+class ForeignJobOut(BaseModel):
+    """Someone else's job occupying GPUs we can see but do not control."""
+    job_id: str
+    user: str
+    state: str
+    nodes: list[str] = []
+    gpus: int = 0
+    # Exact GPU indices held, when the backend can tell us (slurmrestd reports
+    # them; the CLI backend cannot). Empty means "unknown" and the UI packs
+    # sequentially instead.
+    gpu_indices: list[int] = Field(default_factory=list)
+    begin_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
 
 class LeaseExtend(BaseModel):
     duration_seconds: int = Field(..., ge=60)
@@ -79,6 +196,14 @@ class DashboardModel(BaseModel):
     ready: bool
     meta: dict[str, Any]
 
+
+class GpuClassOut(BaseModel):
+    """What the UI needs to render a memory slider for a class."""
+    name: str
+    vram_gb: int = 0
+    usable_gb: float = 0.0
+    unified_memory: bool = False
+
 class EndpointStats(BaseModel):
     model: str
     host: str
@@ -96,16 +221,79 @@ class EndpointStats(BaseModel):
 
 class DashboardResponse(BaseModel):
     now: datetime
+    # Derived from discovered inventory, not the TOTAL_GPUS env var.
     total_gpus: int
     models: list[DashboardModel]
     leases: list[LeaseOut]
     endpoint_stats: list[EndpointStats] = []
+    gpu_classes: list[GpuClassOut] = []
+    nodes: list[NodeLaneOut] = []
+    foreign_jobs: list[ForeignJobOut] = []
+    # Set when node discovery failed, so the UI can say the view may be stale
+    # instead of showing an empty cluster as though everything were free.
+    inventory_error: Optional[str] = None
 
 class LogResponse(BaseModel):
     slurm_job_id: str
     log_stdout: str
     log_stderr: str
     truncated: bool = False
+
+
+# ── Apptainer images ─────────────────────────────────────────────────────────
+
+class ImageOut(BaseModel):
+    """A .sif on the shared filesystem."""
+    name: str
+    path: str
+    size_bytes: int
+    modified_at: datetime
+    #: Non-empty means cluster.yaml points at this file and deleting it would
+    #: break every future job for those GPU classes.
+    used_by_runtimes: list[str] = []
+    used_by_gpu_classes: list[str] = []
+    can_delete: bool = True
+
+class ImageBuildOut(BaseModel):
+    id: int
+    image_name: str
+    source_ref: str
+    arch: str
+    state: str
+    partition: Optional[str] = None
+    nodelist: Optional[str] = None
+    slurm_job_id: Optional[str] = None
+    requested_by: Optional[str] = None
+    error: Optional[str] = None
+    size_bytes: Optional[int] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+class BuildTargetOut(BaseModel):
+    """Somewhere a build for one architecture can actually run."""
+    arch: str
+    partition: str
+    pool: str
+    nodes: list[str] = []
+
+class ImagesResponse(BaseModel):
+    images: list[ImageOut] = []
+    builds: list[ImageBuildOut] = []
+    targets: list[BuildTargetOut] = []
+    image_dir: str = ""
+    #: Set when the directory is not readable from here. The UI says so rather
+    #: than showing an empty list, which would read as "there are no images".
+    error: Optional[str] = None
+
+class ImageBuildRequest(BaseModel):
+    source_ref: str
+    arch: str
+    #: Defaults to a name derived from the reference and architecture.
+    name: Optional[str] = None
+    partition: Optional[str] = None
+    #: Rebuild over an existing image of the same name.
+    overwrite: bool = False
 
 class PublicModelInfo(BaseModel):
     """Model from the catalog, with availability status."""
@@ -128,6 +316,8 @@ class PublicLeaseInfo(BaseModel):
     lane_start: Optional[int] = None
     lane_count: Optional[int] = None
     conflict: bool = False
+    node: Optional[str] = None
+    gpu_class: Optional[str] = None
 
 class PublicScheduleResponse(BaseModel):
     """Full read-only schedule snapshot."""

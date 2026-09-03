@@ -1,9 +1,33 @@
-import subprocess
-import os
+"""Compatibility shim over `app.backends`.
+
+The real implementation now lives in `app/backends/` behind `ClusterBackend`.
+This module keeps the historical function names and return shapes so existing
+call sites in `main.py` and `admin.py` are untouched while the backend swap
+lands; new code should use `app.backends.get_backend()` directly.
+
+Two behavioural notes:
+
+* `sacct_job_exit_info_batch` now falls back to `scontrol` when sacct is
+  unavailable, so the app no longer has to run on the accounting host. Where it
+  previously returned `None`, it may now return a real exit reason.
+* `SlurmUnavailableError` is an alias of `ClusterUnavailableError`, so
+  `except slurm.SlurmUnavailableError` keeps working.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-import asyncio
+
+from .backends import ClusterUnavailableError, JobSpec, get_backend
+
+# Preserved name — the reconciler catches this to skip a cycle rather than
+# concluding every job has died.
+SlurmUnavailableError = ClusterUnavailableError
+
 
 @dataclass
 class SlurmSubmitResult:
@@ -11,20 +35,30 @@ class SlurmSubmitResult:
     raw: str
 
 
-def _run(cmd: list[str], extra_env: dict[str, str] | None = None) -> str:
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
-    p = subprocess.run(
-        cmd,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
-    return p.stdout.strip()
+def _call_sync(sync_name: str, async_name: str, *args):
+    """Invoke a backend method from sync code.
 
+    Prefers the backend's native sync entry point (the CLI backend has one for
+    every call). Falls back to driving the coroutine on a private loop in a
+    worker thread, which is needed because `reconcile_on_startup()` runs inside
+    the FastAPI lifespan and therefore already has a running loop.
+    """
+    backend = get_backend()
+    fn = getattr(backend, sync_name, None)
+    if fn is not None:
+        return fn(*args)
+
+    coro_fn = getattr(backend, async_name)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_fn(*args))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro_fn(*args))).result()
+
+
+# ── Submission ───────────────────────────────────────────────────────────────
 
 def submit_vllm_job(
     *,
@@ -43,160 +77,89 @@ def submit_vllm_job(
     log_dir: str = "./logs",
     mail_user: str | None = None,
     mail_type: str | None = None,
+    gres: str | None = None,
+    reservation: str | None = None,
+    comment: str | None = None,
 ) -> SlurmSubmitResult:
-    # Make logs deterministic and independent of router working directory:
-    # Slurm expands %x=%jobname, %j=%jobid
-    log_dir_abs = os.path.abspath(log_dir)
-    os.makedirs(log_dir_abs, exist_ok=True)
-
-    stdout_path = os.path.join(log_dir_abs, "%x-%j.out")
-    stderr_path = os.path.join(log_dir_abs, "%x-%j.err")
-
-    cmd = [
-        "sbatch",
-        "--parsable",
-        f"--job-name={job_name}",
-        f"--gres=gpu:{gpus}",
-        f"--cpus-per-task={cpus_per_task}",
-        f"--time={time_limit}",
-        f"--output={stdout_path}",
-        f"--error={stderr_path}",
-    ]
-
-    if mem:
-        cmd.append(f"--mem={mem}")
-
-    if mail_user:
-        cmd.append(f"--mail-user={mail_user}")
-        cmd.append(f"--mail-type={mail_type or 'FAIL,END,TIME_LIMIT'}")
-
-    if begin is not None:
-        cmd.append(f"--begin={begin.strftime('%Y-%m-%dT%H:%M:%S')}")
-    if partition:
-        cmd.append(f"--partition={partition}")
-    if account:
-        cmd.append(f"--account={account}")
-    if qos:
-        cmd.append(f"--qos={qos}")
-    if nodelist:
-        cmd.append(f"--nodelist={nodelist}")
-
-    # Inherit environment then set vars in the process env
-    cmd.append("--export=ALL")
-    cmd.append(template_path)
-
-    out = _run(cmd, extra_env=env)
-    job_id = out.split(";")[0]
-    return SlurmSubmitResult(job_id=job_id, raw=out)
-
-
-def cancel(job_id: str) -> None:
-    _run(["scancel", job_id])
-
-
-def extend_time(job_id: str, new_time_limit: str) -> None:
-    _run(["scontrol", "update", f"JobId={job_id}", f"TimeLimit={new_time_limit}"])
-
-
-def squeue_job_state(job_id: str) -> str | None:
-    try:
-        out = _run(["squeue", "-j", job_id, "-h", "-o", "%T"])
-        return out.strip() or None
-    except subprocess.CalledProcessError:
-        return None
-
-async def async_squeue_job_state(job_id: str) -> str | None:
-    """Non-blocking version of squeue_job_state for async contexts."""
-    return await asyncio.to_thread(squeue_job_state, job_id)
-
-
-async def async_cancel(job_id: str) -> None:
-    """Non-blocking version of cancel for async contexts."""
-    await asyncio.to_thread(cancel, job_id)
-
-
-async def async_extend_time(job_id: str, new_time_limit: str) -> None:
-    """Non-blocking version of extend_time for async contexts."""
-    await asyncio.to_thread(extend_time, job_id, new_time_limit)
+    spec = JobSpec(
+        job_name=job_name,
+        script_path=template_path,
+        gpus=gpus,
+        time_limit=time_limit,
+        env=env,
+        cpus=cpus_per_task,
+        mem=mem,
+        partition=partition,
+        account=account,
+        qos=qos,
+        nodelist=nodelist,
+        gres=gres,
+        reservation=reservation,
+        begin=begin,
+        comment=comment,
+        log_dir=log_dir,
+        mail_user=mail_user,
+        mail_type=mail_type,
+    )
+    res = _call_sync("submit_sync", "submit", spec)
+    return SlurmSubmitResult(job_id=res.job_id, raw=res.raw)
 
 
 async def async_submit_vllm_job(**kwargs) -> SlurmSubmitResult:
-    """Non-blocking version of submit_vllm_job for async contexts."""
     return await asyncio.to_thread(lambda: submit_vllm_job(**kwargs))
 
-class SlurmUnavailableError(Exception):
-    """Raised when the Slurm controller itself is unreachable."""
-    pass
+
+# ── Lifecycle ────────────────────────────────────────────────────────────────
+
+def cancel(job_id: str) -> None:
+    _call_sync("cancel_sync", "cancel", job_id)
+
+
+async def async_cancel(job_id: str) -> None:
+    await get_backend().cancel(job_id)
+
+
+def extend_time(job_id: str, new_time_limit: str) -> None:
+    _call_sync("extend_time_sync", "extend_time", job_id, new_time_limit)
+
+
+async def async_extend_time(job_id: str, new_time_limit: str) -> None:
+    await get_backend().extend_time(job_id, new_time_limit)
+
+
+# ── Queue state (legacy shapes: plain state strings) ─────────────────────────
 
 def squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
-    """
-    Query Slurm for multiple job states in a single squeue call.
-    Returns a dict of {job_id: state_or_None}.
+    states = _call_sync("job_states_sync", "job_states", job_ids)
+    return {jid: (st.state if st else None) for jid, st in states.items()}
 
-    Raises SlurmUnavailableError if the Slurm controller is down,
-    so callers don't mistakenly treat all jobs as gone.
-    """
-    if not job_ids:
-        return {}
-
-    result: dict[str, str | None] = {jid: None for jid in job_ids}
-    try:
-        job_list = ",".join(job_ids)
-        out = _run(["squeue", "-j", job_list, "-h", "-o", "%i %T"])
-        for line in out.strip().splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                jid, state = parts[0], parts[1]
-                if jid in result:
-                    result[jid] = state
-    except subprocess.CalledProcessError as e:
-        output = (e.stdout or "") + " " + (e.stderr or "")
-        # Slurm controller errors → don't assume jobs are gone
-        slurm_down_indicators = [
-            "slurm_load_jobs error",
-            "Unable to contact slurm controller",
-            "Socket timed out",
-            "Connection refused",
-            "slurmdbd:",
-        ]
-        if any(indicator in output for indicator in slurm_down_indicators):
-            raise SlurmUnavailableError(f"Slurm controller unavailable: {output.strip()}")
-        # Otherwise: the jobs are genuinely gone (e.g., "Invalid job id specified")
-        # result stays all-None, which is correct
-    return result
 
 async def async_squeue_job_states_batch(job_ids: list[str]) -> dict[str, str | None]:
-    """Non-blocking version of squeue_job_states_batch."""
-    return await asyncio.to_thread(squeue_job_states_batch, job_ids)
+    states = await get_backend().job_states(job_ids)
+    return {jid: (st.state if st else None) for jid, st in states.items()}
+
+
+def squeue_job_state(job_id: str) -> str | None:
+    return squeue_job_states_batch([job_id]).get(job_id)
+
+
+async def async_squeue_job_state(job_id: str) -> str | None:
+    return (await async_squeue_job_states_batch([job_id])).get(job_id)
+
+
+# ── Exit reasons (legacy shape: {"state": ..., "exit_code": ...}) ────────────
+
+def _exit_to_legacy(info) -> dict | None:
+    if info is None:
+        return None
+    return {"state": info.state, "exit_code": info.exit_code, "source": info.source}
 
 
 def sacct_job_exit_info_batch(job_ids: list[str]) -> dict[str, dict | None]:
-    """
-    Query sacct for completed jobs' exit states.
-    Returns {job_id: {"state": "OUT_OF_MEMORY", "exit_code": "0:125"} or None}.
-    """
-    if not job_ids:
-        return {}
-    result: dict[str, dict | None] = {jid: None for jid in job_ids}
-    try:
-        job_list = ",".join(job_ids)
-        out = _run([
-            "sacct", "-j", job_list,
-            "--format=JobID,State,ExitCode",
-            "--noheader", "--parsable2",
-            "--allocations",
-        ])
-        for line in out.strip().splitlines():
-            parts = line.strip().split("|")
-            if len(parts) >= 3:
-                jid = parts[0].split(".")[0]  # strip .batch suffix
-                if jid in result:
-                    result[jid] = {"state": parts[1], "exit_code": parts[2]}
-    except subprocess.CalledProcessError:
-        pass
-    return result
+    infos = _call_sync("job_exit_info_sync", "job_exit_info", job_ids)
+    return {jid: _exit_to_legacy(info) for jid, info in infos.items()}
 
 
 async def async_sacct_job_exit_info_batch(job_ids: list[str]) -> dict[str, dict | None]:
-    """Non-blocking version of sacct_job_exit_info_batch."""
-    return await asyncio.to_thread(sacct_job_exit_info_batch, job_ids)
+    infos = await get_backend().job_exit_info(job_ids)
+    return {jid: _exit_to_legacy(info) for jid, info in infos.items()}

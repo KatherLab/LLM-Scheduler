@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from .auth import auth_router, require_auth, get_session
@@ -21,20 +22,75 @@ from .admin import router as admin_router
 from .router_core import choose_ready_endpoint, health_check_endpoint
 from .proxy import proxy_get, proxy_json_or_stream, proxy_multipart
 from .admin import internal_router
+from .images_api import router as images_router
 from .public_api import router as public_api_router, metrics_router
 from . import slurm
+from .backends import ClusterUnavailableError
+from .backends import get_backend as slurm_backend
 from .utils import ensure_utc
 from .lifecycle_logger import log_health_check, log_state_transition, log_slurm_action
 from .metrics import generate_latest, UPSTREAM_HEALTHY
+from .leader import get_election, is_leader
 
 logger = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    """Make the app's own loggers visible.
+
+    uvicorn installs handlers for `uvicorn.*` only; everything else inherits a
+    bare root logger at WARNING, so our INFO messages vanish. Attach a handler
+    to the `app` package rather than the root logger, so third-party libraries
+    stay as quiet as they were.
+    """
+    level = getattr(logging, (settings.log_level or "INFO").upper(), logging.INFO)
+    app_logger = logging.getLogger("app")
+    app_logger.setLevel(level)
+
+    # Only supply a handler when nothing else will. Under uvicorn the root
+    # logger has none, so ours is the only route to stderr. When the host
+    # application *has* configured logging (or pytest's caplog is attached),
+    # propagation alone delivers the records and adding a handler here would
+    # duplicate every line.
+    #
+    # Propagation deliberately stays on: turning it off silences the app for
+    # anyone who configures logging at the root, and breaks caplog in tests.
+    if not app_logger.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(levelname)s:    %(name)s: %(message)s"
+        ))
+        app_logger.addHandler(handler)
+
+
+configure_logging()
+
 
 # ── Supervised task wrapper ─────────────────────────────────────────────────
 async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
     """
     Run an async worker forever. If it crashes, log and restart after a delay.
     Only exits on asyncio.CancelledError (i.e. shutdown).
+
+    Under HA the worker only runs on the leader; followers idle here and take
+    over within one lock TTL if the leader dies.
     """
+    while True:
+        try:
+            if not is_leader():
+                await asyncio.sleep(LEADER_POLL_SECONDS)
+                continue
+            await coro_fn()
+        except asyncio.CancelledError:
+            logger.info("%s: cancelled, shutting down", name)
+            return
+        except Exception as e:
+            logger.error("%s: crashed (%s), restarting in %ss", name, e, restart_delay)
+            await asyncio.sleep(restart_delay)
+
+
+async def _forever(name: str, coro_fn, restart_delay: float = 2.0):
+    """Like `_supervised`, but runs on every instance — not just the leader."""
     while True:
         try:
             await coro_fn()
@@ -46,6 +102,47 @@ async def _supervised(name: str, coro_fn, restart_delay: float = 2.0):
             await asyncio.sleep(restart_delay)
 
 
+# ── Leader election ─────────────────────────────────────────────────────────
+# Every instance serves proxy traffic; only the leader runs the workers.
+LEADER_POLL_SECONDS = 5
+HEARTBEAT_SECONDS = 15
+
+
+async def leader_worker():
+    """Acquire and heartbeat the worker lock.
+
+    Runs on every instance regardless of leadership — it is what *decides*
+    leadership.
+    """
+    election = get_election()
+    while True:
+        try:
+            await asyncio.to_thread(election.try_acquire)
+        except Exception as e:
+            logger.error("leader_worker error: %s", e)
+        await asyncio.sleep(HEARTBEAT_SECONDS)
+
+
+def _ensure_job_log_dir() -> None:
+    """Create the shared job-log directory if we can reach it.
+
+    Slurm does not create it: a missing directory means the job cannot open
+    its output file and dies at launch, with no log to say why. Creating it is
+    only possible when the same filesystem is mounted here, so failure is a
+    warning — off-cluster routers legitimately cannot see it, and the cluster
+    admin may have to create it with the right ownership anyway.
+    """
+    local = os.path.abspath(settings.job_log_dir_local)
+    try:
+        os.makedirs(local, exist_ok=True)
+    except OSError as e:
+        logger.warning(
+            "job log directory %s is not writable from here (%s); Slurm jobs "
+            "will fail at launch unless %s exists on the compute nodes",
+            local, e, settings.job_log_dir,
+        )
+
+
 # ── Lifespan (replaces deprecated @app.on_event) ───────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -54,14 +151,31 @@ async def lifespan(app: FastAPI):
     Shutdown: cancel all workers, close the shared httpx proxy client.
     """
     # ── Startup ──
-    reconcile_on_startup()
+    _ensure_job_log_dir()
+    # Only the leader may reconcile: it cancels and resubmits Slurm jobs, and
+    # two instances doing that at once would fight.
+    tasks = []
+    if settings.ha_enabled:
+        election = get_election()
+        await asyncio.to_thread(election.try_acquire)
+        tasks.append(asyncio.create_task(_forever("leader_worker", leader_worker)))
+        if election.is_leader:
+            reconcile_on_startup()
+        else:
+            logger.info("starting as follower — serving proxy traffic only")
+    else:
+        reconcile_on_startup()
 
-    tasks = [
+    tasks += [
+        asyncio.create_task(_supervised("inventory_worker", inventory_worker)),
+        asyncio.create_task(_supervised("estimate_worker", estimate_worker)),
         asyncio.create_task(_supervised("health_worker", health_worker)),
         asyncio.create_task(_supervised("planned_submit_worker", planned_submit_worker)),
         asyncio.create_task(_supervised("endpoint_cleanup_worker", endpoint_cleanup_worker)),
         asyncio.create_task(_supervised("slurm_reconcile_worker", slurm_reconcile_worker)),
         asyncio.create_task(_supervised("retry_worker", retry_worker)),
+        asyncio.create_task(_supervised("renew_worker", renew_worker)),
+        asyncio.create_task(_supervised("image_build_worker", image_build_worker)),
     ]
 
     yield  # ← app is running and serving requests
@@ -71,6 +185,10 @@ async def lifespan(app: FastAPI):
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    if settings.ha_enabled:
+        # Hand leadership over promptly instead of waiting out the TTL.
+        await asyncio.to_thread(get_election().release)
 
     # Close shared HTTP clients
     from .proxy import close_client
@@ -83,6 +201,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="KatherLab LLM Scheduler", version="0.4.0", lifespan=lifespan)
 app.include_router(admin_router)
+app.include_router(images_router)
 app.include_router(auth_router)
 app.include_router(internal_router)
 app.include_router(public_api_router)
@@ -299,6 +418,218 @@ async def metrics(request: Request, model: Optional[str] = None):
 #   gets its lease promoted to RUNNING (catches missed transitions)
 # =============================================================================
 
+# =============================================================================
+# INVENTORY WORKER
+#
+# Refreshes the node/foreign-job snapshot that replaces the hand-maintained
+# TOTAL_GPUS. Node topology changes rarely, but node *state* (drain/down) and
+# foreign jobs change often enough that a stale view would mis-plan.
+#
+# Discovery failures keep the previous snapshot rather than reporting an empty
+# cluster, which would make every booking look unplaceable.
+# =============================================================================
+INVENTORY_REFRESH_SECONDS = 60
+
+
+async def inventory_worker():
+    from . import inventory
+
+    while True:
+        try:
+            inv = await inventory.refresh()
+            if inv.error:
+                logger.warning("inventory: %s", inv.error)
+            else:
+                logger.debug(
+                    "inventory: %d nodes, %d GPUs, %d foreign jobs",
+                    len(inv.nodes), inv.total_gpus, len(inv.foreign_jobs),
+                )
+        except Exception as e:
+            logger.error("inventory_worker error: %s", e)
+        await asyncio.sleep(INVENTORY_REFRESH_SECONDS)
+
+
+# =============================================================================
+# ESTIMATE WORKER
+#
+# Keeps Slurm's backfill start estimate fresh for queued jobs on `slurm` pools,
+# where our calendar is not the allocator and the honest answer to "when does
+# this start?" comes from Slurm.
+#
+# The estimate genuinely moves as the queue changes, so this must re-poll
+# rather than record it once. Slurm recomputes it only every `bf_interval`
+# (~30s default), so polling faster would just be noise.
+# =============================================================================
+ESTIMATE_REFRESH_SECONDS = 45
+
+
+async def estimate_worker():
+    from .cluster import get_cluster
+
+    while True:
+        try:
+            cluster = get_cluster()
+
+            # ── Phase 1: which queued leases need an estimate ────────────
+            with SessionLocal() as db:
+                pending = [
+                    {"id": x.id, "job": x.slurm_job_id, "pool": x.pool}
+                    for x in db.execute(
+                        select(Lease).where(Lease.state.in_(["SUBMITTED", "STARTING"]))
+                    ).scalars().all()
+                    if x.slurm_job_id
+                ]
+
+            # Managed pools promise a start time; only `slurm` pools estimate.
+            targets = [
+                p for p in pending
+                if (pool := cluster.pool(p["pool"])) is None or not pool.is_managed
+            ]
+            if not targets:
+                await asyncio.sleep(ESTIMATE_REFRESH_SECONDS)
+                continue
+
+            # ── Phase 2: ask Slurm (outside the DB session) ──────────────
+            try:
+                states = await slurm_backend().job_states([t["job"] for t in targets])
+            except ClusterUnavailableError as e:
+                logger.warning("estimate_worker: cluster unavailable (%s), skipping", e)
+                await asyncio.sleep(ESTIMATE_REFRESH_SECONDS)
+                continue
+
+            # ── Phase 3: write the estimates back ────────────────────────
+            now = datetime.now(timezone.utc)
+            with SessionLocal() as db:
+                for target in targets:
+                    state = states.get(target["job"])
+                    if state is None:
+                        continue
+                    lease = db.get(Lease, target["id"])
+                    if lease is None:
+                        continue
+                    if state.is_running:
+                        # It started — the estimate is now history.
+                        lease.estimated_start = None
+                    elif state.start_time is not None:
+                        lease.estimated_start = state.start_time
+                    lease.estimate_updated_at = now
+                db.commit()
+        except Exception as e:
+            logger.error("estimate_worker error: %s", e)
+        await asyncio.sleep(ESTIMATE_REFRESH_SECONDS)
+
+
+# =============================================================================
+# RENEW WORKER  (mode: service)
+#
+# A long-running model cannot be booked for a month — clusters cap wall time.
+# So a service deployment is a chain of bounded jobs handed over without
+# downtime:
+#
+#   submit replacement -> wait for READY -> drain old -> cancel old
+#
+# The drain step depends on least-loaded routing: both replicas serve the same
+# model briefly, and the drain flag steers traffic one way.
+# =============================================================================
+RENEW_INTERVAL_SECONDS = 30
+
+
+async def renew_worker():
+    from . import renew
+    from .admin import _snapshot_lease, _submit_to_slurm_from_snapshot
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            # ── Phase 1: decide what to do (no I/O) ─────────────────────
+            with SessionLocal() as db:
+                leases = db.execute(
+                    select(Lease).where(Lease.state.in_(renew.ACTIVE))
+                ).scalars().all()
+
+                # (a) service leases nearing expiry get a replacement
+                to_renew = renew.plan_renewals(leases, now)
+                created: list[dict] = []
+                for lease in to_renew:
+                    replacement = renew.build_replacement(lease, now)
+                    db.add(replacement)
+                    db.flush()
+                    log_state_transition(
+                        entity="lease", entity_id=replacement.id, model=replacement.model,
+                        old_state="-", new_state="PLANNED", slurm_job_id=None,
+                        reason=f"service renewal, supersedes lease {lease.id}",
+                    )
+                    created.append(_snapshot_lease(replacement))
+
+                # (b) replacements that are READY -> start draining the old one
+                retire: list[int] = []
+                for lease in leases:
+                    if not lease.supersedes_id:
+                        continue
+                    if not renew.replacement_is_ready(db, lease):
+                        continue
+                    old = db.get(Lease, lease.supersedes_id)
+                    if old is None or old.state not in renew.ACTIVE:
+                        continue
+                    renew.begin_drain(db, old, now)
+                    if renew.drain_complete(db, old, now):
+                        retire.append(old.id)
+
+                db.commit()
+
+            # ── Phase 2: Slurm calls, outside the DB session ────────────
+            submitted: list[tuple[int, str]] = []
+            for snapshot in created:
+                try:
+                    job_id = await asyncio.to_thread(
+                        _submit_to_slurm_from_snapshot, snapshot
+                    )
+                    submitted.append((snapshot["id"], job_id))
+                except Exception as e:
+                    logger.error(
+                        "renew_worker: submit failed for replacement lease %s: %s",
+                        snapshot["id"], e,
+                    )
+
+            for lease_id in retire:
+                with SessionLocal() as db:
+                    old = db.get(Lease, lease_id)
+                    job_id = old.slurm_job_id if old else None
+                if job_id:
+                    try:
+                        await slurm.async_cancel(job_id)
+                    except Exception as e:
+                        logger.warning("renew_worker: cancel %s failed: %s", job_id, e)
+
+            # ── Phase 3: write results back ─────────────────────────────
+            with SessionLocal() as db:
+                for lease_id, job_id in submitted:
+                    lease = db.get(Lease, lease_id)
+                    if lease:
+                        lease.slurm_job_id = job_id
+                        lease.state = "SUBMITTED"
+                for lease_id in retire:
+                    old = db.get(Lease, lease_id)
+                    if old is None:
+                        continue
+                    renew.forget_endpoints(db, old)
+                    old.state = "ENDED"
+                    old.end_at = now
+                    for endpoint in renew.endpoints_for(db, old):
+                        endpoint.state = "STOPPED"
+                    log_state_transition(
+                        entity="lease", entity_id=old.id, model=old.model,
+                        old_state="RUNNING", new_state="ENDED",
+                        slurm_job_id=old.slurm_job_id,
+                        reason="retired after service handover",
+                    )
+                db.commit()
+        except Exception as e:
+            logger.error("renew_worker error: %s", e)
+        await asyncio.sleep(RENEW_INTERVAL_SECONDS)
+
+
 READY_FAIL_THRESHOLD = 3  # consecutive health-check failures before marking READY → FAILED
 
 async def health_worker():
@@ -397,6 +728,10 @@ async def health_worker():
                             ):
                                 old_ls = lease.state
                                 lease.state = "RUNNING"
+                                # A model that reached READY has recovered;
+                                # clear the counter so a future failure retries
+                                # promptly instead of at the backoff ceiling.
+                                lease.retry_count = 0
                                 log_state_transition(
                                     entity="lease",
                                     entity_id=lease.id,
@@ -537,6 +872,7 @@ async def health_worker():
                     if lease and lease.state in ("SUBMITTED", "STARTING"):
                         old_ls = lease.state
                         lease.state = "RUNNING"
+                        lease.retry_count = 0
                         log_state_transition(
                             entity="lease",
                             entity_id=lease.id,
@@ -684,6 +1020,15 @@ async def endpoint_cleanup_worker():
                             Lease.slurm_job_id == e.slurm_job_id
                         )
                     ).scalars().first()
+
+                    # Locked leases and service deployments outlive their
+                    # booking window: the first by policy, the second because
+                    # renew_worker retires them explicitly after a handover.
+                    # Explicit cancellation still applies below.
+                    if lease and lease.state not in ("CANCELED", "ENDED") and (
+                        lease.locked or (lease.mode or "session") == "service"
+                    ):
+                        continue
 
                     if lease and lease.end_at and ensure_utc(lease.end_at) < now:
                         actions.append({
@@ -903,6 +1248,130 @@ async def slurm_reconcile_worker():
 
 
 # =============================================================================
+# IMAGE BUILD WORKER
+#
+# Watches `apptainer build` jobs. They are ordinary Slurm jobs, so this is the
+# same three-phase shape as the reconciler — with one addition: a build that
+# left the queue is judged by whether the .sif is actually there. Slurm's exit
+# code alone is not enough, because the job can succeed while producing
+# nothing useful, and a finished-but-missing image must not look like success.
+# =============================================================================
+IMAGE_BUILD_POLL_SECONDS = 15
+
+
+async def image_build_worker():
+    from . import images
+    from .models import ImageBuild
+
+    while True:
+        try:
+            # ── Phase 1: snapshot ───────────────────────────────────────
+            with SessionLocal() as db:
+                active = db.execute(
+                    select(ImageBuild).where(
+                        ImageBuild.state.in_(["SUBMITTED", "RUNNING"])
+                    )
+                ).scalars().all()
+                watching = [
+                    {"id": b.id, "job_id": b.slurm_job_id, "state": b.state,
+                     "name": b.image_name}
+                    for b in active if b.slurm_job_id
+                ]
+
+            if not watching:
+                await asyncio.sleep(IMAGE_BUILD_POLL_SECONDS)
+                continue
+
+            # ── Phase 2: ask Slurm, outside the session ─────────────────
+            job_ids = [w["job_id"] for w in watching]
+            try:
+                states = await slurm.async_squeue_job_states_batch(job_ids)
+            except slurm.SlurmUnavailableError as e:
+                logger.warning(
+                    "image_build_worker: Slurm unavailable (%s), skipping cycle", e
+                )
+                await asyncio.sleep(IMAGE_BUILD_POLL_SECONDS)
+                continue
+
+            gone = [w["job_id"] for w in watching if states.get(w["job_id"]) is None]
+            exits = (
+                await slurm.async_sacct_job_exit_info_batch(gone) if gone else {}
+            )
+
+            # Did the file actually appear? Only answerable where the images
+            # directory is mounted here; without it we fall back to the exit
+            # code and say so in the error.
+            produced: dict[str, int | None] = {}
+            for w in watching:
+                if w["job_id"] not in gone:
+                    continue
+                try:
+                    path = images.image_path(w["name"])
+                    produced[w["name"]] = (
+                        os.path.getsize(path) if os.path.isfile(path) else None
+                    )
+                except (images.ImageError, OSError):
+                    produced[w["name"]] = -1  # cannot tell from here
+
+            # ── Phase 3: apply ─────────────────────────────────────────
+            now = datetime.now(timezone.utc)
+            with SessionLocal() as db:
+                for w in watching:
+                    row = db.get(ImageBuild, w["id"])
+                    if row is None or not row.is_active:
+                        continue
+
+                    state = states.get(w["job_id"])
+                    if state is not None:
+                        if state in ("RUNNING", "COMPLETING") and row.state != "RUNNING":
+                            row.state = "RUNNING"
+                            row.started_at = row.started_at or now
+                        continue
+
+                    size = produced.get(w["name"])
+                    exit_info = exits.get(w["job_id"])
+                    row.finished_at = now
+
+                    if size is not None and size > 0:
+                        row.state = "SUCCEEDED"
+                        row.size_bytes = size
+                        row.error = None
+                    elif size == -1:
+                        # No filesystem view: trust Slurm, and be honest that
+                        # we could not verify the result.
+                        completed = bool(exit_info and exit_info.state == "COMPLETED")
+                        row.state = "SUCCEEDED" if completed else "FAILED"
+                        row.error = (
+                            "Job finished; the images directory is not visible "
+                            "from the scheduler, so the image was not verified."
+                            if completed else
+                            f"Build job ended {exit_info.state if exit_info else 'unknown'}."
+                        )
+                    else:
+                        row.state = "FAILED"
+                        reason = exit_info.state if exit_info else "without a trace"
+                        row.error = (
+                            f"Build job ended {reason} and produced no image. "
+                            "See the build log."
+                        )
+                    log_state_transition(
+                        entity="image_build",
+                        entity_id=row.id,
+                        model=row.image_name,
+                        old_state=w["state"],
+                        new_state=row.state,
+                        reason=row.error or "",
+                        slurm_job_id=row.slurm_job_id,
+                    )
+                db.commit()
+
+        except Exception as e:
+            logger.error("image_build_worker error: %s", e, exc_info=True)
+
+        await asyncio.sleep(IMAGE_BUILD_POLL_SECONDS)
+
+
+# =============================================================================
 # RETRY WORKER
 #
 # Scans for FAILED leases eligible for retry:
@@ -927,32 +1396,33 @@ async def retry_worker():
                     select(Lease).where(Lease.state == "FAILED")
                 ).scalars().all()
 
+                from . import renew
+
                 for lease in failed:
-                    if lease.end_at and ensure_utc(lease.end_at) < now:
+                    if not renew.should_retry(
+                        lease, now,
+                        max_retries=settings.vllm_max_retries,
+                        retry_delay=settings.vllm_retry_delay_seconds,
+                    ):
                         continue
-                    if lease.retry_count >= settings.vllm_max_retries:
-                        continue
-                    if not lease.failed_at:
-                        continue
-                    since_fail = (
-                        now - ensure_utc(lease.failed_at)
-                    ).total_seconds()
-                    if since_fail < settings.vllm_retry_delay_seconds:
-                        continue
-                    if lease.end_at:
-                        remaining = (
-                            ensure_utc(lease.end_at) - now
-                        ).total_seconds()
-                        if remaining < 120:
-                            logger.info(
-                                "retry_worker: lease %d (%s) has only %.0fs left, skipping",
-                                lease.id, lease.model, remaining,
-                            )
-                            continue
+
+                    if renew.is_permanent(lease):
+                        # Permanent deployments outlive their booking window;
+                        # push it forward so the resubmitted job gets a full
+                        # slot instead of one that expires immediately.
+                        if lease.end_at is None or ensure_utc(lease.end_at) < now + timedelta(minutes=5):
+                            lease.begin_at = now
+                            lease.end_at = now + renew.RENEW_WINDOW
+                        logger.info(
+                            "retry_worker: resurrecting permanent model %s "
+                            "(lease %d, attempt %d)",
+                            lease.model, lease.id, (lease.retry_count or 0) + 1,
+                        )
 
                     snapshot = _snapshot_lease(lease)
                     snapshot["retry_count"] = lease.retry_count
                     candidates.append(snapshot)
+                db.commit()
 
             # ── Phase 2: attempt retries (NO DB session held) ───────────
             for snapshot in candidates:

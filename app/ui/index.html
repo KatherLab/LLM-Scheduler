@@ -241,6 +241,12 @@
           </div>
         </div>
 
+        <!-- Admin only; shown once /api/me confirms it. -->
+        <button id="imagesBtn" class="hidden px-3 py-2 text-sm rounded-lg bg-slate-100 dark:bg-slate-800 border border-gray-300 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700 transition text-slate-600 dark:text-slate-300 flex items-center gap-2" title="Manage Apptainer images">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
+          Images
+        </button>
+
         <button id="refreshBtn" class="px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-md hover:bg-brand-500 transition flex items-center gap-2">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
           Refresh
@@ -361,6 +367,18 @@
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-red-500/15 border border-red-400 border-dashed"></span>Failed</span>
             <span class="inline-flex items-center gap-2"><span class="w-3 h-3 rounded bg-red-500/25 border border-red-400"></span>Conflict</span>
             <span class="text-slate-600 dark:text-slate-500">|</span>
+            <!-- On shared partitions Slurm decides when a job runs, so these
+                 are estimates, not reservations. -->
+            <span class="inline-flex items-center gap-2" title="Slurm's backfill scheduler decides when these run. The block sits at Slurm's current estimate and moves as the queue changes — it is not a reservation.">
+              <span class="w-3 h-3 rounded bg-sky-500/25 border border-sky-400 border-dashed opacity-70"></span>Estimated start (Slurm-scheduled)
+            </span>
+            <span class="inline-flex items-center gap-2" title="Queued, but Slurm has not produced a start estimate yet. Shown at the requested time.">
+              <span class="w-3 h-3 rounded bg-sky-500/20 border border-sky-400 border-dotted opacity-40"></span>Start time unknown
+            </span>
+            <span class="inline-flex items-center gap-2" title="A job belonging to another user. Visible so the calendar cannot promise GPUs Slurm has already allocated.">
+              <span class="w-3 h-3 rounded bg-slate-400/30 border border-slate-400 border-dashed"></span>Other users' jobs
+            </span>
+            <span class="text-slate-600 dark:text-slate-500">|</span>
             <span>Drag model from catalog · Resize edges · Click block for actions · <kbd class="px-1 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-[10px]">Ctrl</kbd>+scroll to zoom</span>
           </div>
 
@@ -466,6 +484,60 @@
           </div>
         </div>
 
+        <!-- GPU class. "Any suitable" lets the scheduler pick the smallest
+             class that fits, which is usually also the one that frees up
+             soonest. Naming one is for when you specifically want that
+             hardware — a Spark, or a 48 GB card for a benchmark. -->
+        <div id="modalGpuClassSection" class="hidden">
+          <label for="modalGpuClass" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+            GPU type
+          </label>
+          <select id="modalGpuClass"
+                  class="w-full px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-gray-300 dark:border-slate-600 text-gray-900 dark:text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
+            <option value="">Any suitable GPU</option>
+          </select>
+          <p id="modalGpuClassHint" class="mt-1.5 text-xs text-slate-500"></p>
+
+          <!-- Set by dropping onto a node's row. Always removable: pinning to
+               one machine can mean waiting much longer than "any card of this
+               type", and the user should be able to take that back. -->
+          <div id="modalNodePin" class="hidden mt-2 flex items-start gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2">
+            <div class="flex-1 text-xs">
+              <div class="text-sky-700 dark:text-sky-300 font-medium">
+                Pinned to node <span id="modalNodePinName" class="font-mono"></span>
+              </div>
+              <div id="modalNodePinWarn" class="text-slate-500 mt-0.5"></div>
+            </div>
+            <button id="modalNodePinClear" type="button"
+                    class="text-xs px-2 py-1 rounded-md border border-sky-500/40 text-sky-700 dark:text-sky-300 hover:bg-sky-500/20 transition shrink-0">
+              Remove
+            </button>
+          </div>
+        </div>
+
+        <!-- GPU memory. The default is greedy (take the whole card, so the
+             rest becomes KV cache); this is an opt-in cap, which is what you
+             want when sharing a GPU or being polite on a busy partition. -->
+        <div id="modalMemorySection" class="hidden">
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input id="modalMemoryLimit" type="checkbox"
+                   class="rounded accent-brand-500" />
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Limit GPU memory
+            </span>
+            <span id="modalMemoryDefaultHint" class="text-xs text-slate-500"></span>
+          </label>
+
+          <div id="modalMemoryControls" class="hidden mt-2">
+            <div class="flex items-center gap-3">
+              <input id="modalMemoryRange" type="range" min="1" max="80" step="1" value="12"
+                     class="flex-1 accent-brand-500" />
+              <span id="modalMemoryLabel" class="text-sm font-mono text-slate-300 w-16 text-right">12 GB</span>
+            </div>
+            <p id="modalMemoryHint" class="mt-1.5 text-xs text-slate-500"></p>
+          </div>
+        </div>
+
         <!-- Error -->
         <div id="modalError" class="hidden text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3"></div>
 
@@ -549,6 +621,86 @@
       <div class="mt-4 flex gap-3">
         <button id="shortenModalConfirm" class="flex-1 px-4 py-2 rounded-lg bg-amber-600 text-white font-medium hover:bg-amber-500 transition text-sm">Shorten</button>
         <button id="shortenModalCancel" class="px-4 py-2 rounded-lg border border-gray-300 dark:border-slate-700 hover:bg-gray-50 dark:hover:bg-slate-800 transition text-sm">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Apptainer Images Modal (admin only) -->
+  <div id="imagesModalBackdrop" class="fixed inset-0 z-50 hidden bg-black/50 backdrop-blur-sm flex items-center justify-center" aria-hidden="true">
+    <div class="bg-white dark:bg-slate-900 rounded-2xl border border-gray-200 dark:border-slate-700 shadow-2xl w-full max-w-4xl mx-4 max-h-[90vh] overflow-hidden popover-enter flex flex-col">
+
+      <div class="p-5 border-b border-gray-200 dark:border-slate-800 flex items-start justify-between shrink-0">
+        <div>
+          <div class="text-lg font-semibold">Container Images</div>
+          <div id="imagesDirLabel" class="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono">—</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="imagesRefreshBtn" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800 transition" title="Refresh">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          </button>
+          <button id="imagesModalClose" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800 transition">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 overflow-y-auto">
+        <!-- Build form -->
+        <div class="p-5 border-b border-gray-200 dark:border-slate-800 bg-gray-50/60 dark:bg-slate-800/30">
+          <div class="text-sm font-semibold mb-3">Build a new image</div>
+          <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+            <div class="sm:col-span-7">
+              <label class="block text-xs font-medium text-slate-500 mb-1.5">Source image</label>
+              <input id="imgSourceRef" type="text" list="imgSourceSuggestions" placeholder="vllm/vllm-openai:v0.11.0"
+                class="w-full px-3 py-2 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500" />
+              <datalist id="imgSourceSuggestions">
+                <option value="vllm/vllm-openai:latest"></option>
+                <option value="vllm/vllm-openai:nightly"></option>
+                <option value="docker://nvcr.io/nvidia/vllm:latest"></option>
+              </datalist>
+              <p class="mt-1 text-xs text-slate-500">Plain names mean Docker Hub. <span class="font-mono">vllm/vllm-openai</span> is multi-arch, so the same tag serves both.</p>
+            </div>
+            <div class="sm:col-span-5">
+              <label class="block text-xs font-medium text-slate-500 mb-1.5">Architecture</label>
+              <select id="imgArch" class="w-full px-3 py-2 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"></select>
+              <p id="imgArchHint" class="mt-1 text-xs text-slate-500"></p>
+            </div>
+            <div class="sm:col-span-7">
+              <label class="block text-xs font-medium text-slate-500 mb-1.5">File name</label>
+              <input id="imgName" type="text" placeholder="derived from the source"
+                class="w-full px-3 py-2 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500" />
+            </div>
+            <div class="sm:col-span-5">
+              <label class="block text-xs font-medium text-slate-500 mb-1.5">Build on partition</label>
+              <select id="imgPartition" class="w-full px-3 py-2 rounded-lg bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"></select>
+            </div>
+          </div>
+
+          <label class="mt-3 flex items-center gap-2 text-xs text-slate-500 cursor-pointer">
+            <input id="imgOverwrite" type="checkbox" class="rounded accent-brand-500" />
+            Replace an existing image with this name
+          </label>
+
+          <div id="imgBuildError" class="hidden mt-3 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3"></div>
+
+          <div class="mt-3 flex items-center gap-3">
+            <button id="imgBuildBtn" class="px-4 py-2 rounded-lg bg-brand-600 text-white font-medium hover:bg-brand-500 transition text-sm">Start build</button>
+            <span class="text-xs text-slate-500">Runs as a Slurm job — Apptainer cannot cross-build.</span>
+          </div>
+        </div>
+
+        <!-- Builds in progress / history -->
+        <div id="imgBuildsSection" class="hidden p-5 border-b border-gray-200 dark:border-slate-800">
+          <div class="text-sm font-semibold mb-3">Builds</div>
+          <div id="imgBuildsList" class="space-y-2"></div>
+        </div>
+
+        <!-- Existing images -->
+        <div class="p-5">
+          <div class="text-sm font-semibold mb-3">On the shared filesystem</div>
+          <div id="imgListError" class="hidden mb-3 text-sm text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg p-3"></div>
+          <div id="imgList" class="space-y-2"></div>
+        </div>
       </div>
     </div>
   </div>

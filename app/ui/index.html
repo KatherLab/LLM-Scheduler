@@ -76,6 +76,10 @@
     /* Log modal */
     .log-content { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
 
+    /* Image build: the step currently running. Indeterminate on purpose —
+       the total download size is not knowable without the registry manifest. */
+    .img-phase-live { animation: statusPulse 1.4s ease-in-out infinite; }
+
     /* Status pulse */
     .status-dot-ready { width: 8px; height: 8px; border-radius: 50%; background: #10b981; animation: statusPulse 2s ease-in-out infinite; }
     .status-dot-starting { width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; animation: statusPulse 1s ease-in-out infinite; }
@@ -581,6 +585,7 @@
           <div id="logModalSubtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-1">Job output</div>
         </div>
         <div class="flex items-center gap-2">
+          <span id="logFollowBadge" class="hidden px-2 py-0.5 rounded-full text-[10px] border bg-sky-500/15 text-sky-400 border-sky-500/25 img-phase-live">live</span>
           <button id="logRefreshBtn" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800 transition" title="Refresh logs">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
           </button>

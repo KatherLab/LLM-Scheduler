@@ -330,6 +330,41 @@ Two failure modes are designed against:
   disk instead of the NFS-backed default (`<images>/../build-tmp`), which is
   what makes layer unpacking slow.
 
+**Where the `.sif` is squashed follows from where scratch is.** mksquashfs
+writes the image with many small writes, and against NFS each one pays the
+round trip. So the job compares `df` for scratch and the images directory: on
+**different** filesystems it builds into scratch and copies the finished file
+across at the end (shared storage takes one sequential write instead of the
+whole squash); on the **same** filesystem it builds in place, because there the
+copy would be pure overhead. If `df` cannot answer, in place — the historical
+path. Two consequences: scratch must now hold cache + rootfs + image (~5× the
+`.sif`), and the copy is verified by size before the rename, since ENOSPC on
+the shared filesystem is exactly how a truncated image would get published.
+
+Either way the last step is a **rename within the images directory**, so the
+final name never exists holding a partial file. `tests/test_build_script.py`
+runs the script against a stubbed `apptainer`/`df` and checks both branches,
+including that a short copy publishes nothing.
+
+**Build progress is the job's own heartbeat, not a parsed progress bar.**
+Apptainer draws its progress for a terminal, so in a Slurm log a ten-minute
+pull is ten minutes of silence. `apptainer_build.sh` therefore prints one line
+per interval — `PROGRESS phase=… elapsed=… cache_bytes=… tmp_bytes=…
+sif_bytes=…` — and `images.parse_build_progress()` reads the last two out of
+the log tail. Three consequences worth keeping:
+
+- The script states only a *coarse* phase. **Downloading vs unpacking vs
+  squashing follows from which counter grew** between two heartbeats, so
+  nothing has to guess, and a counter it cannot measure is reported as `-1` →
+  `None`, never 0 — a stalled download and an unmeasurable one must not look
+  alike.
+- **No percentage anywhere.** The total download size is only in the registry
+  manifest, which the build never fetches; "3.4 GB pulled" is true, "41%"
+  against a guessed denominator is not.
+- Progress needs `JOB_LOG_DIR_LOCAL` mounted, exactly as log viewing does.
+  Without it `progress` is `null` and the UI says the log is not visible rather
+  than showing an empty bar, which would read as a stall.
+
 `image_build_worker` judges a finished build by **whether the `.sif` is
 actually there**, not by the exit code alone — and says so explicitly when it
 has no filesystem view to check with.

@@ -262,6 +262,191 @@ def delete_image(cluster: ClusterConfig, name: str, force: bool = False) -> str:
     return path
 
 
+# ── What a running build is doing ────────────────────────────────────────────
+# A build is minutes of nothing visible: apptainer draws its progress for a
+# terminal, and in a Slurm log that leaves long silences where the only honest
+# answer to "is it stuck?" is a shrug. `apptainer_build.sh` therefore emits its
+# own heartbeat and this reads it back out of the job log.
+#
+# Everything below is a pure function of the log text — no filesystem, no
+# scheduler — so the interesting part (which counter is growing, and what that
+# means) is testable without a cluster.
+
+#: Coarse phases the build script states, plus the finer ones derived here.
+PHASE_LABELS = {
+    "queued": "Waiting for a node",
+    "preparing": "Preparing the node",
+    "building": "Building",
+    "downloading": "Downloading layers",
+    "extracting": "Unpacking layers",
+    "writing": "Writing the .sif image",
+    "verifying": "Checking the image runs on this architecture",
+    # Not instant when the build ran on node-local disk: this is the whole
+    # image crossing to shared storage, and on a slow mount it is minutes.
+    "publishing": "Copying to the images directory",
+    "complete": "Finished",
+    "unknown": "Working",
+}
+
+_PROGRESS_PREFIX = "PROGRESS "
+
+
+@dataclass(frozen=True)
+class BuildProgress:
+    """Where one build has got to, as far as its log can say.
+
+    Sizes are absolute bytes and there is deliberately **no percentage**: the
+    total download size is only in the registry manifest, which we never fetch,
+    and a made-up denominator would turn "3.4 GB pulled" — which is true — into
+    "41%", which is not.
+    """
+
+    phase: str
+    label: str
+    elapsed_seconds: int | None = None
+    #: Bytes in the blob cache: how much of the image has been pulled.
+    downloaded_bytes: int | None = None
+    #: Bytes in the build tmpdir: the unpacked rootfs, several times the .sif.
+    unpacked_bytes: int | None = None
+    #: Bytes of the .sif itself, non-zero only once squashing starts.
+    image_bytes: int | None = None
+    #: Rate of whichever counter defines the current phase, over the last two
+    #: heartbeats. None when it cannot be computed or is not moving.
+    bytes_per_second: float | None = None
+    #: The last line of ordinary output — literally "what is happening now".
+    last_line: str = ""
+
+
+@dataclass(frozen=True)
+class _Sample:
+    phase: str
+    elapsed: int | None
+    downloaded: int | None
+    unpacked: int | None
+    image: int | None
+
+
+def _int_or_none(value: str) -> int | None:
+    """`-1` is the script's way of saying it could not measure that counter.
+
+    Mapping it to 0 would be a lie in the one direction that matters: a stalled
+    download and an unmeasurable one would look the same.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        return None
+    return None if n < 0 else n
+
+
+def _parse_sample(line: str) -> _Sample | None:
+    fields = {}
+    for token in line[len(_PROGRESS_PREFIX):].split():
+        key, sep, value = token.partition("=")
+        if sep:
+            fields[key] = value
+    if not fields:
+        return None
+    return _Sample(
+        phase=fields.get("phase", "unknown"),
+        elapsed=_int_or_none(fields.get("elapsed", "")),
+        downloaded=_int_or_none(fields.get("cache_bytes", "")),
+        unpacked=_int_or_none(fields.get("tmp_bytes", "")),
+        image=_int_or_none(fields.get("sif_bytes", "")),
+    )
+
+
+def _rate(newer: int | None, older: int | None, seconds: int | None) -> float | None:
+    if newer is None or older is None or not seconds or seconds <= 0:
+        return None
+    delta = newer - older
+    return delta / seconds if delta > 0 else None
+
+
+#: Markers in apptainer's own output, newest-wins. Only a fallback: a build
+#: submitted before this template existed still gets a rough phase, and so does
+#: one whose heartbeat has not landed yet.
+_OUTPUT_MARKERS = (
+    ("Build complete", "complete"),
+    ("Creating SIF file", "writing"),
+    ("Copying blob", "downloading"),
+    ("Getting image source signatures", "downloading"),
+    ("Starting build", "preparing"),
+)
+
+
+def parse_build_progress(log: str) -> BuildProgress | None:
+    """Read the tail of a build job's log. None when it has said nothing yet."""
+    samples: list[_Sample] = []
+    last_line = ""
+    for raw in log.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(_PROGRESS_PREFIX):
+            sample = _parse_sample(line)
+            if sample is not None:
+                samples.append(sample)
+            continue
+        last_line = line
+
+    if not samples:
+        for marker, phase in _OUTPUT_MARKERS:
+            if marker in log:
+                return BuildProgress(
+                    phase=phase, label=PHASE_LABELS[phase], last_line=last_line
+                )
+        if not last_line:
+            return None
+        return BuildProgress(phase="unknown", label=PHASE_LABELS["unknown"],
+                             last_line=last_line)
+
+    last = samples[-1]
+    prev = samples[-2] if len(samples) > 1 else None
+    span = (
+        last.elapsed - prev.elapsed
+        if prev is not None and last.elapsed is not None and prev.elapsed is not None
+        else None
+    )
+
+    phase = last.phase if last.phase in PHASE_LABELS else "unknown"
+    if phase == "building":
+        # The script does not distinguish these — it would have to guess. Which
+        # counter grew between two heartbeats says it without guessing.
+        if last.image:
+            phase = "writing"
+        elif prev is not None and _rate(last.downloaded, prev.downloaded, span):
+            phase = "downloading"
+        elif prev is not None and _rate(last.unpacked, prev.unpacked, span):
+            phase = "extracting"
+        elif last.downloaded:
+            phase = "downloading"
+
+    # Rate of whatever the current phase is actually moving. Reporting the
+    # download rate while unpacking would be a number that never changes.
+    counter = {
+        "downloading": "downloaded",
+        "extracting": "unpacked",
+        "writing": "image",
+        "publishing": "image",
+    }.get(phase)
+    rate = (
+        _rate(getattr(last, counter), getattr(prev, counter), span)
+        if counter and prev is not None else None
+    )
+
+    return BuildProgress(
+        phase=phase,
+        label=PHASE_LABELS[phase],
+        elapsed_seconds=last.elapsed,
+        downloaded_bytes=last.downloaded,
+        unpacked_bytes=last.unpacked,
+        image_bytes=last.image,
+        bytes_per_second=rate,
+        last_line=last_line,
+    )
+
+
 # ── Where a build can run ────────────────────────────────────────────────────
 
 @dataclass(frozen=True)

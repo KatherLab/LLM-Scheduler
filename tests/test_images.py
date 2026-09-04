@@ -330,3 +330,123 @@ def test_cpu_only_jobs_send_no_gres_flag():
         time_limit="02:00:00", log_dir="/tmp/logs",
     ))
     assert not any(a.startswith("--gres") for a in argv)
+
+
+# ── Build progress ───────────────────────────────────────────────────────────
+# The build script prints one heartbeat line per interval; everything the UI
+# shows is derived from those, so the derivation is worth pinning down. In
+# particular "downloading" vs "unpacking" is *not* stated by the script — it
+# follows from which counter grew between two heartbeats.
+
+def _beat(phase, elapsed, cache, tmp, sif):
+    return (f"PROGRESS phase={phase} elapsed={elapsed} cache_bytes={cache} "
+            f"tmp_bytes={tmp} sif_bytes={sif}")
+
+
+def test_no_output_yet_is_no_progress():
+    assert images.parse_build_progress("") is None
+
+
+def test_growing_cache_reads_as_downloading_with_a_rate():
+    log = "\n".join([
+        _beat("building", 15, 1_000_000, 0, 0),
+        _beat("building", 30, 4_000_000, 0, 0),
+    ])
+    p = images.parse_build_progress(log)
+    assert p.phase == "downloading"
+    assert p.downloaded_bytes == 4_000_000
+    assert p.bytes_per_second == pytest.approx(200_000)
+
+
+def test_growing_tmpdir_with_a_settled_cache_reads_as_unpacking():
+    log = "\n".join([
+        _beat("building", 60, 8_000_000, 1_000_000, 0),
+        _beat("building", 75, 8_000_000, 9_000_000, 0),
+    ])
+    p = images.parse_build_progress(log)
+    assert p.phase == "extracting"
+    assert p.unpacked_bytes == 9_000_000
+
+
+def test_a_growing_sif_wins_over_everything_else():
+    """Squashing has started, so whatever the other counters do is history."""
+    log = "\n".join([
+        _beat("building", 90, 8_000_000, 20_000_000, 0),
+        _beat("building", 105, 8_000_000, 20_000_000, 500_000),
+    ])
+    assert images.parse_build_progress(log).phase == "writing"
+
+
+def test_later_phases_are_taken_from_the_script_not_guessed():
+    log = "\n".join([
+        _beat("building", 105, 8_000_000, 20_000_000, 500_000),
+        _beat("verifying", 120, 8_000_000, 20_000_000, 4_000_000),
+    ])
+    p = images.parse_build_progress(log)
+    assert p.phase == "verifying"
+    assert p.image_bytes == 4_000_000
+    assert p.label == images.PHASE_LABELS["verifying"]
+
+
+def test_an_unmeasurable_counter_is_unknown_not_zero():
+    """`du` failing must not look like a download that has fetched nothing."""
+    p = images.parse_build_progress(_beat("building", 15, -1, -1, 0))
+    assert p.downloaded_bytes is None
+    assert p.unpacked_bytes is None
+    assert p.phase == "building"
+
+
+def test_a_single_heartbeat_with_a_full_cache_still_reads_as_downloading():
+    p = images.parse_build_progress(_beat("building", 15, 2_000_000, 0, 0))
+    assert p.phase == "downloading"
+    assert p.bytes_per_second is None      # one sample cannot give a rate
+
+
+def test_the_last_ordinary_line_is_what_is_happening_now():
+    log = "\n".join([
+        _beat("building", 15, 1, 0, 0),
+        "Copying blob sha256:deadbeef",
+        _beat("building", 30, 2, 0, 0),
+        "INFO:    Creating SIF file...",
+    ])
+    p = images.parse_build_progress(log)
+    assert p.last_line == "INFO:    Creating SIF file..."
+
+
+def test_apptainers_own_output_is_a_fallback_without_heartbeats():
+    """A build submitted before this template shipped still gets a phase."""
+    log = "INFO:    Starting build...\nCopying blob sha256:abc\n"
+    p = images.parse_build_progress(log)
+    assert p.phase == "downloading"
+    assert p.elapsed_seconds is None
+
+
+def test_a_log_with_nothing_recognisable_says_working_rather_than_nothing():
+    p = images.parse_build_progress("some unrecognised output\n")
+    assert p.phase == "unknown"
+    assert p.last_line == "some unrecognised output"
+
+
+def test_the_copy_to_shared_storage_reports_its_own_rate():
+    """`publishing` is a whole image crossing to NFS when the build ran on
+    node-local disk, so it is a phase with a speed, not an instant."""
+    log = "\n".join([
+        _beat("publishing", 300, 8_000_000, 0, 1_000_000_000),
+        _beat("publishing", 315, 8_000_000, 0, 2_500_000_000),
+    ])
+    p = images.parse_build_progress(log)
+    assert p.phase == "publishing"
+    assert p.image_bytes == 2_500_000_000
+    assert p.bytes_per_second == pytest.approx(100_000_000)
+
+
+def test_a_rate_is_only_ever_the_counter_the_phase_is_moving():
+    """While unpacking, the download counter is frozen — reporting it as the
+    rate would show a number that never changes and means nothing."""
+    log = "\n".join([
+        _beat("building", 60, 8_000_000, 1_000_000, 0),
+        _beat("building", 75, 8_000_000, 4_000_000, 0),
+    ])
+    p = images.parse_build_progress(log)
+    assert p.phase == "extracting"
+    assert p.bytes_per_second == pytest.approx(200_000)

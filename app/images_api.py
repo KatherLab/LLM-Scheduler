@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -27,6 +28,7 @@ from .models import ImageBuild
 from .schemas import (
     BuildTargetOut,
     ImageBuildOut,
+    ImageBuildProgressOut,
     ImageBuildRequest,
     ImageOut,
     ImagesResponse,
@@ -41,6 +43,9 @@ router = APIRouter(
 
 ACTIVE_STATES = ("SUBMITTED", "RUNNING")
 
+#: Enough log tail to hold several heartbeats plus apptainer's last words.
+PROGRESS_TAIL_BYTES = 16_000
+
 
 def _require_admin(user: User) -> None:
     if not user.is_admin:
@@ -50,7 +55,55 @@ def _require_admin(user: User) -> None:
         )
 
 
-def _build_out(row: ImageBuild) -> ImageBuildOut:
+def _progress_for(job_id: str | None) -> ImageBuildProgressOut | None:
+    """What the build is doing right now, from the tail of its job log.
+
+    Both streams are read: the heartbeat lines go to stdout, but apptainer's
+    own commentary — the most recent human-readable thing that happened — goes
+    to stderr. Only the tail is needed, so this stays a few kilobytes of I/O
+    even for a build that has been logging for an hour.
+
+    Returns None when there is nothing to say, including when the job log
+    directory is not mounted here. That is the same "no view" the log viewer
+    already degrades to, and the UI says so rather than implying a stall.
+    """
+    if not job_id:
+        return None
+    from .admin import _find_log_files, _read_log_file
+
+    text = ""
+    newest: datetime | None = None
+    for path in _find_log_files(job_id):
+        if not path:
+            continue
+        chunk, _ = _read_log_file(path, max_bytes=PROGRESS_TAIL_BYTES)
+        text += chunk
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+
+    progress = images.parse_build_progress(text)
+    if progress is None:
+        return None
+    return ImageBuildProgressOut(
+        phase=progress.phase,
+        label=progress.label,
+        elapsed_seconds=progress.elapsed_seconds,
+        downloaded_bytes=progress.downloaded_bytes,
+        unpacked_bytes=progress.unpacked_bytes,
+        image_bytes=progress.image_bytes,
+        bytes_per_second=progress.bytes_per_second,
+        last_line=progress.last_line,
+        updated_at=newest,
+    )
+
+
+def _build_out(
+    row: ImageBuild, progress: ImageBuildProgressOut | None = None
+) -> ImageBuildOut:
     return ImageBuildOut(
         id=row.id,
         image_name=row.image_name,
@@ -66,6 +119,7 @@ def _build_out(row: ImageBuild) -> ImageBuildOut:
         created_at=row.created_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
+        progress=progress,
     )
 
 
@@ -75,8 +129,10 @@ async def list_images(user: User = Depends(current_user)) -> ImagesResponse:
     cluster = get_cluster()
 
     with SessionLocal() as db:
+        # Progress is read from the log for active builds only: a finished one
+        # cannot move, and its own row already says how it ended.
         builds = [
-            _build_out(b)
+            _build_out(b, _progress_for(b.slurm_job_id) if b.is_active else None)
             for b in db.execute(
                 select(ImageBuild).order_by(ImageBuild.id.desc()).limit(50)
             ).scalars().all()

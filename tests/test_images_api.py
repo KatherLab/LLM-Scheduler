@@ -186,3 +186,59 @@ def test_delete_is_refused_while_a_build_is_writing_that_name(client):
 def test_delete_cannot_escape_the_images_directory(client):
     r = client.delete("/admin/images/..%2F..%2Fetc%2Fshadow.sif")
     assert r.status_code in (404, 409)
+
+
+# ── Progress ─────────────────────────────────────────────────────────────────
+# A build is minutes of silence otherwise. The heartbeat lives in the job log,
+# so this is also a test that the two log directories are wired up: the
+# scheduler reads through JOB_LOG_DIR_LOCAL, which is a different path from the
+# one the compute node wrote to.
+
+@pytest.fixture
+def job_logs(tmp_path, monkeypatch):
+    d = tmp_path / "joblogs"
+    d.mkdir()
+    monkeypatch.setattr("app.admin.settings.job_log_dir_local", str(d))
+    return d
+
+
+def test_an_active_build_reports_what_it_is_doing(client, job_logs):
+    client.post("/admin/images/build", json={
+        "source_ref": "vllm/vllm-openai:v0.11.0", "arch": "aarch64",
+    })
+    (job_logs / "sif-build-4242.out").write_text(
+        "PROGRESS phase=building elapsed=15 cache_bytes=1000000 tmp_bytes=0 sif_bytes=0\n"
+        "PROGRESS phase=building elapsed=30 cache_bytes=4000000 tmp_bytes=0 sif_bytes=0\n"
+    )
+    (job_logs / "sif-build-4242.err").write_text("Copying blob sha256:abc\n")
+
+    build = client.get("/admin/images").json()["builds"][0]
+    assert build["progress"]["phase"] == "downloading"
+    assert build["progress"]["downloaded_bytes"] == 4_000_000
+    assert build["progress"]["last_line"] == "Copying blob sha256:abc"
+
+
+def test_no_readable_log_is_no_progress_rather_than_a_failure(client):
+    """The job log directory is often not mounted in the router. That must
+    leave the panel honest, not broken."""
+    client.post("/admin/images/build", json={
+        "source_ref": "vllm/vllm-openai:v0.11.0", "arch": "aarch64",
+    })
+    build = client.get("/admin/images").json()["builds"][0]
+    assert build["progress"] is None
+
+
+def test_finished_builds_carry_no_progress(client, job_logs):
+    client.post("/admin/images/build", json={
+        "source_ref": "vllm/vllm-openai:v0.11.0", "arch": "aarch64",
+    })
+    (job_logs / "sif-build-4242.out").write_text(
+        "PROGRESS phase=complete elapsed=900 cache_bytes=1 tmp_bytes=1 sif_bytes=9\n"
+    )
+    with SessionLocal() as db:
+        row = db.query(ImageBuild).one()
+        row.state = "SUCCEEDED"
+        db.commit()
+
+    build = client.get("/admin/images").json()["builds"][0]
+    assert build["progress"] is None

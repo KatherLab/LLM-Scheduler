@@ -269,6 +269,25 @@ class ImageOut(BaseModel):
     used_by_gpu_classes: list[str] = []
     can_delete: bool = True
 
+class ImageBuildProgressOut(BaseModel):
+    """What a running build is doing, read back out of its job log.
+
+    Deliberately no percentage — the total download size lives in the registry
+    manifest, which we never fetch. Absolute bytes are true; a percentage
+    against a guessed denominator would not be.
+    """
+    phase: str
+    label: str
+    elapsed_seconds: Optional[int] = None
+    downloaded_bytes: Optional[int] = None
+    unpacked_bytes: Optional[int] = None
+    image_bytes: Optional[int] = None
+    bytes_per_second: Optional[float] = None
+    last_line: str = ""
+    #: mtime of the log the numbers came from, so the UI can say "nothing for
+    #: 6 minutes" instead of showing a stale phase as if it were live.
+    updated_at: Optional[datetime] = None
+
 class ImageBuildOut(BaseModel):
     id: int
     image_name: str
@@ -284,6 +303,9 @@ class ImageBuildOut(BaseModel):
     created_at: datetime
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    #: Only for builds still running, and only where the job log directory is
+    #: readable from here. None means "no view", not "nothing happening".
+    progress: Optional[ImageBuildProgressOut] = None
 
 class BuildTargetOut(BaseModel):
     """Somewhere a build for one architecture can actually run."""

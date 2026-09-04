@@ -897,7 +897,16 @@ let logState = {
   url: null,
   activeTab: 'stdout',
   data: null,
+  // Set while watching something that is still running — the viewer re-reads
+  // the tail on its own, which is the point of opening it mid-build.
+  followTimer: null,
 };
+
+function followLogs(on) {
+  clearInterval(logState.followTimer);
+  logState.followTimer = on ? setInterval(fetchLogs, 5000) : null;
+  $('#logFollowBadge')?.classList.toggle('hidden', !on);
+}
 
 function openLogModal(leaseId) {
   logState.leaseId = leaseId;
@@ -926,6 +935,7 @@ function closeLogModal() {
   logState.leaseId = null;
   logState.url = null;
   logState.data = null;
+  followLogs(false);
 
   document.body.style.overflow = '';
 }
@@ -984,6 +994,13 @@ function renderLogContent() {
     ? logState.data.log_stdout
     : logState.data.log_stderr;
 
+  // Whether to follow the tail is decided *before* the content changes: if the
+  // reader has scrolled up to look at something, a refresh must not yank them
+  // back down.
+  const scrollContainer = $('#logContent').parentElement;
+  const atBottom = scrollContainer.scrollHeight - scrollContainer.scrollTop
+                   - scrollContainer.clientHeight < 80;
+
   $('#logContent').textContent = content || '(empty)';
 
   if (logState.data.truncated) {
@@ -992,9 +1009,7 @@ function renderLogContent() {
     $('#logTruncatedBanner').classList.add('hidden');
   }
 
-  // Auto-scroll to bottom
-  const scrollContainer = $('#logContent').parentElement;
-  scrollContainer.scrollTop = scrollContainer.scrollHeight;
+  if (atBottom) scrollContainer.scrollTop = scrollContainer.scrollHeight;
 }
 
 // Global helper to open logs for a model (finds the active lease)
@@ -4090,13 +4105,15 @@ function openImagesModal() {
   document.body.style.overflow = 'hidden';
   loadImages();
   // A build takes minutes; poll while the panel is open so state moves on its
-  // own rather than making the user hit refresh.
+  // own rather than making the user hit refresh. 5s because the job's own
+  // heartbeat lands every 15s — polling slower than that would show progress
+  // that is already a heartbeat out of date.
   clearInterval(imagesPollTimer);
   imagesPollTimer = setInterval(() => {
     if (IMAGES?.builds?.some(b => b.state === 'SUBMITTED' || b.state === 'RUNNING')) {
       loadImages();
     }
-  }, 10000);
+  }, 5000);
 }
 
 function closeImagesModal() {
@@ -4248,6 +4265,74 @@ async function deleteImage(name) {
   }
 }
 
+function fmtDuration(seconds) {
+  if (seconds == null || !isFinite(seconds)) return '—';
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// The phases a build passes through, in order, so the panel can show where it
+// is rather than only that it is "RUNNING" for eleven minutes. There is no
+// percentage anywhere: the total download size is in the registry manifest,
+// which the build never fetches — bytes pulled is what we actually know.
+const IMG_PHASES = ['queued', 'preparing', 'downloading', 'extracting', 'writing', 'verifying', 'publishing'];
+
+function renderBuildProgress(b) {
+  const active = b.state === 'SUBMITTED' || b.state === 'RUNNING';
+  if (!active) return '';
+
+  const p = b.progress;
+  const queued = b.state === 'SUBMITTED' && (!p || p.phase === 'queued');
+  const phase = queued ? 'queued' : (p?.phase || 'unknown');
+  // 'complete' is the script's last word before the job exits; everything is
+  // behind it, so every step is done.
+  const idx = phase === 'complete' ? IMG_PHASES.length : IMG_PHASES.indexOf(phase);
+
+  // No progress at all: either the job has not written anything yet, or this
+  // scheduler cannot see the job log directory. Say which — an empty panel
+  // reads like a stall.
+  if (!p && !queued) {
+    return `<div class="text-xs text-slate-500 mt-2">Running — no output visible yet
+      (the job log directory may not be mounted here).</div>`;
+  }
+
+  const bits = [];
+  if (p?.elapsed_seconds != null) bits.push(`${fmtDuration(p.elapsed_seconds)} in`);
+  else if (queued) bits.push(`queued ${fmtDuration((Date.now() - new Date(b.created_at)) / 1000)}`);
+  if (p?.downloaded_bytes) bits.push(`${fmtBytes(p.downloaded_bytes)} pulled`);
+  if (p?.unpacked_bytes) bits.push(`${fmtBytes(p.unpacked_bytes)} unpacked`);
+  if (p?.image_bytes) bits.push(`${fmtBytes(p.image_bytes)} written`);
+  if (p?.bytes_per_second) bits.push(`${fmtBytes(p.bytes_per_second)}/s`);
+
+  // A heartbeat arrives every 15s; well past that with nothing new is worth
+  // saying out loud, because it is the difference between slow and stuck.
+  const silentFor = p?.updated_at ? (Date.now() - new Date(p.updated_at)) / 1000 : null;
+  const stale = silentFor != null && silentFor > 90;
+
+  const steps = IMG_PHASES.slice(1).map((name, i) => {
+    const done = idx > i + 1;
+    const current = idx === i + 1;
+    const cls = done ? 'bg-emerald-500/60'
+      : current ? (stale ? 'bg-amber-500/60' : 'bg-sky-500 img-phase-live')
+      : 'bg-gray-300 dark:bg-slate-700';
+    return `<div class="h-1 flex-1 rounded-full ${cls}" title="${name}"></div>`;
+  }).join('');
+
+  return `
+    <div class="mt-2">
+      <div class="flex gap-1 mb-1.5">${steps}</div>
+      <div class="text-xs text-slate-400 flex items-center gap-2 flex-wrap">
+        <span class="${stale ? 'text-amber-400' : 'text-sky-400'}">${escapeHtml(queued ? 'Waiting for a node' : (p?.label || 'Working'))}</span>
+        ${bits.length ? `<span class="text-slate-500">${escapeHtml(bits.join(' · '))}</span>` : ''}
+        ${stale ? `<span class="text-amber-400">no output for ${fmtDuration(silentFor)}</span>` : ''}
+      </div>
+      ${p?.last_line ? `<div class="text-[11px] text-slate-500 font-mono truncate mt-1" title="${escapeHtml(p.last_line)}">${escapeHtml(p.last_line)}</div>` : ''}
+    </div>`;
+}
+
 const IMG_BUILD_BADGE = {
   SUBMITTED: 'bg-sky-500/15 text-sky-400 border-sky-500/25',
   RUNNING: 'bg-amber-500/15 text-amber-400 border-amber-500/25',
@@ -4282,10 +4367,11 @@ function renderImageBuilds() {
             ${b.error ? `<div class="text-xs text-red-400 mt-1">${escapeHtml(b.error)}</div>` : ''}
           </div>
           <div class="flex items-center gap-2 shrink-0">
-            ${b.slurm_job_id ? `<button class="img-build-logs px-2 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-700 transition" data-id="${b.id}" data-name="${escapeHtml(b.image_name)}" data-job="${escapeHtml(b.slurm_job_id)}">Logs</button>` : ''}
+            ${b.slurm_job_id ? `<button class="img-build-logs px-2 py-1.5 text-xs rounded-lg border border-gray-300 dark:border-slate-600 hover:bg-gray-100 dark:hover:bg-slate-700 transition" data-id="${b.id}" data-name="${escapeHtml(b.image_name)}" data-job="${escapeHtml(b.slurm_job_id)}" data-active="${active ? '1' : ''}">Logs</button>` : ''}
             ${active ? `<button class="img-build-cancel px-2 py-1.5 text-xs rounded-lg border border-red-500/40 text-red-400 hover:bg-red-500/10 transition" data-id="${b.id}">Cancel</button>` : ''}
           </div>
         </div>
+        ${renderBuildProgress(b)}
       </div>`;
   }).join('');
 
@@ -4301,6 +4387,9 @@ function renderImageBuilds() {
       updateLogTabs();
       $('#logModalBackdrop').classList.remove('hidden');
       $('#logModalBackdrop').setAttribute('aria-hidden', 'false');
+      // A build in flight is exactly when the log is worth watching rather
+      // than reading once.
+      followLogs(btn.dataset.active === '1');
       fetchLogs();
     });
   });

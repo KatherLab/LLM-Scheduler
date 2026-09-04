@@ -136,6 +136,11 @@ def build_scratch_dir() -> str:
     `.sif`, and the default is `$HOME` — which the service account does not
     have on every node. It also must not be a RAM-backed `/tmp`: vega's is a
     47 GB tmpfs, so an 8 GB image would be built in RAM.
+
+    The build script scopes `APPTAINER_CACHEDIR`/`APPTAINER_TMPDIR` under here
+    per-job and `rm -rf`s them on exit, so this can point at fast node-local
+    disk instead of the NFS-backed default without accumulating unpacked
+    layers there build after build.
     """
     if settings.image_build_scratch:
         return os.path.abspath(os.path.expanduser(settings.image_build_scratch))
@@ -363,10 +368,10 @@ def build_job_spec(
         "BUILD_TARGET": final_path,
         "BUILD_SCRATCH": scratch,
         "BUILD_EXPECTED_ARCH": target.arch,
-        # Apptainer defaults both of these under $HOME, which the service
-        # account does not have on every node.
-        "APPTAINER_CACHEDIR": os.path.join(scratch, f"cache-{target.arch}"),
-        "APPTAINER_TMPDIR": os.path.join(scratch, f"tmp-{target.arch}"),
+        # APPTAINER_CACHEDIR/APPTAINER_TMPDIR are left unset here: the template
+        # derives them from BUILD_SCRATCH plus the Slurm job ID (unknown until
+        # the job runs) and removes them on exit, so each build gets its own
+        # disposable scratch instead of piling up across builds.
     }
     if settings.image_registry_username and settings.image_registry_password:
         env["APPTAINER_DOCKER_USERNAME"] = settings.image_registry_username

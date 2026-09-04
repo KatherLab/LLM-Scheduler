@@ -323,7 +323,12 @@ Two failure modes are designed against:
 - **Apptainer's scratch defaults to `$HOME`**, which the service account does
   not have on every node, and `/tmp` is a RAM-backed tmpfs on some. So
   `APPTAINER_CACHEDIR`/`APPTAINER_TMPDIR` are set explicitly from
-  `IMAGE_BUILD_SCRATCH`.
+  `IMAGE_BUILD_SCRATCH`, scoped per-job (arch + Slurm job ID) and `rm -rf`'d by
+  the build script's exit trap — unpacked layers run several times the size of
+  the `.sif`, and leaving them behind would accumulate across every build.
+  Because it self-cleans, `IMAGE_BUILD_SCRATCH` can point at fast node-local
+  disk instead of the NFS-backed default (`<images>/../build-tmp`), which is
+  what makes layer unpacking slow.
 
 `image_build_worker` judges a finished build by **whether the `.sif` is
 actually there**, not by the exit code alone — and says so explicitly when it

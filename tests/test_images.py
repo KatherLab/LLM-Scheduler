@@ -309,10 +309,13 @@ def test_build_job_carries_the_target_and_scratch_paths(image_dir, monkeypatch):
     )
     assert spec.env["BUILD_TARGET"] == str(image_dir / "vllm-new.sif")
     assert spec.env["BUILD_EXPECTED_ARCH"] == "x86_64"
-    # Apptainer defaults these under $HOME, which the service account does not
-    # have on every node — the failure appears minutes into a build.
-    assert spec.env["APPTAINER_CACHEDIR"].startswith("/scratch/build")
-    assert spec.env["APPTAINER_TMPDIR"].startswith("/scratch/build")
+    assert spec.env["BUILD_SCRATCH"] == "/scratch/build"
+    # APPTAINER_CACHEDIR/APPTAINER_TMPDIR are deliberately absent here — the
+    # build script derives them from BUILD_SCRATCH plus its own Slurm job ID
+    # (unknown until the job runs) and rm -rf's them on exit, so scratch never
+    # accumulates across builds.
+    assert "APPTAINER_CACHEDIR" not in spec.env
+    assert "APPTAINER_TMPDIR" not in spec.env
     assert "user:alice" in spec.comment
 
 

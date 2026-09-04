@@ -41,16 +41,30 @@ if ! command -v apptainer >/dev/null 2>&1; then
 fi
 apptainer --version
 
-mkdir -p "${BUILD_SCRATCH}" "${APPTAINER_CACHEDIR:-${BUILD_SCRATCH}/cache}" \
-         "${APPTAINER_TMPDIR:-${BUILD_SCRATCH}/tmp}" "$(dirname "${BUILD_TARGET}")"
+JOB_ID="${SLURM_JOB_ID:-$$}"
+
+# Per-job, not per-arch: two builds of the same architecture can run
+# concurrently, and the cleanup trap below rm -rf's these directories, so
+# sharing them across jobs would let one build's cleanup delete another
+# build's cache out from under it.
+: "${APPTAINER_CACHEDIR:=${BUILD_SCRATCH}/cache-${BUILD_EXPECTED_ARCH}-${JOB_ID}}"
+: "${APPTAINER_TMPDIR:=${BUILD_SCRATCH}/tmp-${BUILD_EXPECTED_ARCH}-${JOB_ID}}"
+export APPTAINER_CACHEDIR APPTAINER_TMPDIR
+
+mkdir -p "${BUILD_SCRATCH}" "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}" \
+         "$(dirname "${BUILD_TARGET}")"
 
 # Build to a temporary name in the SAME directory, then rename. A .sif appears
 # under its final name only once it is complete, so a crashed or cancelled
 # build cannot leave a truncated image that a model job would happily try to
 # run. Same directory keeps the rename atomic — across filesystems it is a copy.
-STAGING="${BUILD_TARGET}.building.${SLURM_JOB_ID:-$$}"
+STAGING="${BUILD_TARGET}.building.${JOB_ID}"
 cleanup() {
   rm -f "${STAGING}"
+  # Unpacked layers run several times the size of the finished .sif — leaving
+  # them behind would silently fill BUILD_SCRATCH across every build. Safe to
+  # remove unconditionally: this cache/tmp pair is scoped to this job alone.
+  rm -rf "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}"
 }
 trap cleanup EXIT
 
@@ -72,8 +86,10 @@ echo "--- verifying ---"
 apptainer exec "${STAGING}" /bin/true
 
 mv -f "${STAGING}" "${BUILD_TARGET}"
-trap - EXIT
 
+# Cleanup trap stays armed: it still needs to remove APPTAINER_CACHEDIR and
+# APPTAINER_TMPDIR on this, the success path. Removing STAGING is now a no-op
+# — it no longer exists at that path once mv has renamed it.
 chmod 0644 "${BUILD_TARGET}"
 ls -l "${BUILD_TARGET}"
 echo "Build complete: ${BUILD_TARGET}"

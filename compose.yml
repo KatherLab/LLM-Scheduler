@@ -8,8 +8,6 @@
 #   this container  -> slurmrestd            (:6820)
 #   this container  -> compute nodes         (vLLM's ephemeral ports)
 #   compute nodes   -> this container        (ROUTER_REGISTER_URL)
-#
-# See the bottom of this file for the legacy CLI-backend setup.
 
 services:
   scheduler:
@@ -39,8 +37,7 @@ services:
       # JOB_LOG_DIR is deliberately NOT set here: it is a path on the COMPUTE
       # NODES, so a container path would be wrong. Set it in .env.
       - SBATCH_TEMPLATE_PATH=/app/templates/vllm_job.sh
-      # Set CLUSTER_BACKEND=slurm_cli in .env to fall back to the legacy mode.
-      - CLUSTER_BACKEND=${CLUSTER_BACKEND:-slurm_rest}
+      - CLUSTER_BACKEND=slurm_rest
 
     # Lets the container reach the host as "host.docker.internal" — only
     # needed if slurmrestd runs on the Docker host itself.
@@ -106,7 +103,6 @@ services:
       - ./secrets/known_hosts:/run/secrets/known_hosts:ro
 
     # Unprivileged; matches the `scheduler` user baked into the image.
-    # No host UID matching needed — that was a CLI-backend requirement.
     user: "1000:1000"
 
     security_opt:
@@ -114,25 +110,3 @@ services:
 
 volumes:
   scheduler-data:
-
-# ═══════════════════════════════════════════════════════════════════════════
-# LEGACY: CLUSTER_BACKEND=slurm_cli
-#
-# Only needed if slurmrestd is unavailable, or to keep `sbatch --test-only`
-# start-time previews (which have no REST equivalent — see ESTIMATE_BACKEND).
-# This is the setup the REST backend replaces: it requires the container to run
-# on a submit host, as a UID with Slurm permissions.
-#
-#    volumes:
-#      - /usr/bin/sbatch:/usr/bin/sbatch:ro
-#      - /usr/bin/scancel:/usr/bin/scancel:ro
-#      - /usr/bin/scontrol:/usr/bin/scontrol:ro
-#      - /usr/bin/squeue:/usr/bin/squeue:ro
-#      - /usr/bin/sacct:/usr/bin/sacct:ro
-#      - /usr/bin/sinfo:/usr/bin/sinfo:ro
-#      - /usr/lib/x86_64-linux-gnu/slurm:/usr/lib/x86_64-linux-gnu/slurm:ro
-#      - /etc/slurm:/etc/slurm:ro
-#      - /etc/munge:/etc/munge:ro
-#      - /var/run/munge:/var/run/munge
-#    user: "${UID:-0}:${GID:-0}"
-# ═══════════════════════════════════════════════════════════════════════════

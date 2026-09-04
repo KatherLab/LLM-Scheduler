@@ -174,6 +174,68 @@ def test_deleting_something_that_is_not_there_says_so(image_dir):
         images.delete_image(CLUSTER, "ghost.sif")
 
 
+# ── Version selection ────────────────────────────────────────────────────────
+# `Runtime.image` is a filename glob, not a fixed path, so a runtime can offer
+# several versions and the newest wins by default.
+
+def _cluster_with_glob(pattern: str) -> ClusterConfig:
+    runtimes = dict(CLUSTER.runtimes)
+    runtimes["arm-vllm"] = Runtime(name="arm-vllm", kind="apptainer", image=pattern)
+    return ClusterConfig(
+        runtimes=runtimes, gpu_classes=CLUSTER.gpu_classes, pools=CLUSTER.pools,
+    )
+
+
+def test_list_versions_matches_the_runtime_glob_newest_first(image_dir):
+    import time
+
+    old = image_dir / "vllm-0.26.0-aarch64.sif"
+    old.write_bytes(b"x")
+    time.sleep(0.01)
+    new = image_dir / "vllm-0.27.1-aarch64.sif"
+    new.write_bytes(b"x")
+    (image_dir / "vllm-x86_64.sif").write_bytes(b"x")  # different arch, no match
+
+    cluster = _cluster_with_glob("vllm-*-aarch64.sif")
+    versions = [i.name for i in images.list_versions(cluster, "arm-vllm")]
+    assert versions == ["vllm-0.27.1-aarch64.sif", "vllm-0.26.0-aarch64.sif"]
+
+
+def test_resolve_runtime_image_defaults_to_newest(image_dir):
+    import time
+
+    (image_dir / "vllm-0.26.0-aarch64.sif").write_bytes(b"x")
+    time.sleep(0.01)
+    newest = image_dir / "vllm-0.27.1-aarch64.sif"
+    newest.write_bytes(b"x")
+
+    cluster = _cluster_with_glob("vllm-*-aarch64.sif")
+    assert images.resolve_runtime_image(cluster, "arm-vllm") == str(newest)
+
+
+def test_resolve_runtime_image_honours_an_explicit_pin(image_dir):
+    pinned = image_dir / "vllm-0.26.0-aarch64.sif"
+    pinned.write_bytes(b"x")
+    (image_dir / "vllm-0.27.1-aarch64.sif").write_bytes(b"x")
+
+    cluster = _cluster_with_glob("vllm-*-aarch64.sif")
+    got = images.resolve_runtime_image(cluster, "arm-vllm", "vllm-0.26.0-aarch64.sif")
+    assert got == str(pinned)
+
+
+def test_resolve_runtime_image_rejects_an_unknown_pin(image_dir):
+    (image_dir / "vllm-0.27.1-aarch64.sif").write_bytes(b"x")
+    cluster = _cluster_with_glob("vllm-*-aarch64.sif")
+    with pytest.raises(images.ImageError, match="not available"):
+        images.resolve_runtime_image(cluster, "arm-vllm", "vllm-9.9.9-aarch64.sif")
+
+
+def test_resolve_runtime_image_with_no_match_says_so(image_dir):
+    cluster = _cluster_with_glob("vllm-*-aarch64.sif")
+    with pytest.raises(images.ImageError, match="No image matches"):
+        images.resolve_runtime_image(cluster, "arm-vllm")
+
+
 # ── Where a build can run ────────────────────────────────────────────────────
 
 def test_build_targets_come_from_the_gpu_class_architecture():

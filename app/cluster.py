@@ -124,17 +124,24 @@ class GpuClass:
 class Runtime:
     name: str
     kind: str = RUNTIME_VENV
-    image: str | None = None          # apptainer .sif path
+    image: str | None = None          # apptainer .sif filename glob, matched
+                                       # against APPTAINER_IMAGE_DIR; no
+                                       # wildcard means "exactly this file"
     activate: str | None = None       # venv activate script
     nv: bool = True                   # apptainer --nv
     binds: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
 
     def as_job_env(self) -> dict[str, str]:
-        """Variables the job template switches on."""
+        """Variables the job template switches on.
+
+        APPTAINER_IMAGE is not set here: `image` is a filename pattern, not a
+        path, and resolving it to one file needs a directory listing plus an
+        optional per-lease version pin — the caller sets it via
+        `images.resolve_runtime_image()`.
+        """
         env = {"RUNTIME_KIND": self.kind, "RUNTIME_NAME": self.name}
         if self.kind == RUNTIME_APPTAINER:
-            env["APPTAINER_IMAGE"] = self.image or ""
             env["APPTAINER_NV"] = "1" if self.nv else "0"
             env["APPTAINER_BINDS"] = ",".join(self.binds)
         elif self.activate:

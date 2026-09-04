@@ -185,9 +185,11 @@ def test_model_runtime_override_wins(cluster):
 
 
 def test_apptainer_runtime_exports_job_env(cluster):
+    """APPTAINER_IMAGE is resolved separately (images.resolve_runtime_image),
+    since `image` is now a filename pattern, not a fixed path."""
     env = cluster.runtime_for("gpu96").as_job_env()
     assert env["RUNTIME_KIND"] == "apptainer"
-    assert env["APPTAINER_IMAGE"].endswith(".sif")
+    assert "APPTAINER_IMAGE" not in env
     assert env["APPTAINER_NV"] == "1"
     assert "/scratch" in env["APPTAINER_BINDS"]
 

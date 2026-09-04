@@ -15,6 +15,7 @@ never silently change what the next job runs.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 from dataclasses import dataclass
@@ -154,17 +155,44 @@ class ImageInfo:
     used_by_gpu_classes: tuple[str, ...] = ()
 
 
-def _runtime_users(cluster: ClusterConfig, path: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Which runtimes and GPU classes depend on one image file."""
+def _runtime_users(cluster: ClusterConfig, name: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Which runtimes and GPU classes can select one image file by name.
+
+    `runtime.image` is a filename glob, not a fixed path, so several files can
+    match one runtime — each is a selectable version, and every one of them
+    counts as "in use" for delete protection.
+    """
     runtimes = tuple(sorted(
         r.name for r in cluster.runtimes.values()
         if r.kind == RUNTIME_APPTAINER and r.image
-        and os.path.abspath(os.path.expanduser(r.image)) == path
+        and fnmatch.fnmatch(name, os.path.basename(r.image))
     ))
     classes = tuple(sorted(
         c.name for c in cluster.gpu_classes.values() if c.runtime in runtimes
     ))
     return runtimes, classes
+
+
+def list_versions(cluster: ClusterConfig, runtime_name: str) -> list[ImageInfo]:
+    """Images one runtime can select, newest first."""
+    return [i for i in list_images(cluster) if runtime_name in i.used_by_runtimes]
+
+
+def resolve_runtime_image(
+    cluster: ClusterConfig, runtime_name: str, requested: str | None = None
+) -> str:
+    """Absolute path of the image a job should launch: a pin, or the newest match."""
+    candidates = list_versions(cluster, runtime_name)
+    if not candidates:
+        raise ImageError(
+            f"No image matches runtime {runtime_name!r} in {image_dir()}."
+        )
+    if requested:
+        for c in candidates:
+            if c.name == requested:
+                return c.path
+        raise ImageError(f"Image {requested!r} is not available for runtime {runtime_name!r}.")
+    return candidates[0].path
 
 
 def list_images(cluster: ClusterConfig) -> list[ImageInfo]:
@@ -190,7 +218,7 @@ def list_images(cluster: ClusterConfig) -> list[ImageInfo]:
                 continue
             stat = entry.stat()
             path = os.path.join(directory, entry.name)
-            runtimes, classes = _runtime_users(cluster, path)
+            runtimes, classes = _runtime_users(cluster, entry.name)
             out.append(ImageInfo(
                 name=entry.name,
                 path=path,
@@ -211,7 +239,7 @@ def delete_image(cluster: ClusterConfig, name: str, force: bool = False) -> str:
     reference is checked here, and overriding it has to be explicit.
     """
     path = image_path(name)
-    runtimes, classes = _runtime_users(cluster, path)
+    runtimes, classes = _runtime_users(cluster, name)
     if runtimes and not force:
         used = ", ".join(runtimes)
         via = f" (GPU classes: {', '.join(classes)})" if classes else ""

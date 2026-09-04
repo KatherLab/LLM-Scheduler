@@ -46,6 +46,9 @@ class LeaseCreate(BaseModel):
     extra_args: Optional[str] = None
     tool_args: Optional[str] = None
     reasoning_parser: Optional[str] = None
+    # Apptainer image filename to launch (see GpuClassOut.available_images).
+    # None picks the newest image matching the runtime at submit time.
+    image: Optional[str] = None
 
 class LeaseUpdate(BaseModel):
     begin_at: Optional[datetime] = None
@@ -109,6 +112,8 @@ class LeaseOut(BaseModel):
     supersedes_id: Optional[int] = None
     # Models sharing this lease's GPU, if any (includes `model` itself).
     colocated: list[str] = Field(default_factory=list)
+    # Apptainer image actually pinned/resolved for this lease, if any.
+    image: Optional[str] = None
 
     @property
     def is_estimated(self) -> bool:
@@ -206,6 +211,9 @@ class GpuClassOut(BaseModel):
     vram_gb: int = 0
     usable_gb: float = 0.0
     unified_memory: bool = False
+    # Apptainer images this class's runtime can launch, newest first. Empty
+    # for a venv runtime or when no image matches.
+    available_images: list[str] = []
 
 class EndpointStats(BaseModel):
     model: str

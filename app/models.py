@@ -74,6 +74,9 @@ class Lease(Base):
     pinned_node: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Runtime name from cluster.yaml; normally implied by gpu_class.
     runtime: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Apptainer image file pinned at booking time; None means "resolve the
+    # newest matching image for the runtime" at submit time.
+    image: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # session -> fixed window, hard stop at end_at (benchmarks).
     # service -> no fixed end; renewed before TimeLimit expiry so a long-running

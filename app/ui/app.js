@@ -1247,6 +1247,7 @@ $('#modalModel').addEventListener('change', () => {
   $('#modalGpuInfo').textContent = `Requires ${meta.gpus} GPUs · TP ${meta.tensor_parallel_size}`;
   // Each model has its own eligible classes and memory default.
   syncGpuClassOptions(id);
+  syncImageOptions(id);
   syncMemorySlider(id);
 });
 
@@ -1344,6 +1345,9 @@ modalDurationRange.addEventListener('input', () => {
 const gpuClassSection = $('#modalGpuClassSection');
 const gpuClassSelect = $('#modalGpuClass');
 const gpuClassHint = $('#modalGpuClassHint');
+const imageSection = $('#modalImageSection');
+const imageSelect = $('#modalImage');
+const imageControlPresent = Boolean(imageSection && imageSelect);
 const nodePin = $('#modalNodePin');
 const nodePinName = $('#modalNodePinName');
 const nodePinWarn = $('#modalNodePinWarn');
@@ -1448,6 +1452,45 @@ function syncGpuClassOptions(modelId) {
   gpuClassSection.classList.toggle('hidden', modalState.mode === 'edit');
 }
 
+/**
+ * Populate the vLLM image version selector.
+ *
+ * Options come from the eligible GPU class(es)' `available_images` — union of
+ * all of them when no class is chosen yet, just that class's list once one
+ * is. Hidden whenever there is nothing to choose between, since "Newest" is
+ * already the default with no image selected at all.
+ */
+function syncImageOptions(modelId) {
+  if (!imageControlPresent) return;
+  if (modalState.mode === 'edit') {
+    imageSection.classList.add('hidden');
+    return;
+  }
+
+  const chosen = gpuClassSelect && gpuClassSelect.value;
+  const classes = chosen ? [chosen] : eligibleClassesFor(modelId);
+  const names = new Set();
+  for (const cls of classes) {
+    for (const img of (gpuClassInfo(cls)?.available_images || [])) names.add(img);
+  }
+  const list = [...names];
+
+  const previous = imageSelect.value;
+  imageSelect.innerHTML = '';
+  const newest = document.createElement('option');
+  newest.value = '';
+  newest.textContent = 'Newest';
+  imageSelect.appendChild(newest);
+  for (const name of list) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    imageSelect.appendChild(opt);
+  }
+  imageSelect.value = list.includes(previous) ? previous : '';
+  imageSection.classList.toggle('hidden', list.length < 2);
+}
+
 /** Seed the control from the chosen model. */
 function syncMemorySlider(modelId) {
   if (!memoryControlPresent) return false;
@@ -1523,6 +1566,8 @@ gpuClassSelect.addEventListener('change', () => {
     modalState.pinnedNode = null;
   }
   renderNodePin();
+  // Available image versions depend on the chosen class too.
+  syncImageOptions($('#modalModel').value);
   // The ceiling depends on the chosen class, so re-clamp rather than leave a
   // value that is now impossible.
   const cap = memoryCeilingGb($('#modalModel').value);
@@ -1586,6 +1631,10 @@ $('#modalSave').addEventListener('click', async () => {
       }
       if (modalState.pinnedNode) {
         payload.node = modalState.pinnedNode;
+      }
+      // Left out means "newest", resolved when the job actually launches.
+      if (imageSelect && imageSelect.value) {
+        payload.image = imageSelect.value;
       }
 
       if (modalState.asap) {

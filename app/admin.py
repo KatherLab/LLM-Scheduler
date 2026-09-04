@@ -46,8 +46,15 @@ from .authz import (
     describe_denial,
 )
 from . import colocation
+from . import images
 from .catalog import get_catalog, resolve_variant
-from .cluster import SCHEDULING_MANAGED, SCHEDULING_SLURM, UNLIMITED, get_cluster
+from .cluster import (
+    RUNTIME_APPTAINER,
+    SCHEDULING_MANAGED,
+    SCHEDULING_SLURM,
+    UNLIMITED,
+    get_cluster,
+)
 from . import inventory
 from . import scheduling
 from .backends import ClusterUnavailableError, JobSpec, get_estimate_backend
@@ -137,6 +144,7 @@ def _lease_to_out(
         replicas=l.replicas or 1,
         supersedes_id=l.supersedes_id,
         colocated=[t.model for t in colocation.decode(l.colocated_json)],
+        image=l.image,
     )
 
 
@@ -221,6 +229,21 @@ def _gres_for(gpu_class: str | None, gpus: int) -> str | None:
     return f"gpu:{gpu_class}:{max(1, gpus)}"
 
 
+def _available_images(cluster, runtime_name: str | None) -> list[str]:
+    """Image versions the booking dialog can offer for one GPU class.
+
+    Empty for a venv runtime, an unset APPTAINER_IMAGE_DIR, or a class with no
+    runtime — none of those should break the dashboard.
+    """
+    runtime = cluster.runtimes.get(runtime_name) if runtime_name else None
+    if runtime is None or runtime.kind != RUNTIME_APPTAINER:
+        return []
+    try:
+        return [i.name for i in images.list_versions(cluster, runtime.name)]
+    except images.ImageError:
+        return []
+
+
 def _submit_to_slurm(lease: Lease) -> str:
     return _submit_to_slurm_from_snapshot(_snapshot_lease(lease))
 
@@ -301,6 +324,10 @@ def _build_submit_kwargs(snapshot: dict) -> dict:
     runtime = cluster.runtime_for(gpu_class, snapshot.get("runtime"))
     if runtime is not None:
         env.update(runtime.as_job_env())
+        if runtime.kind == RUNTIME_APPTAINER:
+            env["APPTAINER_IMAGE"] = images.resolve_runtime_image(
+                cluster, runtime.name, snapshot.get("image")
+            )
 
     # On a managed pool our calendar is the allocator, so pin the job to the
     # node the planner chose — that is what makes the booking truthful rather
@@ -370,6 +397,7 @@ def _snapshot_lease(lease: "Lease") -> dict:
         "node": lease.node,
         "pinned_node": lease.pinned_node,
         "runtime": lease.runtime,
+        "image": lease.image,
         "colocated_json": lease.colocated_json,
     }
 
@@ -702,6 +730,7 @@ async def dashboard(user: User = Depends(current_user)):
                 name=c.name, vram_gb=c.vram_gb,
                 usable_gb=round(c.usable_gb, 1),
                 unified_memory=c.unified_memory,
+                available_images=_available_images(cluster, c.runtime),
             )
             for c in sorted(cluster.gpu_classes.values(), key=lambda x: x.vram_gb)
         ],
@@ -1140,6 +1169,7 @@ async def create_lease(req: LeaseCreate, user: User = Depends(current_user)):
             gpu_class=gpu_class,
             pinned_node=req.node,
             runtime=cat.runtime,
+            image=req.image,
             mode=req.mode,
             replicas=req.replicas,
             colocated_json=colocation.encode(tenants) if tenants else None,
